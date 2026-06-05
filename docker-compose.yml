@@ -1,0 +1,98 @@
+# =============================================================================
+# Enma Labs — Local Development Stack
+#
+# Phase 0 deliverable: bring up postgres (with timescaledb + pgvector + pg_trgm),
+# the Python backend, and the Node gateway. Both services expose /health.
+#
+# Production deployment lives elsewhere (Railway/Render/ECS) — this file is
+# explicitly for local dev. Override behaviour with docker-compose.override.yml.
+# =============================================================================
+
+name: enma
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    # Provides pgvector natively without needing custom builds
+    container_name: enma-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-enma_dev}
+      POSTGRES_USER: ${POSTGRES_USER:-enma}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dev_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/home/postgres/pgdata/data
+      - ./scripts/init-extensions.sql:/docker-entrypoint-initdb.d/000_init-extensions.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-enma} -d ${POSTGRES_DB:-enma_dev}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  backend:
+    build:
+      context: ./enma-backend
+      dockerfile: Dockerfile
+      target: dev
+    container_name: enma-backend
+    restart: unless-stopped
+    environment:
+      ENV: ${ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-enma}:${POSTGRES_PASSWORD:-dev_password}@postgres:5432/${POSTGRES_DB:-enma_dev}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-changeme}
+      BACKEND_API_KEY: ${BACKEND_API_KEY:-dev_backend_api_key_change_me}
+      GATEWAY_HMAC_SECRET: ${GATEWAY_HMAC_SECRET:-dev_hmac_secret_change_me}
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      SENTRY_TRACES_SAMPLE_RATE: ${SENTRY_TRACES_SAMPLE_RATE:-0.1}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    volumes:
+      - ./enma-backend:/app:cached
+
+  gateway:
+    build:
+      context: ./enma-gateway
+      dockerfile: Dockerfile
+      target: dev
+    container_name: enma-gateway
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${ENV:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-changeme}
+      BACKEND_URL: http://backend:8000
+      BACKEND_API_KEY: ${BACKEND_API_KEY:-dev_backend_api_key_change_me}
+      GATEWAY_HMAC_SECRET: ${GATEWAY_HMAC_SECRET:-dev_hmac_secret_change_me}
+      PORT: "3000"
+      SENTRY_DSN: ${SENTRY_DSN:-}
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    volumes:
+      - ./enma-gateway:/app:cached
+      - /app/node_modules
+
+volumes:
+  pgdata:
+    driver: local

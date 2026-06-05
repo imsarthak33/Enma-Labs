@@ -1,0 +1,36 @@
+{
+  "name": "enma-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Enma Labs gateway — Telegram polling, routing, cron, media buffering.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0 <23.0.0"
+  },
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "node-cron": "^3.0.3",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "eslint": "^9.7.0",
+    "@eslint/js": "^9.7.0",
+    "eslint-plugin-security": "^3.0.1",
+    "eslint-plugin-promise": "^7.0.0",
+    "globals": "^15.8.0",
+    "prettier": "^3.3.3",
+    "vitest": "^2.0.5",
+    "@vitest/coverage-v8": "^2.0.5"
+  }
+}
