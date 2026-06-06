@@ -190,8 +190,16 @@ $backendTaskDef = @"
       {"name": "TELEGRAM_BOT_TOKEN", "value": "PLACEHOLDER_SET_VIA_SECRETS"},
       {"name": "SENTRY_DSN", "value": "PLACEHOLDER_SET_VIA_SECRETS"},
       {"name": "LLM_API_KEY", "value": "PLACEHOLDER_SET_VIA_SECRETS"},
-      {"name": "EMBEDDING_ENDPOINT", "value": "https://api.openai.com/v1/embeddings"},
-      {"name": "EMBEDDING_DIMENSIONS", "value": "1024"}
+      {"name": "LAYOUT_MODEL_ENDPOINT", "value": "https://integrate.api.nvidia.com/v1/chat/completions"},
+      {"name": "LAYOUT_MODEL_NAME", "value": "meta/llama-3.1-8b-instruct"},
+      {"name": "EXTRACTION_MODEL_ENDPOINT", "value": "https://integrate.api.nvidia.com/v1/chat/completions"},
+      {"name": "EXTRACTION_MODEL_NAME", "value": "nvidia/nemotron-ocr-v1"},
+      {"name": "REASONING_MODEL_ENDPOINT", "value": "https://integrate.api.nvidia.com/v1/chat/completions"},
+      {"name": "REASONING_MODEL_NAME", "value": "meta/llama-3.3-70b-instruct"},
+      {"name": "EMBEDDING_ENDPOINT", "value": "https://integrate.api.nvidia.com/v1/embeddings"},
+      {"name": "EMBEDDING_MODEL_NAME", "value": "nvidia/nv-embedqa-e5-v5"},
+      {"name": "EMBEDDING_DIMENSIONS", "value": "1024"},
+      {"name": "WHISPER_ENDPOINT", "value": "https://integrate.api.nvidia.com/v1/audio/transcriptions"}
     ]
   }]
 }

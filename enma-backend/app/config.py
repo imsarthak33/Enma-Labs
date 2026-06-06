@@ -106,29 +106,41 @@ class Settings(BaseSettings):
     telegram_bot_token: SecretStr = Field(default=SecretStr("changeme-telegram-bot-token"))
 
     # -- Model endpoints (Phase 4+) ------------------------------------------
-    # Defaults point at OpenAI's public chat-completions endpoint so the
-    # codebase is provider-agnostic but works out of the box for dev. Any
-    # OpenAI-compatible server (NVIDIA NIM, vLLM, LiteLLM, Anthropic via
-    # proxy, …) works by overriding the URL via env.
-    layout_model_endpoint: str = Field(default="https://api.openai.com/v1/chat/completions")
-    layout_model_name: str = Field(default="gpt-4o-mini")
+    # Provider: NVIDIA NIM (OpenAI-compatible surface).
+    # All three roles share the same base URL; the model name selects the
+    # specific NIM. Override any of these via environment variables.
+    # Docs: https://docs.api.nvidia.com/nim/reference/
+    layout_model_endpoint: str = Field(
+        default="https://integrate.api.nvidia.com/v1/chat/completions"
+    )
+    layout_model_name: str = Field(default="meta/llama-3.1-8b-instruct")
 
-    extraction_model_endpoint: str = Field(default="https://api.openai.com/v1/chat/completions")
-    extraction_model_name: str = Field(default="gpt-4o")
+    extraction_model_endpoint: str = Field(
+        default="https://integrate.api.nvidia.com/v1/chat/completions"
+    )
+    extraction_model_name: str = Field(default="nvidia/nemotron-ocr-v1")
 
-    reasoning_model_endpoint: str = Field(default="https://api.openai.com/v1/chat/completions")
-    reasoning_model_name: str = Field(default="gpt-4o")
+    reasoning_model_endpoint: str = Field(
+        default="https://integrate.api.nvidia.com/v1/chat/completions"
+    )
+    reasoning_model_name: str = Field(default="meta/llama-3.3-70b-instruct")
 
-    # Optional in Phase 4 — wired in later phases.
-    whisper_endpoint: str | None = None
+    # Voice transcription (NVIDIA NIM audio endpoint, Whisper-compatible).
+    whisper_endpoint: str | None = Field(
+        default="https://integrate.api.nvidia.com/v1/audio/transcriptions"
+    )
     summarization_endpoint: str | None = None
 
     # Embeddings (Phase 5). REQUIRED in production / staging. In dev/test
     # the embedding service falls back to a deterministic hash embedder
     # so the suite is offline. ``embedding_dimensions`` MUST match the
     # ca_firm_rules.rule_embedding VECTOR(1024) column.
-    embedding_endpoint: str | None = None
-    embedding_model_name: str = Field(default="text-embedding-3-large")
+    # ⚠  Use nvidia/nv-embedqa-e5-v5 — produces exactly 1024 dims.
+    #    Do NOT use nv-embedcode-7b-v1 (code embeddings, wrong domain).
+    embedding_endpoint: str | None = Field(
+        default="https://integrate.api.nvidia.com/v1/embeddings"
+    )
+    embedding_model_name: str = Field(default="nvidia/nv-embedqa-e5-v5")
     embedding_dimensions: int = Field(default=1024, ge=64, le=4096)
 
     # LLM API key. Required at first LLM call (not at boot, so tests
