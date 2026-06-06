@@ -25,9 +25,7 @@ from app.logging_setup import get_logger
 _log = get_logger(__name__)
 
 _TELEGRAM_API_BASE: Final[str] = "https://api.telegram.org"
-_DEFAULT_TIMEOUT: Final[httpx.Timeout] = httpx.Timeout(
-    connect=5.0, read=30.0, write=30.0, pool=5.0
-)
+_DEFAULT_TIMEOUT: Final[httpx.Timeout] = httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=5.0)
 
 _client: httpx.AsyncClient | None = None
 
@@ -74,9 +72,7 @@ class TelegramAPIError(RuntimeError):
     """Raised when the Telegram Bot API returns a non-OK response."""
 
     def __init__(self, method: str, status_code: int, body: str) -> None:
-        super().__init__(
-            f"Telegram API call {method!r} failed: HTTP {status_code} — {body[:200]}"
-        )
+        super().__init__(f"Telegram API call {method!r} failed: HTTP {status_code} — {body[:200]}")
         self.method = method
         self.status_code = status_code
         self.body = body
@@ -142,9 +138,7 @@ async def send_message(
     return await _post_json("sendMessage", payload, client=client)
 
 
-async def get_file_path(
-    file_id: str, *, client: httpx.AsyncClient | None = None
-) -> str:
+async def get_file_path(file_id: str, *, client: httpx.AsyncClient | None = None) -> str:
     """Return the relative ``file_path`` for a given Telegram ``file_id``."""
     result = await _post_json("getFile", {"file_id": file_id}, client=client)
     file_path = result.get("file_path")
@@ -153,9 +147,7 @@ async def get_file_path(
     return file_path
 
 
-async def download_file(
-    file_id: str, *, client: httpx.AsyncClient | None = None
-) -> bytes:
+async def download_file(file_id: str, *, client: httpx.AsyncClient | None = None) -> bytes:
     """Resolve ``file_id`` to a download URL and return the raw bytes."""
     file_path = await get_file_path(file_id, client=client)
     http = client or get_client()

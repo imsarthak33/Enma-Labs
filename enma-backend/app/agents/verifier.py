@@ -130,9 +130,7 @@ def _pct(value: Decimal, rate: Decimal) -> Decimal:
 # ---------------------------------------------------------------------------
 
 
-def _check_gstins(
-    extraction: dict[str, Any], issues: list[VerificationIssue]
-) -> None:
+def _check_gstins(extraction: dict[str, Any], issues: list[VerificationIssue]) -> None:
     for party in ("vendor", "buyer"):
         party_obj = extraction.get(party) or {}
         if not isinstance(party_obj, dict):
@@ -141,11 +139,7 @@ def _check_gstins(
         if gstin is None or gstin == "":
             # B2C invoices legitimately have no buyer GSTIN. We flag at
             # WARNING for vendor, INFO for buyer.
-            sev = (
-                VerificationSeverity.WARNING
-                if party == "vendor"
-                else VerificationSeverity.INFO
-            )
+            sev = VerificationSeverity.WARNING if party == "vendor" else VerificationSeverity.INFO
             issues.append(
                 VerificationIssue(
                     severity=sev,
@@ -170,9 +164,7 @@ def _check_gstins(
             )
 
 
-def _check_line_items(
-    extraction: dict[str, Any], issues: list[VerificationIssue]
-) -> None:
+def _check_line_items(extraction: dict[str, Any], issues: list[VerificationIssue]) -> None:
     items = extraction.get("line_items") or []
     if not isinstance(items, list):
         issues.append(
@@ -199,9 +191,7 @@ def _check_line_items(
         _check_line_item(idx, item, issues)
 
 
-def _check_line_item(
-    idx: int, item: dict[str, Any], issues: list[VerificationIssue]
-) -> None:
+def _check_line_item(idx: int, item: dict[str, Any], issues: list[VerificationIssue]) -> None:
     taxable = _safe_money(item.get("taxable_value"))
     cgst_amt = _safe_money(item.get("cgst_amount"))
     sgst_amt = _safe_money(item.get("sgst_amount"))
@@ -228,8 +218,7 @@ def _check_line_item(
                 severity=VerificationSeverity.ERROR,
                 code="tax_coexistence",
                 message=(
-                    f"Line {idx + 1}: IGST cannot coexist with CGST/SGST on the"
-                    " same line."
+                    f"Line {idx + 1}: IGST cannot coexist with CGST/SGST on the" " same line."
                 ),
                 field=FieldRef(f"line_items[{idx}]"),
             )
@@ -242,8 +231,7 @@ def _check_line_item(
                 severity=VerificationSeverity.ERROR,
                 code="cgst_sgst_mismatch",
                 message=(
-                    f"Line {idx + 1}: CGST and SGST must appear together "
-                    "(intra-state supply)."
+                    f"Line {idx + 1}: CGST and SGST must appear together " "(intra-state supply)."
                 ),
                 field=FieldRef(f"line_items[{idx}]"),
             )
@@ -282,9 +270,7 @@ def _check_line_item(
                 )
 
 
-def _check_totals(
-    extraction: dict[str, Any], issues: list[VerificationIssue]
-) -> None:
+def _check_totals(extraction: dict[str, Any], issues: list[VerificationIssue]) -> None:
     items = extraction.get("line_items") or []
     totals = extraction.get("totals") or {}
     if not isinstance(totals, dict):
@@ -334,19 +320,14 @@ def _check_totals(
     grand = _safe_money(totals.get("grand_total"))
     if grand is not None:
         expected_grand = quantize_money(
-            sums["taxable_value"]
-            + sums["total_cgst"]
-            + sums["total_sgst"]
-            + sums["total_igst"]
+            sums["taxable_value"] + sums["total_cgst"] + sums["total_sgst"] + sums["total_igst"]
         )
         if not _close_enough(grand, expected_grand):
             issues.append(
                 VerificationIssue(
                     severity=VerificationSeverity.ERROR,
                     code="grand_total_mismatch",
-                    message=(
-                        f"grand_total should be {expected_grand}, got {grand}."
-                    ),
+                    message=(f"grand_total should be {expected_grand}, got {grand}."),
                     field=FieldRef("totals.grand_total"),
                 )
             )

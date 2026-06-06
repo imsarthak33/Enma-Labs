@@ -46,9 +46,7 @@ MONEY_QUANTUM: Final[Decimal] = TWO_PLACES  # alias for readability
 # because then a literal "Rs." or "Mr." would leak the embedded dot into
 # the value and turn "Rs. 100" into "0.100". Matching the explicit numeric
 # shape is the safe move.
-_MONEY_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
-    r"-?\d[\d,]*(?:\.\d+)?"
-)
+_MONEY_TOKEN_RE: Final[re.Pattern[str]] = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
 
 
 def parse_money(value: object) -> Decimal:
@@ -75,8 +73,7 @@ def parse_money(value: object) -> Decimal:
         return quantize_money(Decimal(value))
     if isinstance(value, float):
         raise TypeError(
-            f"refusing to parse float as money ({value!r}); "
-            "cast at the call site if intentional"
+            f"refusing to parse float as money ({value!r}); " "cast at the call site if intentional"
         )
     if isinstance(value, str):
         match = _MONEY_TOKEN_RE.search(value)
@@ -108,8 +105,6 @@ def sum_money(values: object) -> Decimal:
     total = ZERO
     for v in values:  # type: ignore[attr-defined]
         if not isinstance(v, Decimal):
-            raise TypeError(
-                f"sum_money input contains non-Decimal: {type(v).__name__}"
-            )
+            raise TypeError(f"sum_money input contains non-Decimal: {type(v).__name__}")
         total += v
     return quantize_money(total)

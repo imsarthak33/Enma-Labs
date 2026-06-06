@@ -73,7 +73,8 @@ async def test_envelope_without_message_id_is_not_deduped(
 
     monkeypatch.setattr(idem_queries, "insert_if_new", fake_insert)
     verdict = await check_idempotency(
-        _envelope(message_id=None), _StubSession()  # type: ignore[arg-type]
+        _envelope(message_id=None),
+        _StubSession(),  # type: ignore[arg-type]
     )
     assert verdict.is_duplicate is False
     assert verdict.log_id is None

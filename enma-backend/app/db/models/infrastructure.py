@@ -97,9 +97,7 @@ class IdentityResolutionLog(Base):
         nullable=True,
         comment="HIGH | MEDIUM | EXPLICIT",
     )
-    resolution_time_ms: Mapped[int | None] = mapped_column(
-        Integer, nullable=True
-    )
+    resolution_time_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -151,9 +149,6 @@ class ClientNotification(Base):
         DateTime(timezone=True),
         nullable=True,
     )
-
-
-
 
 
 __all__ = [

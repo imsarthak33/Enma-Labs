@@ -48,9 +48,7 @@ class CaFirm(Base):
     subscription_tier: Mapped[str] = mapped_column(
         String(50), nullable=False, server_default=text("'starter'")
     )
-    max_clients: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("50")
-    )
+    max_clients: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("50"))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -72,9 +70,7 @@ class FirmUser(Base):
     """A user within a CA firm (admin, partner, or member)."""
 
     __tablename__ = "firm_users"
-    __table_args__ = (
-        UniqueConstraint("ca_firm_id", "chat_id", name="uq_firm_users_firm_chat"),
-    )
+    __table_args__ = (UniqueConstraint("ca_firm_id", "chat_id", name="uq_firm_users_firm_chat"),)
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -95,9 +91,7 @@ class FirmUser(Base):
         server_default=text("'member'"),
         comment="admin | partner | member",
     )
-    is_active: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, server_default=text("TRUE")
-    )
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("TRUE"))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

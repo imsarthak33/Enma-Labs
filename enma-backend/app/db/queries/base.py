@@ -34,14 +34,10 @@ class BaseQuery:
 
     def __init__(self, session: AsyncSession, ca_firm_id: uuid.UUID | str) -> None:
         if not ca_firm_id:
-            raise SecurityError(
-                "ca_firm_id is required for all database operations"
-            )
+            raise SecurityError("ca_firm_id is required for all database operations")
         self.session = session
         self.ca_firm_id = (
-            ca_firm_id
-            if isinstance(ca_firm_id, uuid.UUID)
-            else uuid.UUID(str(ca_firm_id))
+            ca_firm_id if isinstance(ca_firm_id, uuid.UUID) else uuid.UUID(str(ca_firm_id))
         )
 
     # -- SELECT helpers -------------------------------------------------------
@@ -52,15 +48,9 @@ class BaseQuery:
             model.ca_firm_id == self.ca_firm_id  # type: ignore[attr-defined]
         )
 
-    def _scoped_select_client(
-        self, model: type[T], client_id: uuid.UUID | str
-    ) -> Select[tuple[T]]:
+    def _scoped_select_client(self, model: type[T], client_id: uuid.UUID | str) -> Select[tuple[T]]:
         """Client-scoped queries add a second constraint layer."""
-        cid = (
-            client_id
-            if isinstance(client_id, uuid.UUID)
-            else uuid.UUID(str(client_id))
-        )
+        cid = client_id if isinstance(client_id, uuid.UUID) else uuid.UUID(str(client_id))
         return self._scoped_select(model).where(
             model.client_id == cid  # type: ignore[attr-defined]
         )
@@ -87,15 +77,9 @@ class BaseQuery:
 
     # -- UPDATE helper --------------------------------------------------------
 
-    async def _update(
-        self, model: type[T], record_id: uuid.UUID | str, **kwargs: Any
-    ) -> T | None:
+    async def _update(self, model: type[T], record_id: uuid.UUID | str, **kwargs: Any) -> T | None:
         """Every UPDATE is scoped to firm_id + record_id."""
-        rid = (
-            record_id
-            if isinstance(record_id, uuid.UUID)
-            else uuid.UUID(str(record_id))
-        )
+        rid = record_id if isinstance(record_id, uuid.UUID) else uuid.UUID(str(record_id))
         stmt = (
             update(model)
             .where(model.id == rid)  # type: ignore[attr-defined]
@@ -117,11 +101,7 @@ class BaseQuery:
 
     async def _hard_delete(self, model: type[T], record_id: uuid.UUID | str) -> None:
         """Hard delete — use ONLY for infrastructure/log tables."""
-        rid = (
-            record_id
-            if isinstance(record_id, uuid.UUID)
-            else uuid.UUID(str(record_id))
-        )
+        rid = record_id if isinstance(record_id, uuid.UUID) else uuid.UUID(str(record_id))
         stmt = (
             delete(model)
             .where(model.id == rid)  # type: ignore[attr-defined]

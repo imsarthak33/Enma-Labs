@@ -54,6 +54,12 @@ REPLAY_WINDOW_SECONDS: Final[int] = 300  # 5 minutes
 ALLOWED_KINDS: Final[frozenset[str]] = frozenset(
     {"document", "document_batch", "command", "voice", "callback"}
 )
+# Phase 7 — gateway-driven cron kinds. Verified by ``verify_cron_envelope``
+# which uses identical HMAC + freshness checks but a different allow-list
+# (these envelopes carry ``chat_id=null`` and no Telegram message_id).
+CRON_KINDS: Final[frozenset[str]] = frozenset(
+    {"cron_task_heartbeat", "cron_morning_briefing", "cron_client_chase"}
+)
 
 
 # ---------------------------------------------------------------------------
@@ -156,12 +162,8 @@ def _check_freshness(issued_at: datetime) -> None:
 async def verify_envelope(
     request: Request,
     x_enma_api_key: Annotated[str | None, Header(alias="X-Enma-Api-Key")] = None,
-    x_enma_signature: Annotated[
-        str | None, Header(alias="X-Enma-Signature")
-    ] = None,
-    x_enma_envelope_version: Annotated[
-        str | None, Header(alias="X-Enma-Envelope-Version")
-    ] = None,
+    x_enma_signature: Annotated[str | None, Header(alias="X-Enma-Signature")] = None,
+    x_enma_envelope_version: Annotated[str | None, Header(alias="X-Enma-Envelope-Version")] = None,
 ) -> DecodedEnvelope:
     """Verify the inbound envelope and return its decoded form."""
 
@@ -170,12 +172,8 @@ async def verify_envelope(
     if x_enma_signature is None:
         raise _unauthorized("missing signature header")
 
-    if x_enma_envelope_version is not None and x_enma_envelope_version != str(
-        ENVELOPE_VERSION
-    ):
-        raise _bad_request(
-            f"unsupported envelope version: {x_enma_envelope_version}"
-        )
+    if x_enma_envelope_version is not None and x_enma_envelope_version != str(ENVELOPE_VERSION):
+        raise _bad_request(f"unsupported envelope version: {x_enma_envelope_version}")
 
     # Read the raw body once; FastAPI would otherwise consume it for us when
     # we declare a model parameter.
@@ -228,11 +226,92 @@ async def verify_envelope(
 VerifiedEnvelopeDep = Annotated[DecodedEnvelope, Depends(verify_envelope)]
 
 
+# ---------------------------------------------------------------------------
+# Cron envelope verifier (Phase 7)
+# ---------------------------------------------------------------------------
+
+
+async def verify_cron_envelope(
+    request: Request,
+    x_enma_api_key: Annotated[str | None, Header(alias="X-Enma-Api-Key")] = None,
+    x_enma_signature: Annotated[str | None, Header(alias="X-Enma-Signature")] = None,
+    x_enma_envelope_version: Annotated[str | None, Header(alias="X-Enma-Envelope-Version")] = None,
+) -> DecodedEnvelope:
+    """Verify an inbound cron envelope.
+
+    Identical HMAC + freshness checks to :func:`verify_envelope`, but:
+
+    * ``kind`` must be one of :data:`CRON_KINDS`.
+    * ``chat_id`` MUST be ``None`` — cron has no Telegram chat target.
+    * The payload MUST carry ``scheduled_at`` (ISO-8601, tz-aware) so the
+      idempotency middleware can derive a stable dedup key.
+
+    See ADR-007 §Decision 2 for the dedup-key rationale.
+    """
+    _check_api_key(x_enma_api_key)
+
+    if x_enma_signature is None:
+        raise _unauthorized("missing signature header")
+
+    if x_enma_envelope_version is not None and x_enma_envelope_version != str(ENVELOPE_VERSION):
+        raise _bad_request(f"unsupported envelope version: {x_enma_envelope_version}")
+
+    raw_body = await request.body()
+    if not raw_body:
+        raise _bad_request("empty body")
+
+    try:
+        outer = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _bad_request("outer body is not JSON") from exc
+    if not isinstance(outer, dict):
+        raise _bad_request("outer body must be a JSON object")
+    if outer.get("v") != ENVELOPE_VERSION:
+        raise _bad_request(f"outer envelope version mismatch: {outer.get('v')!r}")
+
+    payload_b64 = outer.get("payload_b64")
+    if not isinstance(payload_b64, str) or not payload_b64:
+        raise _bad_request("outer envelope missing payload_b64")
+
+    _verify_signature(payload_b64, x_enma_signature)
+
+    inner_dict = _decode_inner(payload_b64)
+
+    try:
+        envelope = DecodedEnvelope.model_validate(inner_dict)
+    except ValidationError as exc:
+        raise _bad_request(f"inner envelope schema invalid: {exc.errors()[:3]}") from exc
+
+    if envelope.v != ENVELOPE_VERSION:
+        raise _bad_request(f"inner envelope version mismatch: {envelope.v}")
+    if envelope.kind not in CRON_KINDS:
+        raise _bad_request(f"not a cron envelope kind: {envelope.kind}")
+    if outer.get("kind") != envelope.kind:
+        raise _bad_request("outer/inner kind mismatch")
+    if envelope.chat_id is not None:
+        # Cron envelopes are firm-fanout-only — a chat_id would muddle the
+        # per-firm scheduling and would also collide with the user idempotency
+        # key. Reject early.
+        raise _bad_request("cron envelope must not carry chat_id")
+    if not isinstance(envelope.payload.get("scheduled_at"), str):
+        raise _bad_request("cron envelope payload missing 'scheduled_at'")
+
+    _check_freshness(envelope.issued_at)
+
+    return envelope
+
+
+VerifiedCronEnvelopeDep = Annotated[DecodedEnvelope, Depends(verify_cron_envelope)]
+
+
 __all__ = [
     "ALLOWED_KINDS",
+    "CRON_KINDS",
     "DecodedEnvelope",
     "ENVELOPE_VERSION",
     "REPLAY_WINDOW_SECONDS",
+    "VerifiedCronEnvelopeDep",
     "VerifiedEnvelopeDep",
+    "verify_cron_envelope",
     "verify_envelope",
 ]

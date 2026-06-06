@@ -262,9 +262,7 @@ async def call_chat(
             status=resp.status_code,
             body=resp.text[:500],
         )
-        raise LLMError(
-            f"LLM returned HTTP {resp.status_code}: {resp.text[:200]}"
-        )
+        raise LLMError(f"LLM returned HTTP {resp.status_code}: {resp.text[:200]}")
 
     try:
         data: dict[str, Any] = resp.json()
@@ -274,9 +272,7 @@ async def call_chat(
     return _parse_response(data, role=role, model=model)
 
 
-def _parse_response(
-    data: dict[str, Any], *, role: LLMRole, model: str
-) -> ChatResponse:
+def _parse_response(data: dict[str, Any], *, role: LLMRole, model: str) -> ChatResponse:
     """Extract content + usage from a Chat Completions response body."""
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices:

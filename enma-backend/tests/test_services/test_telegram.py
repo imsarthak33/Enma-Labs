@@ -35,9 +35,7 @@ async def test_send_message_uses_html_parse_mode() -> None:
 
     client = _make_client(httpx.MockTransport(handler))
     try:
-        result = await telegram.send_message(
-            chat_id=42, html_text="<b>hello</b>", client=client
-        )
+        result = await telegram.send_message(chat_id=42, html_text="<b>hello</b>", client=client)
     finally:
         await client.aclose()
 
@@ -64,9 +62,7 @@ async def test_send_message_optional_reply_to() -> None:
 
     client = _make_client(httpx.MockTransport(handler))
     try:
-        await telegram.send_message(
-            chat_id=1, html_text="x", reply_to_message_id=99, client=client
-        )
+        await telegram.send_message(chat_id=1, html_text="x", reply_to_message_id=99, client=client)
     finally:
         await client.aclose()
     body = json.loads(seen[0].content.decode())

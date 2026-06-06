@@ -15,6 +15,7 @@ from app.db.models.infrastructure import (
     IdempotencyLog,
     IdentityResolutionLog,
 )
+from app.db.models.pending_assignment import PendingAssignment
 from app.db.models.rule import CaFirmRule
 from app.db.models.task import Task
 
@@ -29,5 +30,6 @@ __all__ = [
     "FirmUser",
     "IdempotencyLog",
     "IdentityResolutionLog",
+    "PendingAssignment",
     "Task",
 ]

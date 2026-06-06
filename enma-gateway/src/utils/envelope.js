@@ -42,6 +42,17 @@ export const ENVELOPE_KINDS = Object.freeze([
   "command",
   "voice",
   "callback",
+  // Phase 7 — gateway-initiated cron envelopes (ADR-007).
+  "cron_task_heartbeat",
+  "cron_morning_briefing",
+  "cron_client_chase",
+]);
+
+/** Subset that callers can use to recognise cron envelopes. */
+export const CRON_ENVELOPE_KINDS = Object.freeze([
+  "cron_task_heartbeat",
+  "cron_morning_briefing",
+  "cron_client_chase",
 ]);
 
 /**

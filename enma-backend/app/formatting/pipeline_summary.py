@@ -67,9 +67,7 @@ def _verdict_line(verification: VerificationResult | None) -> str:
     if verification is None:
         return italic("Verification skipped (extraction failed).")
     errors = [i for i in verification.issues if i.severity is VerificationSeverity.ERROR]
-    warnings = [
-        i for i in verification.issues if i.severity is VerificationSeverity.WARNING
-    ]
+    warnings = [i for i in verification.issues if i.severity is VerificationSeverity.WARNING]
     if errors:
         return (
             f"{bold('Verdict:')} {bold('NEEDS REVIEW')} "
@@ -132,9 +130,7 @@ def _stage_block(result: PipelineResult) -> str:
     pieces = []
     for s in result.stages:
         glyph = _stage_glyph(s.status)
-        pieces.append(
-            f"{glyph} {safe_text(s.stage.value)} {italic(f'{s.duration_ms} ms')}"
-        )
+        pieces.append(f"{glyph} {safe_text(s.stage.value)} {italic(f'{s.duration_ms} ms')}")
     return bold("Pipeline") + "\n" + "\n".join(pieces)
 
 
@@ -157,9 +153,7 @@ def _severity_sort_key(issue: VerificationIssue) -> int:
 def _format_issue(issue: VerificationIssue) -> str:
     sev_label = bold(safe_text(issue.severity.value))
     code_label = code(safe_text(issue.code))
-    field_label = (
-        f" @ {code(safe_text(issue.field.path))}" if issue.field else ""
-    )
+    field_label = f" @ {code(safe_text(issue.field.path))}" if issue.field else ""
     return f"• {sev_label} {code_label}{field_label}: {safe_text(issue.message)}"
 
 

@@ -1,10 +1,11 @@
-"""Tests for the Phase 4 ``_run_document_pipeline`` background coroutine.
+"""Tests for the Phase 4/6 ``_run_document_pipeline`` background coroutine.
 
 We hand it a decoded envelope and mock every external dependency:
 
   * ``find_firm_by_admin_chat_id`` — returns a fixture firm
-  * ``ClientQuery.first_active`` — returns a fixture client
-  * ``telegram.download_file`` — returns bytes
+  * ``resolve_identity``           — returns a synthetic ResolutionOutcome
+  * ``ClientQuery.get_by_id``      — returns a fixture client
+  * ``telegram.download_file``     — returns bytes
   * ``run_pipeline``               — returns a synthetic PipelineResult
   * ``telegram.send_message``      — captures calls
 
@@ -60,6 +61,12 @@ class _FakeSession:
     async def close(self) -> None:
         return None
 
+    async def commit(self) -> None:
+        return None
+
+    async def rollback(self) -> None:
+        return None
+
 
 def _fake_sessionmaker():
     @asynccontextmanager
@@ -99,6 +106,7 @@ def _patch_common(
     download_bytes: bytes = b"\x89PNG\r\n\x1a\nfake",
     pipeline_result: PipelineResult | None = None,
     pipeline_raise: Exception | None = None,
+    pending_assignment: bool = False,
 ) -> dict[str, list[Any]]:
     """Apply standard monkeypatches and return capture buckets."""
     captures: dict[str, list[Any]] = {
@@ -112,11 +120,48 @@ def _patch_common(
 
     monkeypatch.setattr(worker_module, "find_firm_by_admin_chat_id", fake_find_firm)
 
+    from app.identity.resolver import (
+        ResolutionConfidence,
+        ResolutionOutcome,
+        ResolutionStage,
+    )
+
+    # Synthetic client_id so is_resolved=True even when the fixture
+    # client object is None (drives the "routed client no longer exists" path).
+    synthetic_client_id = getattr(client, "id", None) or uuid.uuid4()
+
+    async def fake_resolve_identity(**_kw: Any) -> ResolutionOutcome:
+        if pending_assignment:
+            return ResolutionOutcome(
+                stage=ResolutionStage.EXPLICIT_ASK,
+                confidence=ResolutionConfidence.EXPLICIT,
+                client_id=None,
+                pending_assignment_id=uuid.uuid4(),
+                resolution_time_ms=1,
+                log_id=uuid.uuid4(),
+            )
+        return ResolutionOutcome(
+            stage=ResolutionStage.SESSION,
+            confidence=ResolutionConfidence.HIGH,
+            client_id=synthetic_client_id,
+            pending_assignment_id=None,
+            resolution_time_ms=1,
+            log_id=uuid.uuid4(),
+        )
+
+    monkeypatch.setattr(worker_module, "resolve_identity", fake_resolve_identity)
+
     class _FakeClientQuery:
         def __init__(self, **_kw: Any) -> None: ...
 
         async def first_active(self) -> Any:
             return client
+
+        async def get_by_id(self, _client_id: Any) -> Any:
+            return client
+
+        async def list_active(self) -> list[Any]:
+            return [client] if client is not None else []
 
     monkeypatch.setattr(worker_module, "ClientQuery", _FakeClientQuery)
     monkeypatch.setattr(worker_module, "get_sessionmaker", _fake_sessionmaker)
@@ -158,9 +203,7 @@ class _FakeClient:
 
 @pytest.mark.asyncio
 async def test_happy_path_sends_summary(monkeypatch: pytest.MonkeyPatch) -> None:
-    captures = _patch_common(
-        monkeypatch, firm=_FakeFirm(), client=_FakeClient()
-    )
+    captures = _patch_common(monkeypatch, firm=_FakeFirm(), client=_FakeClient())
     await worker_module._run_document_pipeline(_envelope())
     assert captures["downloads"] == ["tg-file-1"]
     assert len(captures["pipeline_calls"]) == 1
@@ -184,8 +227,24 @@ async def test_no_firm_sends_error_message(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 @pytest.mark.asyncio
-async def test_no_clients_sends_error_message(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_resolved_client_missing_sends_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Identity resolved to a client_id but the row no longer exists."""
     captures = _patch_common(monkeypatch, firm=_FakeFirm(), client=None)
+    await worker_module._run_document_pipeline(_envelope())
+    assert captures["pipeline_calls"] == []
+    assert "Routed client no longer exists" in captures["sends"][0]["html_text"]
+
+
+@pytest.mark.asyncio
+async def test_pending_assignment_no_clients_sends_no_clients_msg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Identity cascade hits stage 5 but the firm has no active clients."""
+    captures = _patch_common(
+        monkeypatch, firm=_FakeFirm(), client=None, pending_assignment=True
+    )
     await worker_module._run_document_pipeline(_envelope())
     assert captures["pipeline_calls"] == []
     assert "no active clients" in captures["sends"][0]["html_text"]

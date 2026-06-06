@@ -33,12 +33,14 @@ sqlite3.register_converter("TEXT", lambda b: b.decode("utf-8"))
 
 # -- Helper: Create a SQLite-compatible metadata copy -----------------------
 
+
 def _create_sqlite_tables(eng):
     """Create all tables using raw SQL that SQLite can handle."""
     from sqlalchemy import text as sa_text
 
     with eng.connect() as conn:
-        conn.execute(sa_text("""
+        conn.execute(
+            sa_text("""
             CREATE TABLE IF NOT EXISTS ca_firms (
                 id TEXT PRIMARY KEY,
                 firm_name TEXT NOT NULL,
@@ -49,8 +51,10 @@ def _create_sqlite_tables(eng):
                 created_at TEXT,
                 updated_at TEXT
             )
-        """))
-        conn.execute(sa_text("""
+        """)
+        )
+        conn.execute(
+            sa_text("""
             CREATE TABLE IF NOT EXISTS firm_users (
                 id TEXT PRIMARY KEY,
                 ca_firm_id TEXT NOT NULL REFERENCES ca_firms(id),
@@ -61,8 +65,10 @@ def _create_sqlite_tables(eng):
                 created_at TEXT,
                 UNIQUE(ca_firm_id, chat_id)
             )
-        """))
-        conn.execute(sa_text("""
+        """)
+        )
+        conn.execute(
+            sa_text("""
             CREATE TABLE IF NOT EXISTS clients (
                 id TEXT PRIMARY KEY,
                 ca_firm_id TEXT NOT NULL REFERENCES ca_firms(id),
@@ -75,12 +81,15 @@ def _create_sqlite_tables(eng):
                 contact_email TEXT,
                 contact_phone TEXT,
                 is_active INTEGER DEFAULT 1,
+                gst_tds_deductor INTEGER DEFAULT 0,
                 created_at TEXT,
                 updated_at TEXT,
                 UNIQUE(ca_firm_id, gstin)
             )
-        """))
-        conn.execute(sa_text("""
+        """)
+        )
+        conn.execute(
+            sa_text("""
             CREATE TABLE IF NOT EXISTS documents (
                 id TEXT PRIMARY KEY,
                 ca_firm_id TEXT NOT NULL REFERENCES ca_firms(id),
@@ -97,11 +106,13 @@ def _create_sqlite_tables(eng):
                 created_at TEXT,
                 updated_at TEXT
             )
-        """))
+        """)
+        )
         conn.commit()
 
 
 # -- Fixtures ---------------------------------------------------------------
+
 
 @pytest.fixture
 async def engine():
@@ -119,7 +130,8 @@ async def engine():
                 id TEXT PRIMARY KEY, ca_firm_id TEXT NOT NULL REFERENCES ca_firms(id),
                 trade_name TEXT NOT NULL, legal_name TEXT, gstin TEXT, pan TEXT,
                 state_code TEXT, address TEXT, contact_email TEXT, contact_phone TEXT,
-                is_active INTEGER DEFAULT 1, created_at TEXT, updated_at TEXT)""",
+                is_active INTEGER DEFAULT 1, gst_tds_deductor INTEGER DEFAULT 0,
+                created_at TEXT, updated_at TEXT)""",
             """CREATE TABLE documents (
                 id TEXT PRIMARY KEY, ca_firm_id TEXT NOT NULL REFERENCES ca_firms(id),
                 client_id TEXT NOT NULL REFERENCES clients(id),
@@ -130,6 +142,7 @@ async def engine():
                 created_at TEXT, updated_at TEXT)""",
         ]:
             from sqlalchemy import text as sa_text
+
             await conn.execute(sa_text(ddl))
 
     yield eng
@@ -148,6 +161,7 @@ async def session(engine):
 async def seeded_session(session: AsyncSession):
     """Seed Firm A and Firm B with clients and documents."""
     from sqlalchemy import text as sa_text
+
     now = datetime.now(UTC).isoformat()
     client_a_id = str(uuid.uuid4())
     client_b_id = str(uuid.uuid4())
@@ -158,9 +172,7 @@ async def seeded_session(session: AsyncSession):
         "id, firm_name, admin_chat_id, telegram_bot_token, "
         "subscription_tier, max_clients, created_at, updated_at"
     )
-    client_cols = (
-        "id, ca_firm_id, trade_name, gstin, is_active, created_at, updated_at"
-    )
+    client_cols = "id, ca_firm_id, trade_name, gstin, is_active, created_at, updated_at"
     doc_cols = (
         "id, ca_firm_id, client_id, document_type, source_file_ids, "
         "extraction_data, processing_status, created_at, updated_at"
@@ -170,8 +182,7 @@ async def seeded_session(session: AsyncSession):
         "VALUES (:id, :name, :chat, :token, 'starter', 50, :now, :now)"
     )
     client_sql = sa_text(
-        f"INSERT INTO clients ({client_cols}) "
-        "VALUES (:id, :firm, :name, :gstin, 1, :now, :now)"
+        f"INSERT INTO clients ({client_cols}) " "VALUES (:id, :firm, :name, :gstin, 1, :now, :now)"
     )
     doc_sql = sa_text(
         f"INSERT INTO documents ({doc_cols}) "
@@ -180,36 +191,72 @@ async def seeded_session(session: AsyncSession):
     )
 
     # Insert firms
-    await session.execute(firm_sql, {
-        "id": str(FIRM_A_ID), "name": "Firm Alpha",
-        "chat": 111111, "token": "tok_a", "now": now,
-    })
-    await session.execute(firm_sql, {
-        "id": str(FIRM_B_ID), "name": "Firm Beta",
-        "chat": 222222, "token": "tok_b", "now": now,
-    })
+    await session.execute(
+        firm_sql,
+        {
+            "id": str(FIRM_A_ID),
+            "name": "Firm Alpha",
+            "chat": 111111,
+            "token": "tok_a",
+            "now": now,
+        },
+    )
+    await session.execute(
+        firm_sql,
+        {
+            "id": str(FIRM_B_ID),
+            "name": "Firm Beta",
+            "chat": 222222,
+            "token": "tok_b",
+            "now": now,
+        },
+    )
 
     # Insert clients
-    await session.execute(client_sql, {
-        "id": client_a_id, "firm": str(FIRM_A_ID),
-        "name": "Alpha Client 1", "gstin": "27AABCU9603R1ZP", "now": now,
-    })
-    await session.execute(client_sql, {
-        "id": client_b_id, "firm": str(FIRM_B_ID),
-        "name": "Beta Client 1", "gstin": "29AADCB2230M1ZT", "now": now,
-    })
+    await session.execute(
+        client_sql,
+        {
+            "id": client_a_id,
+            "firm": str(FIRM_A_ID),
+            "name": "Alpha Client 1",
+            "gstin": "27AABCU9603R1ZP",
+            "now": now,
+        },
+    )
+    await session.execute(
+        client_sql,
+        {
+            "id": client_b_id,
+            "firm": str(FIRM_B_ID),
+            "name": "Beta Client 1",
+            "gstin": "29AADCB2230M1ZT",
+            "now": now,
+        },
+    )
 
     # Insert documents
-    await session.execute(doc_sql, {
-        "id": doc_a_id, "firm": str(FIRM_A_ID), "client": client_a_id,
-        "files": '{"file_ids":["abc"]}', "data": '{"vendor":"Test A"}',
-        "now": now,
-    })
-    await session.execute(doc_sql, {
-        "id": doc_b_id, "firm": str(FIRM_B_ID), "client": client_b_id,
-        "files": '{"file_ids":["xyz"]}', "data": '{"vendor":"Test B"}',
-        "now": now,
-    })
+    await session.execute(
+        doc_sql,
+        {
+            "id": doc_a_id,
+            "firm": str(FIRM_A_ID),
+            "client": client_a_id,
+            "files": '{"file_ids":["abc"]}',
+            "data": '{"vendor":"Test A"}',
+            "now": now,
+        },
+    )
+    await session.execute(
+        doc_sql,
+        {
+            "id": doc_b_id,
+            "firm": str(FIRM_B_ID),
+            "client": client_b_id,
+            "files": '{"file_ids":["xyz"]}',
+            "data": '{"vendor":"Test B"}',
+            "now": now,
+        },
+    )
 
     await session.commit()
     return session
@@ -218,6 +265,7 @@ async def seeded_session(session: AsyncSession):
 # ==========================================================================
 # Test: BaseQuery rejects empty firm_id
 # ==========================================================================
+
 
 class TestBaseQuerySecurity:
     """Verify the BaseQuery class enforces firm_id on construction."""
@@ -243,18 +291,18 @@ class TestBaseQuerySecurity:
 # Test: Cross-tenant client isolation
 # ==========================================================================
 
+
 class TestClientIsolation:
     """Verify that ClientQuery scopes all operations to the owning firm."""
 
-    async def test_firm_a_cannot_see_firm_b_clients(
-        self, seeded_session: AsyncSession
-    ) -> None:
+    async def test_firm_a_cannot_see_firm_b_clients(self, seeded_session: AsyncSession) -> None:
         """Firm A's client list must not contain Firm B's clients.
 
         Uses raw SQL to verify isolation since SQLite + ORM UUID types
         have comparison issues. This validates the WHERE clause logic.
         """
         from sqlalchemy import text as sa_text
+
         result = await seeded_session.execute(
             sa_text("SELECT * FROM clients WHERE ca_firm_id = :firm_id AND is_active = 1"),
             {"firm_id": str(FIRM_A_ID)},
@@ -263,10 +311,9 @@ class TestClientIsolation:
         assert len(rows) >= 1
         assert all(r[1] == str(FIRM_A_ID) for r in rows)  # ca_firm_id is col index 1
 
-    async def test_firm_b_cannot_see_firm_a_clients(
-        self, seeded_session: AsyncSession
-    ) -> None:
+    async def test_firm_b_cannot_see_firm_a_clients(self, seeded_session: AsyncSession) -> None:
         from sqlalchemy import text as sa_text
+
         result = await seeded_session.execute(
             sa_text("SELECT * FROM clients WHERE ca_firm_id = :firm_id AND is_active = 1"),
             {"firm_id": str(FIRM_B_ID)},
@@ -280,6 +327,7 @@ class TestClientIsolation:
     ) -> None:
         """Querying Firm A must return zero Firm B rows."""
         from sqlalchemy import text as sa_text
+
         result = await seeded_session.execute(
             sa_text("SELECT COUNT(*) FROM clients WHERE ca_firm_id = :a AND ca_firm_id = :b"),
             {"a": str(FIRM_A_ID), "b": str(FIRM_B_ID)},
@@ -287,11 +335,10 @@ class TestClientIsolation:
         count = result.scalar()
         assert count == 0, "A query scoped to both firms must return 0 rows"
 
-    async def test_get_by_gstin_cross_tenant(
-        self, seeded_session: AsyncSession
-    ) -> None:
+    async def test_get_by_gstin_cross_tenant(self, seeded_session: AsyncSession) -> None:
         """Firm A cannot fetch Firm B's client by GSTIN."""
         from sqlalchemy import text as sa_text
+
         result = await seeded_session.execute(
             sa_text("SELECT * FROM clients WHERE ca_firm_id = :firm AND gstin = :gstin"),
             {"firm": str(FIRM_A_ID), "gstin": "29AADCB2230M1ZT"},
@@ -303,13 +350,13 @@ class TestClientIsolation:
 # Test: Cross-tenant document isolation
 # ==========================================================================
 
+
 class TestDocumentIsolation:
     """Verify that DocumentQuery scopes all operations to the owning firm."""
 
-    async def test_firm_a_cannot_see_firm_b_documents(
-        self, seeded_session: AsyncSession
-    ) -> None:
+    async def test_firm_a_cannot_see_firm_b_documents(self, seeded_session: AsyncSession) -> None:
         from sqlalchemy import text as sa_text
+
         result = await seeded_session.execute(
             sa_text("SELECT * FROM documents WHERE ca_firm_id = :firm"),
             {"firm": str(FIRM_A_ID)},
@@ -318,10 +365,9 @@ class TestDocumentIsolation:
         assert len(rows) >= 1
         assert all(r[1] == str(FIRM_A_ID) for r in rows)
 
-    async def test_firm_b_cannot_see_firm_a_documents(
-        self, seeded_session: AsyncSession
-    ) -> None:
+    async def test_firm_b_cannot_see_firm_a_documents(self, seeded_session: AsyncSession) -> None:
         from sqlalchemy import text as sa_text
+
         result = await seeded_session.execute(
             sa_text("SELECT * FROM documents WHERE ca_firm_id = :firm"),
             {"firm": str(FIRM_B_ID)},
@@ -330,9 +376,7 @@ class TestDocumentIsolation:
         assert len(rows) >= 1
         assert all(r[1] == str(FIRM_B_ID) for r in rows)
 
-    async def test_get_by_id_cross_tenant(
-        self, seeded_session: AsyncSession
-    ) -> None:
+    async def test_get_by_id_cross_tenant(self, seeded_session: AsyncSession) -> None:
         """Firm A cannot fetch a Firm B document by ID when scoped."""
         from sqlalchemy import text as sa_text
 
@@ -355,12 +399,11 @@ class TestDocumentIsolation:
 # Test: BaseQuery _insert always injects firm_id
 # ==========================================================================
 
+
 class TestInsertInjection:
     """Verify that _insert always overrides ca_firm_id."""
 
-    async def test_insert_overrides_wrong_firm_id(
-        self, seeded_session: AsyncSession
-    ) -> None:
+    async def test_insert_overrides_wrong_firm_id(self, seeded_session: AsyncSession) -> None:
         """Even if someone sets a different ca_firm_id, _insert overrides it."""
         query = BaseQuery(seeded_session, ca_firm_id=FIRM_A_ID)
 

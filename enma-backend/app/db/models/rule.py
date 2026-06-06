@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Any
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -22,7 +24,7 @@ from sqlalchemy import (
     Text,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -46,6 +48,10 @@ class CaFirmRule(Base):
             postgresql_using="ivfflat",
             postgresql_with={"lists": 100},
             postgresql_ops={"rule_embedding": "vector_cosine_ops"},
+        ),
+        CheckConstraint(
+            "jsonb_typeof(directive) = 'object'",
+            name="ck_ca_firm_rules_directive_is_object",
         ),
     )
 
@@ -85,6 +91,15 @@ class CaFirmRule(Base):
         String(50),
         nullable=False,
         comment="human_correction | manual_entry | system_learned",
+    )
+    directive: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text("'{}'::jsonb"),
+        comment=(
+            "Typed RuleDirective payload (action + scope). Authoritative for the "
+            "tax engine; rule_text is retrieval-only."
+        ),
     )
     is_active: Mapped[bool] = mapped_column(
         Boolean,

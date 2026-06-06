@@ -18,28 +18,18 @@ class DocumentQuery(BaseQuery):
         stmt = self._scoped_select(Document).order_by(Document.created_at.desc())
         return await self._fetch_all(stmt)
 
-    async def list_by_client(
-        self, client_id: uuid.UUID | str
-    ) -> Sequence[Document]:
+    async def list_by_client(self, client_id: uuid.UUID | str) -> Sequence[Document]:
         """Return all documents for a specific client (firm-scoped)."""
-        stmt = self._scoped_select_client(Document, client_id).order_by(
-            Document.created_at.desc()
-        )
+        stmt = self._scoped_select_client(Document, client_id).order_by(Document.created_at.desc())
         return await self._fetch_all(stmt)
 
     async def get_by_id(self, document_id: uuid.UUID | str) -> Document | None:
         """Fetch a single document by ID (firm-scoped)."""
-        did = (
-            document_id
-            if isinstance(document_id, uuid.UUID)
-            else uuid.UUID(str(document_id))
-        )
+        did = document_id if isinstance(document_id, uuid.UUID) else uuid.UUID(str(document_id))
         stmt = self._scoped_select(Document).where(Document.id == did)
         return await self._fetch_one(stmt)
 
-    async def list_by_filing_period(
-        self, year: int, month: int
-    ) -> Sequence[Document]:
+    async def list_by_filing_period(self, year: int, month: int) -> Sequence[Document]:
         """Return all documents for a filing period (firm-scoped)."""
         stmt = (
             self._scoped_select(Document)
@@ -62,11 +52,7 @@ class DocumentQuery(BaseQuery):
         filing_period_year: int | None = None,
     ) -> Document:
         """Insert a new document for this firm."""
-        cid = (
-            client_id
-            if isinstance(client_id, uuid.UUID)
-            else uuid.UUID(str(client_id))
-        )
+        cid = client_id if isinstance(client_id, uuid.UUID) else uuid.UUID(str(client_id))
         doc = Document(
             client_id=cid,
             document_type=document_type,

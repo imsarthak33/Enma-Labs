@@ -42,9 +42,13 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.classifier import ClassificationResult, classify_document
+from app.agents.context_injector import load_rules_for_engine
 from app.agents.extractor import ExtractionResult, extract_document
+from app.agents.tax_engine import LockedPeriodError, TaxVerdict, compute_verdict
 from app.agents.verifier import VerificationResult, verify_extraction
+from app.db.queries.clients import ClientQuery
 from app.db.queries.documents import DocumentQuery
+from app.db.queries.filings import FilingQuery
 from app.logging_setup import get_logger
 from app.services.file_processor import (
     FileKind,
@@ -53,6 +57,8 @@ from app.services.file_processor import (
     is_image,
     split_pdf_pages,
 )
+from app.tax.itc import PeriodContext
+from app.utils.date_utils import FilingPeriod, now_ist, parse_iso_date
 
 _log = get_logger(__name__)
 
@@ -71,6 +77,7 @@ class PipelineStage(StrEnum):
     CLASSIFICATION = "classification"
     EXTRACTION = "extraction"
     VERIFICATION = "verification"
+    TAX_VERDICT = "tax_verdict"
     PERSISTENCE = "persistence"
 
 
@@ -98,6 +105,7 @@ class PipelineResult:
     document_type: str
     extraction: dict[str, Any] | None
     verification: VerificationResult | None
+    tax_verdict: TaxVerdict | None = None
     stages: tuple[PipelineStageOutcome, ...] = field(default_factory=tuple)
 
     @property
@@ -125,7 +133,7 @@ def _now_ms() -> int:
 # ---------------------------------------------------------------------------
 
 
-async def run_pipeline(
+async def run_pipeline(  # noqa: PLR0912, PLR0915 — linear orchestrator, splitting hurts readability
     *,
     session: AsyncSession,
     ca_firm_id: uuid.UUID,
@@ -252,7 +260,98 @@ async def run_pipeline(
             )
         )
 
-    # ---- Stage 5: persistence --------------------------------------------
+    # ---- Stage 5: tax verdict --------------------------------------------
+    verdict: TaxVerdict | None = None
+    t0 = _now_ms()
+    if extraction_data is not None:
+        try:
+            verdict = await _run_tax_engine(
+                session=session,
+                ca_firm_id=ca_firm_id,
+                client_id=client_id,
+                extraction=extraction_data,
+                document_type=classification.document_type,
+                filing_period_month=filing_period_month,
+                filing_period_year=filing_period_year,
+            )
+            stages.append(
+                PipelineStageOutcome(
+                    stage=PipelineStage.TAX_VERDICT,
+                    status=PipelineStageStatus.OK,
+                    duration_ms=_now_ms() - t0,
+                )
+            )
+        except LockedPeriodError as exc:
+            # Frozen-verdict invariant — the document targets a period
+            # the firm has already approved. Skip without failing the
+            # pipeline; the CA can investigate via audit.
+            _log.info("pipeline_skipped_locked_period", reason=str(exc))
+            stages.append(
+                PipelineStageOutcome(
+                    stage=PipelineStage.TAX_VERDICT,
+                    status=PipelineStageStatus.SKIPPED,
+                    duration_ms=_now_ms() - t0,
+                    error=str(exc),
+                )
+            )
+        except Exception as exc:  # — engine errors are observable but not fatal
+            stages.append(
+                PipelineStageOutcome(
+                    stage=PipelineStage.TAX_VERDICT,
+                    status=PipelineStageStatus.FAILED,
+                    duration_ms=_now_ms() - t0,
+                    error=str(exc),
+                )
+            )
+            _log.error("pipeline_tax_verdict_failed", error=str(exc))
+    else:
+        stages.append(
+            PipelineStageOutcome(
+                stage=PipelineStage.TAX_VERDICT,
+                status=PipelineStageStatus.SKIPPED,
+                duration_ms=_now_ms() - t0,
+            )
+        )
+
+    # ---- Filing-period lock check ----------------------------------------
+    # Phase 6 invariant: a (firm, month, year) approved via ENMA APPROVE
+    # FILING is frozen — new documents whose invoice date falls inside a
+    # locked period are refused (decision in Phase 6 plan, ADR-005 rev 2).
+    invoice_date_iso = (extraction_data or {}).get("invoice_date")
+    invoice_date_parsed = parse_iso_date(invoice_date_iso)
+    derived_month = filing_period_month
+    derived_year = filing_period_year
+    if invoice_date_parsed is not None and derived_month is None:
+        derived_month = invoice_date_parsed.month
+        derived_year = invoice_date_parsed.year
+    if derived_month is not None and derived_year is not None:
+        locked = await FilingQuery(
+            session=session, ca_firm_id=ca_firm_id
+        ).is_period_locked(month=derived_month, year=derived_year)
+        if locked:
+            _log.info(
+                "pipeline_refused_locked_period",
+                month=derived_month,
+                year=derived_year,
+            )
+            stages.append(
+                PipelineStageOutcome(
+                    stage=PipelineStage.PERSISTENCE,
+                    status=PipelineStageStatus.SKIPPED,
+                    duration_ms=0,
+                    error=f"period {derived_month}/{derived_year} is locked",
+                )
+            )
+            return PipelineResult(
+                document_id=None,
+                document_type=classification.document_type,
+                extraction=extraction_data,
+                verification=verification,
+                tax_verdict=verdict,
+                stages=tuple(stages),
+            )
+
+    # ---- Stage 6: persistence --------------------------------------------
     t0 = _now_ms()
     document_id: uuid.UUID | None = None
     queries = DocumentQuery(session=session, ca_firm_id=ca_firm_id)
@@ -262,10 +361,8 @@ async def run_pipeline(
             document_type=classification.document_type,
             source_file_ids={"file_ids": source_file_ids or []},
             extraction_data=extraction_data or {},
-            tax_verdict=None,  # Phase 5
-            verification_result=(
-                verification.to_dict() if verification is not None else None
-            ),
+            tax_verdict=verdict.to_jsonb() if verdict is not None else None,
+            verification_result=(verification.to_dict() if verification is not None else None),
             filing_period_month=filing_period_month,
             filing_period_year=filing_period_year,
         )
@@ -298,7 +395,84 @@ async def run_pipeline(
         document_type=classification.document_type,
         extraction=extraction_data,
         verification=verification,
+        tax_verdict=verdict,
         stages=tuple(stages),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tax engine integration
+# ---------------------------------------------------------------------------
+
+
+async def _run_tax_engine(
+    *,
+    session: AsyncSession,
+    ca_firm_id: uuid.UUID,
+    client_id: uuid.UUID,
+    extraction: dict[str, Any],
+    document_type: str,
+    filing_period_month: int | None,
+    filing_period_year: int | None,
+) -> TaxVerdict:
+    """Assemble the engine inputs and run :func:`compute_verdict`.
+
+    DB I/O happens here, NOT inside the engine itself — keeping the
+    engine pure makes it trivially unit-testable. We:
+
+      * Look up the client's ``gst_tds_deductor`` flag.
+      * Build the locked-period set from ``filing_approvals``.
+      * Build the current ``FilingPeriod`` from the supplied period or
+        IST today.
+      * Retrieve and precedence-order the firm rules via
+        :func:`load_rules_for_engine`.
+      * Determine the invoice's own period so the frozen-verdict guard
+        can fire when applicable.
+    """
+    client_query = ClientQuery(session=session, ca_firm_id=ca_firm_id)
+    client = await client_query.get_by_id(client_id)
+    gst_tds_deductor = bool(client.gst_tds_deductor) if client is not None else False
+
+    filing_query = FilingQuery(session=session, ca_firm_id=ca_firm_id)
+    locked_periods = await filing_query.list_locked_periods()
+
+    today_ist = now_ist().date()
+    if filing_period_month is not None and filing_period_year is not None:
+        current_period = FilingPeriod(year=filing_period_year, month=filing_period_month)
+    else:
+        current_period = FilingPeriod.from_date(today_ist)
+
+    period_context = PeriodContext(
+        current=current_period,
+        locked_periods=locked_periods,
+        as_of=today_ist,
+    )
+
+    invoice_period: FilingPeriod | None = None
+    invoice_date = parse_iso_date(extraction.get("invoice_date"))
+    if invoice_date is not None:
+        invoice_period = FilingPeriod.from_date(invoice_date)
+
+    vendor_name = (
+        extraction.get("vendor", {}).get("name")
+        if isinstance(extraction.get("vendor"), dict)
+        else None
+    )
+    query_text = f"{document_type} {vendor_name or ''}".strip()
+    firm_rules = await load_rules_for_engine(
+        session=session,
+        ca_firm_id=ca_firm_id,
+        client_id=client_id,
+        query_text=query_text,
+    )
+
+    return compute_verdict(
+        extraction,
+        document_type=document_type,
+        period_context=period_context,
+        gst_tds_deductor=gst_tds_deductor,
+        firm_rules=firm_rules,
+        invoice_period=invoice_period,
     )
 
 

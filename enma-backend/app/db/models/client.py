@@ -29,9 +29,7 @@ class Client(Base):
     """A business entity managed by a CA firm."""
 
     __tablename__ = "clients"
-    __table_args__ = (
-        UniqueConstraint("ca_firm_id", "gstin", name="uq_clients_firm_gstin"),
-    )
+    __table_args__ = (UniqueConstraint("ca_firm_id", "gstin", name="uq_clients_firm_gstin"),)
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -60,8 +58,15 @@ class Client(Base):
     address: Mapped[str | None] = mapped_column(Text, nullable=True)
     contact_email: Mapped[str | None] = mapped_column(Text, nullable=True)
     contact_phone: Mapped[str | None] = mapped_column(Text, nullable=True)
-    is_active: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, server_default=text("TRUE")
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("TRUE"))
+    gst_tds_deductor: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("FALSE"),
+        comment=(
+            "Section 51 GST-TDS deductor flag (government / PSU). "
+            "Engine gates tds_amount on this. IT-Act TDS is out of scope."
+        ),
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

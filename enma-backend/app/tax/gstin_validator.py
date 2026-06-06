@@ -203,9 +203,7 @@ def validate_gstin(  # noqa: PLR0911 — each return is a distinct failure mode
             pan=pan,
         )
 
-    return GstinValidationResult(
-        is_valid=True, state_code=state_code, pan=pan
-    )
+    return GstinValidationResult(is_valid=True, state_code=state_code, pan=pan)
 
 
 def is_valid_gstin(value: str | None) -> bool:

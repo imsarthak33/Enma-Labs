@@ -9,16 +9,14 @@ from __future__ import annotations
 import asyncio
 from logging.config import fileConfig
 
+# Import all models so Base.metadata is fully populated.
+import app.db.models  # noqa: F401
 from alembic import context
+from app.config import settings
+from app.db.base import Base
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
-
-from app.config import settings
-from app.db.base import Base
-
-# Import all models so Base.metadata is fully populated.
-import app.db.models  # noqa: F401
 
 config = context.config
 

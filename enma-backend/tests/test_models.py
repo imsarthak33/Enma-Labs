@@ -45,13 +45,13 @@ class TestModelRegistration:
     def test_all_tables_registered(self) -> None:
         """Every canonical table must be in Base.metadata."""
         registered = set(Base.metadata.tables.keys())
-        assert self.EXPECTED_TABLES.issubset(registered), (
-            f"Missing tables: {self.EXPECTED_TABLES - registered}"
-        )
+        assert self.EXPECTED_TABLES.issubset(
+            registered
+        ), f"Missing tables: {self.EXPECTED_TABLES - registered}"
 
     def test_table_count(self) -> None:
-        """We expect exactly 11 tables after the TimescaleDB hypertables removal."""
-        assert len(Base.metadata.tables) == 11
+        """12 tables after Phase 6 adds ``pending_assignments``."""
+        assert len(Base.metadata.tables) == 12
 
 
 class TestCaFirmModel:
@@ -195,4 +195,3 @@ class TestInfrastructureModels:
             notification_type="document_chase",
         )
         assert notif.notification_type == "document_chase"
-

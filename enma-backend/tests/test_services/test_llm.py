@@ -113,9 +113,7 @@ class TestCallChat:
         assert sent["response_format"] == {"type": "json_object"}
 
     @pytest.mark.asyncio
-    async def test_max_tokens_is_capped_by_ceiling(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_max_tokens_is_capped_by_ceiling(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(llm.settings, "llm_max_output_tokens", 100)
         captured: list[dict[str, Any]] = []
 

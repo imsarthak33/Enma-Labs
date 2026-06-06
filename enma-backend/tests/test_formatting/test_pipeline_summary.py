@@ -56,9 +56,7 @@ class TestRenderSummary:
             "totals": {"taxable_value": "1000.00", "grand_total": "1180.00"},
             "line_items": [{}, {}],
         }
-        html = render_pipeline_summary(
-            _result(extraction=extraction, verification=verification)
-        )
+        html = render_pipeline_summary(_result(extraction=extraction, verification=verification))
         # Header + verdict + extraction + stages — but no issues block.
         assert "Document processed" in html
         assert "CLEAN" in html

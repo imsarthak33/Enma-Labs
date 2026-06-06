@@ -53,9 +53,7 @@ class FilingApproval(Base):
     )
     filing_month: Mapped[int] = mapped_column(Integer, nullable=False)
     filing_year: Mapped[int] = mapped_column(Integer, nullable=False)
-    approved_by_chat_id: Mapped[int] = mapped_column(
-        BigInteger, nullable=False
-    )
+    approved_by_chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     filing_snapshot: Mapped[dict[str, Any]] = mapped_column(
         JSONB,
         nullable=False,

@@ -25,9 +25,7 @@ from app.logging_setup import get_logger
 _log = get_logger(__name__)
 
 
-def _envelope(
-    *, code: str, message: str, details: Any = None
-) -> dict[str, Any]:
+def _envelope(*, code: str, message: str, details: Any = None) -> dict[str, Any]:
     body: dict[str, Any] = {"error": {"code": code, "message": message}}
     if details is not None:
         body["error"]["details"] = details
@@ -54,9 +52,7 @@ def register_exception_handlers(app: FastAPI) -> None:
         )
 
     @app.exception_handler(RequestValidationError)
-    async def _validation_exc(
-        _req: Request, exc: RequestValidationError
-    ) -> JSONResponse:
+    async def _validation_exc(_req: Request, exc: RequestValidationError) -> JSONResponse:
         _log.info("validation_error", errors=exc.errors())
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

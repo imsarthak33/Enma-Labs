@@ -74,9 +74,7 @@ async def test_uses_extraction_role_and_correct_prompt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured = _patch_llm(monkeypatch, json.dumps(_valid_extraction()))
-    await extract_document(
-        b"\x89PNG\r\n\x1a\n" + b"\x00" * 16, document_type="FREIGHT"
-    )
+    await extract_document(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16, document_type="FREIGHT")
     assert captured[0]["role"] is LLMRole.EXTRACTION
     # The system message should include FREIGHT-specific law context.
     sys_msg = captured[0]["messages"][0]["content"]
@@ -88,18 +86,14 @@ async def test_uses_extraction_role_and_correct_prompt(
 async def test_non_json_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_llm(monkeypatch, "no json")
     with pytest.raises(ExtractorError, match="non-JSON"):
-        await extract_document(
-            b"\x89PNG\r\n\x1a\n" + b"\x00" * 16, document_type="B2B_INVOICE"
-        )
+        await extract_document(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16, document_type="B2B_INVOICE")
 
 
 @pytest.mark.asyncio
 async def test_array_payload_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_llm(monkeypatch, json.dumps([{"k": "v"}]))
     with pytest.raises(ExtractorError, match="non-object"):
-        await extract_document(
-            b"\x89PNG\r\n\x1a\n" + b"\x00" * 16, document_type="B2B_INVOICE"
-        )
+        await extract_document(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16, document_type="B2B_INVOICE")
 
 
 @pytest.mark.asyncio
@@ -108,6 +102,4 @@ async def test_missing_required_keys_raises(monkeypatch: pytest.MonkeyPatch) -> 
     del partial["totals"]
     _patch_llm(monkeypatch, json.dumps(partial))
     with pytest.raises(ExtractorError, match="totals"):
-        await extract_document(
-            b"\x89PNG\r\n\x1a\n" + b"\x00" * 16, document_type="B2B_INVOICE"
-        )
+        await extract_document(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16, document_type="B2B_INVOICE")

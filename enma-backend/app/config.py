@@ -74,9 +74,7 @@ class Settings(BaseSettings):
     # Default below points to session mode — override with transaction mode
     # in Cloud Run via DATABASE_URL env var in GCP Secret Manager.
     database_url: PostgresDsn = Field(
-        default=PostgresDsn(
-            "postgresql+asyncpg://postgres:dev_password@localhost:5432/postgres"
-        ),
+        default=PostgresDsn("postgresql+asyncpg://postgres:dev_password@localhost:5432/postgres"),
         description=(
             "Supabase async DSN (asyncpg driver). "
             "Session mode (port 5432) for GKE; "
@@ -105,34 +103,33 @@ class Settings(BaseSettings):
     )
 
     # -- Telegram -------------------------------------------------------------
-    telegram_bot_token: SecretStr = Field(
-        default=SecretStr("changeme-telegram-bot-token")
-    )
+    telegram_bot_token: SecretStr = Field(default=SecretStr("changeme-telegram-bot-token"))
 
     # -- Model endpoints (Phase 4+) ------------------------------------------
     # Defaults point at OpenAI's public chat-completions endpoint so the
     # codebase is provider-agnostic but works out of the box for dev. Any
     # OpenAI-compatible server (NVIDIA NIM, vLLM, LiteLLM, Anthropic via
     # proxy, …) works by overriding the URL via env.
-    layout_model_endpoint: str = Field(
-        default="https://api.openai.com/v1/chat/completions"
-    )
+    layout_model_endpoint: str = Field(default="https://api.openai.com/v1/chat/completions")
     layout_model_name: str = Field(default="gpt-4o-mini")
 
-    extraction_model_endpoint: str = Field(
-        default="https://api.openai.com/v1/chat/completions"
-    )
+    extraction_model_endpoint: str = Field(default="https://api.openai.com/v1/chat/completions")
     extraction_model_name: str = Field(default="gpt-4o")
 
-    reasoning_model_endpoint: str = Field(
-        default="https://api.openai.com/v1/chat/completions"
-    )
+    reasoning_model_endpoint: str = Field(default="https://api.openai.com/v1/chat/completions")
     reasoning_model_name: str = Field(default="gpt-4o")
 
     # Optional in Phase 4 — wired in later phases.
     whisper_endpoint: str | None = None
-    embedding_endpoint: str | None = None
     summarization_endpoint: str | None = None
+
+    # Embeddings (Phase 5). REQUIRED in production / staging. In dev/test
+    # the embedding service falls back to a deterministic hash embedder
+    # so the suite is offline. ``embedding_dimensions`` MUST match the
+    # ca_firm_rules.rule_embedding VECTOR(1024) column.
+    embedding_endpoint: str | None = None
+    embedding_model_name: str = Field(default="text-embedding-3-large")
+    embedding_dimensions: int = Field(default=1024, ge=64, le=4096)
 
     # LLM API key. Required at first LLM call (not at boot, so tests
     # that mock the client don't need it set).
@@ -187,6 +184,16 @@ class Settings(BaseSettings):
     sentry_dsn: str | None = None
     sentry_traces_sample_rate: float = Field(default=0.1, ge=0.0, le=1.0)
 
+    # -- Phase 7: compliance news + voice ------------------------------------
+    serper_api_key: SecretStr | None = Field(
+        default=None,
+        description="Serper.dev API key for the daily compliance-news briefing.",
+    )
+    serper_endpoint: str = Field(
+        default="https://google.serper.dev/news",
+        description="Serper.dev search endpoint (defaults to the news vertical).",
+    )
+
     # -- CORS -----------------------------------------------------------------
     cors_origins: list[str] = Field(
         default_factory=lambda: ["http://localhost:3000"],
@@ -199,10 +206,7 @@ class Settings(BaseSettings):
     def _require_async_driver(cls, v: PostgresDsn) -> PostgresDsn:
         # SQLAlchemy's async engine needs the +asyncpg dialect.
         if "+asyncpg" not in str(v):
-            raise ValueError(
-                "database_url must use the postgresql+asyncpg driver "
-                f"(got: {v})"
-            )
+            raise ValueError("database_url must use the postgresql+asyncpg driver " f"(got: {v})")
         return v
 
     @field_validator("cors_origins")
@@ -229,13 +233,18 @@ class Settings(BaseSettings):
 
     def model_post_init(self, __context: object) -> None:
         # Hard guard: no wildcard CORS in non-dev environments.
+        if self.env != Environment.DEVELOPMENT and "*" in self.cors_origins:
+            raise ValueError("cors_origins='*' is not allowed outside development.")
+        # Phase 5: embedding endpoint is required in staging/production.
+        # Dev/test can fall back to the deterministic hash embedder.
         if (
-            self.env != Environment.DEVELOPMENT
-            and "*" in self.cors_origins
+            self.env in (Environment.PRODUCTION, Environment.STAGING)
+            and not self.embedding_endpoint
         ):
-            raise ValueError(
-                "cors_origins='*' is not allowed outside development."
-            )
+            raise ValueError("embedding_endpoint is required in staging/production.")
+        # Embedding dimension must match the pgvector column (1024).
+        if self.embedding_dimensions != 1024:
+            raise ValueError("embedding_dimensions must equal 1024 to match VECTOR(1024).")
 
     # -- Logging-safe representation ------------------------------------------
     def safe_repr(self) -> dict[str, str | int | bool | None]:

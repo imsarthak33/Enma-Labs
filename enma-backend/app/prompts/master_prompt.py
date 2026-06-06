@@ -31,6 +31,7 @@ from app.prompts.tax_law_library import DOCUMENT_TYPES, module_for_document_type
 __all__ = [
     "build_classifier_prompt",
     "build_extractor_prompt",
+    "build_supervisor_prompt",
 ]
 
 
@@ -154,3 +155,53 @@ def build_extractor_prompt(document_type: str) -> str:
             _EXTRACTOR_OUTPUT_SCHEMA,
         ]
     )
+
+
+# ---------------------------------------------------------------------------
+# Supervisor (Phase 6)
+# ---------------------------------------------------------------------------
+
+
+_SUPERVISOR_TASK: Final[str] = (
+    "TASK: ANSWER A CA'S TEXT QUERY\n"
+    "You receive a free-form Telegram message from a practising CA. "
+    "Decide whether the answer needs data from the firm's database; if "
+    "so, call one or more of the tools provided. Otherwise answer "
+    "directly. Always end with a single concise reply to the user.\n\n"
+    "TOOL-CALLING RULES\n"
+    "- Call tools when you need facts (documents, clients, tasks, "
+    "filings) — never invent values.\n"
+    "- Chain tools when one result narrows the next (e.g. resolve a "
+    "client name → query that client's documents).\n"
+    "- Stop calling tools as soon as you have enough to answer.\n"
+    "- After the final tool result, produce the user-facing reply as "
+    "plain text. No markdown. No emojis."
+)
+
+
+_SUPERVISOR_OUTPUT: Final[str] = (
+    "OUTPUT FORMAT\n"
+    "Your final assistant message (after any tool calls) is sent to the "
+    "user via Telegram with HTML parse mode. Plain text is fine — the "
+    "formatter escapes special characters. Do NOT include <html> or "
+    "<body> tags, do NOT use markdown."
+)
+
+
+def build_supervisor_prompt(*, firm_rules_block: str | None = None) -> str:
+    """System message for the supervisor agent.
+
+    ``firm_rules_block`` is the rendered output of
+    :func:`app.agents.context_injector.format_rules_for_prompt` for the
+    active firm + (optionally) client. Passing ``None`` is fine — the
+    supervisor still works without any firm-specific rules.
+    """
+    parts = [
+        ROLE_DESCRIPTION,
+        VOICE_INSTRUCTIONS,
+        _SUPERVISOR_TASK,
+        _SUPERVISOR_OUTPUT,
+    ]
+    if firm_rules_block:
+        parts.append("CONTEXT — FIRM-SPECIFIC RULES\n" + firm_rules_block)
+    return "\n\n".join(parts)

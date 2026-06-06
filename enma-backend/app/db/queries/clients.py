@@ -6,9 +6,10 @@ import uuid
 from collections.abc import Sequence
 from typing import cast
 
-from sqlalchemy import or_
+from sqlalchemy import exists, or_, select
 
 from app.db.models.client import Client
+from app.db.models.document import Document
 from app.db.queries.base import BaseQuery
 
 
@@ -37,11 +38,7 @@ class ClientQuery(BaseQuery):
 
     async def get_by_id(self, client_id: uuid.UUID | str) -> Client | None:
         """Fetch a single client by ID (firm-scoped)."""
-        cid = (
-            client_id
-            if isinstance(client_id, uuid.UUID)
-            else uuid.UUID(str(client_id))
-        )
+        cid = client_id if isinstance(client_id, uuid.UUID) else uuid.UUID(str(client_id))
         stmt = self._scoped_select(Client).where(Client.id == cid)
         return await self._fetch_one(stmt)
 
@@ -97,11 +94,35 @@ class ClientQuery(BaseQuery):
         """Soft-delete a client."""
         return await self._soft_delete(Client, client_id)
 
-    async def update(
-        self, client_id: uuid.UUID | str, **kwargs: object
-    ) -> Client | None:
+    async def update(self, client_id: uuid.UUID | str, **kwargs: object) -> Client | None:
         """Update client fields (firm-scoped)."""
         return await self._update(Client, client_id, **kwargs)
+
+    # ----- Phase 7: client chase -------------------------------------------
+
+    async def list_missing_filing_docs(
+        self, *, month: int, year: int
+    ) -> Sequence[Client]:
+        """Active clients with zero documents in the given filing period.
+
+        Used by the 28th-of-month client chase: callers iterate the
+        result, apply the per-client 7-day cooldown, and ping each up to
+        the batch cap.
+        """
+        has_doc_subq = (
+            select(Document.id)
+            .where(Document.ca_firm_id == self.ca_firm_id)
+            .where(Document.client_id == Client.id)
+            .where(Document.filing_period_month == month)
+            .where(Document.filing_period_year == year)
+        )
+        stmt = (
+            self._scoped_select(Client)
+            .where(Client.is_active.is_(True))
+            .where(~exists(has_doc_subq))
+            .order_by(Client.trade_name.asc())
+        )
+        return await self._fetch_all(stmt)
 
 
 __all__ = ["ClientQuery"]

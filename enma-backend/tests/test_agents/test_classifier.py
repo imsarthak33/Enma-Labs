@@ -55,9 +55,7 @@ async def test_uses_layout_role_and_json_response_format(
 ) -> None:
     captured = _patch_llm(
         monkeypatch,
-        json.dumps(
-            {"document_type": "RESTAURANT", "confidence": "MEDIUM", "reasoning": "x"}
-        ),
+        json.dumps({"document_type": "RESTAURANT", "confidence": "MEDIUM", "reasoning": "x"}),
     )
     await classify_document(b"\xff\xd8\xff" + b"\x00" * 16)
     assert captured[0]["role"] is LLMRole.LAYOUT
@@ -120,9 +118,7 @@ async def test_image_part_attached_to_user_message(
 ) -> None:
     captured = _patch_llm(
         monkeypatch,
-        json.dumps(
-            {"document_type": "FREIGHT", "confidence": "MEDIUM", "reasoning": "x"}
-        ),
+        json.dumps({"document_type": "FREIGHT", "confidence": "MEDIUM", "reasoning": "x"}),
     )
     await classify_document(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
     user_msg = captured[0]["messages"][1]

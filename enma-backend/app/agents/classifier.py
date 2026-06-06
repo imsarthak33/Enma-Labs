@@ -56,18 +56,14 @@ class ClassificationResult(BaseModel):
     @classmethod
     def _document_type_in_enum(cls, v: str) -> str:
         if v not in DOCUMENT_TYPES:
-            raise ValueError(
-                f"document_type must be one of {DOCUMENT_TYPES}, got {v!r}"
-            )
+            raise ValueError(f"document_type must be one of {DOCUMENT_TYPES}, got {v!r}")
         return v
 
     @field_validator("confidence")
     @classmethod
     def _confidence_in_set(cls, v: str) -> str:
         if v not in _ALLOWED_CONFIDENCE:
-            raise ValueError(
-                f"confidence must be one of {sorted(_ALLOWED_CONFIDENCE)}, got {v!r}"
-            )
+            raise ValueError(f"confidence must be one of {sorted(_ALLOWED_CONFIDENCE)}, got {v!r}")
         return v
 
 
@@ -107,9 +103,7 @@ async def classify_document(image_bytes: bytes) -> ClassificationResult:
         payload = json.loads(response.content)
     except json.JSONDecodeError as exc:
         _log.warning("classifier_non_json", body=response.content[:200])
-        raise ClassifierError(
-            f"classifier returned non-JSON content: {exc}"
-        ) from exc
+        raise ClassifierError(f"classifier returned non-JSON content: {exc}") from exc
 
     try:
         return ClassificationResult.model_validate(payload)

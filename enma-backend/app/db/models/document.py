@@ -83,21 +83,15 @@ class Document(Base):
         nullable=True,
         comment="Red-team deterministic verification output.",
     )
-    filing_period_month: Mapped[int | None] = mapped_column(
-        Integer, nullable=True
-    )
-    filing_period_year: Mapped[int | None] = mapped_column(
-        Integer, nullable=True
-    )
+    filing_period_month: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    filing_period_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
     processing_status: Mapped[str] = mapped_column(
         String(20),
         nullable=False,
         server_default=text("'pending'"),
         comment="pending | processing | completed | failed",
     )
-    processing_time_ms: Mapped[int | None] = mapped_column(
-        Integer, nullable=True
-    )
+    processing_time_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

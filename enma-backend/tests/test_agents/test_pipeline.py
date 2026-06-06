@@ -64,7 +64,10 @@ async def db_session():
         await conn.execute(
             text(
                 "CREATE TABLE clients (id TEXT PRIMARY KEY, ca_firm_id TEXT, "
-                "trade_name TEXT, gstin TEXT, is_active INTEGER DEFAULT 1, "
+                "trade_name TEXT, legal_name TEXT, gstin TEXT, pan TEXT, "
+                "state_code TEXT, address TEXT, contact_email TEXT, "
+                "contact_phone TEXT, is_active INTEGER DEFAULT 1, "
+                "gst_tds_deductor INTEGER DEFAULT 0, "
                 "created_at TEXT, updated_at TEXT)"
             )
         )
@@ -77,6 +80,14 @@ async def db_session():
                 "filing_period_month INTEGER, filing_period_year INTEGER, "
                 "processing_status TEXT DEFAULT 'pending', "
                 "processing_time_ms INTEGER, created_at TEXT, updated_at TEXT)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE TABLE filing_approvals (id TEXT PRIMARY KEY, "
+                "ca_firm_id TEXT, filing_month INTEGER, filing_year INTEGER, "
+                "approved_by_chat_id INTEGER, filing_snapshot TEXT, "
+                "approval_hash TEXT, created_at TEXT)"
             )
         )
     factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -164,6 +175,20 @@ def _extract_stub(
     monkeypatch.setattr(pipeline_module, "extract_document", fake_extract)
 
 
+def _no_firm_rules(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bypass the pgvector-backed rule retrieval for SQLite tests.
+
+    The pipeline now calls ``load_rules_for_engine`` which executes a
+    ``cosine_distance`` query — unsupported on SQLite. Stub it to
+    return an empty tuple so the deterministic engine still runs.
+    """
+
+    async def _empty(**_kwargs: Any) -> tuple[Any, ...]:
+        return ()
+
+    monkeypatch.setattr(pipeline_module, "load_rules_for_engine", _empty)
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -174,6 +199,7 @@ async def test_happy_path_image(monkeypatch: pytest.MonkeyPatch, db_session: Any
     session, firm_id, client_id = db_session
     _classify_stub(monkeypatch)
     _extract_stub(monkeypatch)
+    _no_firm_rules(monkeypatch)
     result = await run_pipeline(
         session=session,
         ca_firm_id=firm_id,
@@ -195,12 +221,11 @@ async def test_happy_path_image(monkeypatch: pytest.MonkeyPatch, db_session: Any
 
 
 @pytest.mark.asyncio
-async def test_pdf_first_page_extracted(
-    monkeypatch: pytest.MonkeyPatch, db_session: Any
-) -> None:
+async def test_pdf_first_page_extracted(monkeypatch: pytest.MonkeyPatch, db_session: Any) -> None:
     session, firm_id, client_id = db_session
     _classify_stub(monkeypatch)
     _extract_stub(monkeypatch)
+    _no_firm_rules(monkeypatch)
     result = await run_pipeline(
         session=session,
         ca_firm_id=firm_id,
@@ -217,6 +242,7 @@ async def test_unsupported_file_kind_raises(
     session, firm_id, client_id = db_session
     _classify_stub(monkeypatch)
     _extract_stub(monkeypatch)
+    _no_firm_rules(monkeypatch)
     with pytest.raises(PipelineError, match="file processing"):
         await run_pipeline(
             session=session,
@@ -227,9 +253,7 @@ async def test_unsupported_file_kind_raises(
 
 
 @pytest.mark.asyncio
-async def test_classifier_failure_raises(
-    monkeypatch: pytest.MonkeyPatch, db_session: Any
-) -> None:
+async def test_classifier_failure_raises(monkeypatch: pytest.MonkeyPatch, db_session: Any) -> None:
     session, firm_id, client_id = db_session
 
     async def boom(_b: bytes) -> ClassificationResult:
@@ -296,6 +320,7 @@ async def test_dirty_extraction_records_verification_issues(
     }
     _classify_stub(monkeypatch)
     _extract_stub(monkeypatch, data=bad)
+    _no_firm_rules(monkeypatch)
     result = await run_pipeline(
         session=session,
         ca_firm_id=firm_id,

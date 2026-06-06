@@ -23,6 +23,8 @@ What it does NOT validate:
 
 from __future__ import annotations
 
+from pgvector import sqlalchemy
+from sentry_sdk.integrations import fastapi
 import json
 from typing import Any, Final
 
@@ -62,9 +64,7 @@ class ExtractionResult(BaseModel):
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
 
     document_type: str = Field(..., description="Echoes the classifier's choice.")
-    data: dict[str, Any] = Field(
-        ..., description="Raw decoded extraction JSON."
-    )
+    data: dict[str, Any] = Field(..., description="Raw decoded extraction JSON.")
     model_name: str
     input_tokens: int
     output_tokens: int
@@ -89,10 +89,7 @@ async def extract_document(
             "content": [
                 {
                     "type": "text",
-                    "text": (
-                        f"Extract structured fields from this "
-                        f"{document_type} document."
-                    ),
+                    "text": (f"Extract structured fields from this " f"{document_type} document."),
                 },
                 image_part,
             ],
@@ -110,20 +107,14 @@ async def extract_document(
         payload = json.loads(response.content)
     except json.JSONDecodeError as exc:
         _log.warning("extractor_non_json", body=response.content[:400])
-        raise ExtractorError(
-            f"extractor returned non-JSON content: {exc}"
-        ) from exc
+        raise ExtractorError(f"extractor returned non-JSON content: {exc}") from exc
 
     if not isinstance(payload, dict):
-        raise ExtractorError(
-            f"extractor returned non-object payload: {type(payload).__name__}"
-        )
+        raise ExtractorError(f"extractor returned non-object payload: {type(payload).__name__}")
 
     missing = _REQUIRED_TOP_LEVEL_KEYS - set(payload.keys())
     if missing:
-        raise ExtractorError(
-            f"extractor payload missing required keys: {sorted(missing)}"
-        )
+        raise ExtractorError(f"extractor payload missing required keys: {sorted(missing)}")
 
     return ExtractionResult(
         document_type=document_type,

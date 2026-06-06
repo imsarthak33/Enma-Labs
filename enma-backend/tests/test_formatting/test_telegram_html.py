@@ -25,6 +25,7 @@ class TestSafeText:
         assert safe_text(42) == "42"
         # A Decimal-shaped object should serialise via str().
         from decimal import Decimal
+
         assert safe_text(Decimal("1234.56")) == "1234.56"
 
 

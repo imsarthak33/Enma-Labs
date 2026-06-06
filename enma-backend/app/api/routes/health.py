@@ -80,9 +80,7 @@ async def ready(
         # default 200; that's wrong — flip to 503 via a starlette Response.
         from fastapi.responses import JSONResponse
 
-        body = ReadyResponse(
-            status="degraded", database="fail", detail=str(exc)
-        ).model_dump()
+        body = ReadyResponse(status="degraded", database="fail", detail=str(exc)).model_dump()
         return JSONResponse(  # type: ignore[return-value]
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content=body,

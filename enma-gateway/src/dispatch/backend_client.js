@@ -24,6 +24,10 @@ export const ROUTE_BY_KIND = Object.freeze({
   command: "/worker/command",
   voice: "/worker/voice",
   callback: "/worker/callback",
+  // Phase 7 cron envelopes — ADR-007 §Decision 3.
+  cron_task_heartbeat: "/worker/cron/task-heartbeat",
+  cron_morning_briefing: "/worker/cron/morning-briefing",
+  cron_client_chase: "/worker/cron/client-chase",
 });
 
 const DEFAULT_TIMEOUT_MS = 5000;

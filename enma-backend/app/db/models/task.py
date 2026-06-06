@@ -68,9 +68,7 @@ class Task(Base):
         nullable=False,
         server_default=text("0"),
     )
-    due_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_notified_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
