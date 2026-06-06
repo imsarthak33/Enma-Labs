@@ -71,7 +71,7 @@ async def ready(
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> ReadyResponse:
     try:
-        result = await session.execute(text("SELECT 1"))  # audit:allow-direct-session — liveness probe, no tenant data
+        result = await session.execute(text("SELECT 1"))  # audit:allow-direct-session
         if result.scalar_one() != 1:
             raise RuntimeError("unexpected SELECT 1 result")
     except (SQLAlchemyError, RuntimeError) as exc:

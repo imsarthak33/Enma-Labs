@@ -289,9 +289,15 @@ async def _process_cron(
     return ORJSONResponse(status_code=status.HTTP_202_ACCEPTED, content=_accepted_body(verdict))
 
 
+# Rate limiting: cron endpoints inherit the global 100/minute default from
+# SlowAPIMiddleware. CRON_RATE_LIMIT (5/minute) is reserved as a per-route
+# tighter policy for the planned Depends-based limiter migration.
+
+
 @router.post("/task-heartbeat", summary="Cron — overdue task heartbeat")
 async def cron_task_heartbeat(
-    envelope: VerifiedCronEnvelopeDep, verdict: IdempotencyDep
+    envelope: VerifiedCronEnvelopeDep,
+    verdict: IdempotencyDep,
 ) -> Response:
     _assert_kind(envelope, "cron_task_heartbeat")
     return await _process_cron(envelope, verdict, _run_heartbeat, "task_heartbeat")
@@ -299,14 +305,18 @@ async def cron_task_heartbeat(
 
 @router.post("/morning-briefing", summary="Cron — daily firm digest")
 async def cron_morning_briefing(
-    envelope: VerifiedCronEnvelopeDep, verdict: IdempotencyDep
+    envelope: VerifiedCronEnvelopeDep,
+    verdict: IdempotencyDep,
 ) -> Response:
     _assert_kind(envelope, "cron_morning_briefing")
     return await _process_cron(envelope, verdict, _run_briefing, "morning_briefing")
 
 
 @router.post("/client-chase", summary="Cron — 28th-of-month client chase")
-async def cron_client_chase(envelope: VerifiedCronEnvelopeDep, verdict: IdempotencyDep) -> Response:
+async def cron_client_chase(
+    envelope: VerifiedCronEnvelopeDep,
+    verdict: IdempotencyDep,
+) -> Response:
     _assert_kind(envelope, "cron_client_chase")
     return await _process_cron(envelope, verdict, _run_chase, "client_chase")
 
@@ -316,7 +326,8 @@ async def cron_client_chase(envelope: VerifiedCronEnvelopeDep, verdict: Idempote
     summary="Cron — daily idempotency_log cleanup (72hr TTL)",
 )
 async def cron_idempotency_cleanup(
-    envelope: VerifiedCronEnvelopeDep, verdict: IdempotencyDep
+    envelope: VerifiedCronEnvelopeDep,
+    verdict: IdempotencyDep,
 ) -> Response:
     _assert_kind(envelope, "cron_idempotency_cleanup")
     return await _process_cron(envelope, verdict, _run_idempotency_cleanup, "idempotency_cleanup")

@@ -196,6 +196,25 @@ class Settings(BaseSettings):
     sentry_dsn: str | None = None
     sentry_traces_sample_rate: float = Field(default=0.1, ge=0.0, le=1.0)
 
+    # -- Cache (Phase 8 — Redis) ---------------------------------------------
+    # OPTIONAL: when unset, the cache layer becomes a no-op and the rate
+    # limiter falls back to in-memory storage. In production this MUST
+    # point at the ElastiCache Serverless endpoint (use rediss:// for TLS).
+    # Example: rediss://enma-cache-xxxxx.serverless.aps1.cache.amazonaws.com:6379/0
+    redis_url: str | None = Field(
+        default=None,
+        description="Redis DSN. Use rediss:// for ElastiCache Serverless (TLS required).",
+    )
+
+    # -- Rate limiting (Phase 8) ---------------------------------------------
+    # slowapi rate-string. ``count/window`` where window is one of
+    # second|minute|hour|day. Applied as the global default; per-route
+    # policies live in app/api/middleware/rate_limit.py.
+    rate_limit_default: str = Field(
+        default="100/minute",
+        description="Default per-IP request budget across all routes.",
+    )
+
     # -- Phase 7: compliance news + voice ------------------------------------
     serper_api_key: SecretStr | None = Field(
         default=None,
@@ -286,6 +305,10 @@ class Settings(BaseSettings):
             "aws_account_id": self.aws_account_id,
             "fargate_service_url": self.fargate_service_url,
             "sentry_dsn_configured": bool(self.sentry_dsn),
+            # Phase 8 — cache + rate limit (URL deliberately not echoed)
+            "redis_configured": bool(self.redis_url),
+            "redis_tls": bool(self.redis_url and self.redis_url.startswith("rediss://")),
+            "rate_limit_default": self.rate_limit_default,
         }
 
 

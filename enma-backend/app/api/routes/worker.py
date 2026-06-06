@@ -746,6 +746,14 @@ def _assert_kind(envelope: DecodedEnvelope, expected: str) -> None:
         )
 
 
+# Rate limiting: the global default (100/minute via RATE_LIMIT_DEFAULT) is
+# enforced by SlowAPIMiddleware installed in create_app(). Per-route tighter
+# policies live as constants in app/api/middleware/rate_limit.py — they will
+# be wired in via a Depends-based limiter once we either migrate to
+# fastapi-limiter or write a custom check, since slowapi's @limit decorator
+# breaks FastAPI's Annotated[..., Depends(...)] dependency resolution.
+
+
 @router.post("/document", summary="Single document envelope")
 async def worker_document(envelope: VerifiedEnvelopeDep, verdict: IdempotencyDep) -> Response:
     _assert_kind(envelope, "document")

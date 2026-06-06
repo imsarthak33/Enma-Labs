@@ -16,11 +16,13 @@ from sentry_sdk.integrations.starlette import StarletteIntegration
 
 from app import __version__
 from app.api.middleware.error_handler import register_exception_handlers
+from app.api.middleware.rate_limit import attach_rate_limiter
 from app.api.middleware.request_id import RequestIDMiddleware
 from app.api.router import api_router
 from app.config import settings
 from app.db.session import dispose_engine, get_engine
 from app.logging_setup import configure_logging, get_logger
+from app.services.cache import close_redis, get_redis
 from app.services.telegram import close_client as close_telegram_client
 from app.utils.background import shutdown_registry
 from app.utils.masking import sentry_before_send
@@ -54,6 +56,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # Eagerly construct the engine so any DSN problem surfaces at boot,
     # not on the first request.
     get_engine()
+    # Warm the Redis client too — surfaces DSN typos before the first hit.
+    # ``get_redis`` returns None when REDIS_URL is unset, which is fine.
+    get_redis()
 
     try:
         yield
@@ -63,6 +68,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         # any pending DB writes BEFORE we tear the engine down.
         await shutdown_registry(timeout=30.0)
         await close_telegram_client()
+        await close_redis()
         await dispose_engine()
 
 
@@ -91,6 +97,12 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
         expose_headers=["X-Request-ID"],
     )
+
+    # ---- Rate limiting -----------------------------------------------------
+    # Attaches the slowapi Limiter to ``app.state`` and registers the 429
+    # exception handler. Must run before ``include_router`` so the limiter
+    # decorators inside route modules see the live Limiter instance.
+    attach_rate_limiter(app)
 
     # ---- Error handlers ----------------------------------------------------
     register_exception_handlers(app)

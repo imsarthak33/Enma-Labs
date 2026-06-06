@@ -29,6 +29,7 @@ SENSITIVE_KEY_FRAGMENTS: frozenset[str] = frozenset(
         "token",
         "authorization",
         "database_url",
+        "redis_url",  # Phase 8 — may contain a TLS password in the DSN
         "dsn",
         "encryption_key",
         "hmac_secret",

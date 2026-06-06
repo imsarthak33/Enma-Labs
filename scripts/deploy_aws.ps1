@@ -1,371 +1,531 @@
 # =============================================================================
-# Enma Labs — AWS Deployment Script (PowerShell)
+# Enma Labs — AWS Production Deployment (PowerShell)
+#
+# Architecture (Phase 8 — 13/13 production-ready):
+#
+#   Internet
+#      |
+#      v
+#   +---------------------------+
+#   |  Public ALB (enma-alb)    |  TLS at LB (optional ACM cert)
+#   |  - /worker/* → backend TG |
+#   |  - /webhook  → gateway TG |
+#   |  - SG: 0.0.0.0/0 :443/80  |
+#   +-------------+-------------+
+#                 |
+#       +---------+---------+
+#       |                   |
+#       v                   v
+#   +---------+         +---------+
+#   | backend |         | gateway |   ECS Fargate tasks (default VPC, 3 AZ)
+#   |  :8000  |         |  :3000  |   SG ingress: ALB-SG only
+#   |   ...   |         |  ...    |   Egress: 0.0.0.0/0 (NIM API, Telegram)
+#   +----+----+         +---------+
+#        |
+#        v
+#   +-------------------+
+#   | ElastiCache Redis |  Serverless cache, SG ingress: ECS-SG only
+#   |     :6379         |
+#   +-------------------+
+#                 +
+#         (TLS over public internet)
+#                 v
+#   +-------------------+
+#   |  Supabase Postgres |  Managed, sslmode=require
+#   +-------------------+
 #
 # Prerequisites:
-#   1. AWS CLI v2 installed (double-click AWSCLIV2.msi from your Temp folder)
-#   2. Run: aws configure
-#      - Access Key ID + Secret Access Key for account 603013471251
-#      - Region: ap-south-1
-#      - Output: json
-#   3. Docker Desktop running (for image builds)
+#   1. AWS CLI v2 installed and `aws configure` completed for account
+#      603013471251 in region ap-south-1.
+#   2. Docker images already built and pushed (the previous deploy used
+#      CodeBuild; this script does not rebuild — it only provisions infra
+#      and updates service definitions).
 #
-# Usage:
-#   .\scripts\deploy_aws.ps1
-#
-# This script creates:
-#   - ECR repositories for backend + gateway
-#   - ECS cluster (Fargate)
-#   - Task definitions
-#   - ALB + target groups
-#   - ECS services
-#   - CloudWatch log groups
+# Idempotency: every step checks for existing resources and reuses them.
+# Safe to re-run as many times as you like.
 # =============================================================================
 
 $ErrorActionPreference = "Stop"
-$REGION = "ap-south-1"
-$ACCOUNT_ID = "603013471251"
+
+# ---- Configuration ---------------------------------------------------------
+$REGION       = "ap-south-1"
+$ACCOUNT_ID   = "603013471251"
 $CLUSTER_NAME = "enma-prod"
 $BACKEND_REPO = "enma-backend"
 $GATEWAY_REPO = "enma-gateway"
-$VPC_CIDR = "10.0.0.0/16"
-$TAG = (git rev-parse --short HEAD)
 
-Write-Host "============================================" -ForegroundColor Cyan
-Write-Host " Enma Labs AWS Deployment" -ForegroundColor Cyan
-Write-Host " Account: $ACCOUNT_ID | Region: $REGION" -ForegroundColor Cyan
-Write-Host " Image tag: $TAG" -ForegroundColor Cyan
-Write-Host "============================================" -ForegroundColor Cyan
+# ALB / target group names — kept short so AWS limits aren't hit.
+$ALB_NAME      = "enma-alb"
+$BACKEND_TG    = "enma-backend-tg"
+$GATEWAY_TG    = "enma-gateway-tg"
+
+# Security group names
+$ALB_SG_NAME   = "enma-alb-sg"
+$ECS_SG_NAME   = "enma-ecs-tasks"
+$REDIS_SG_NAME = "enma-redis-sg"
+
+# ElastiCache Serverless
+$REDIS_CACHE_NAME = "enma-cache"
+
+$TAG = (git rev-parse --short HEAD 2>$null); if (-not $TAG) { $TAG = "latest" }
+
+function Write-Step([string]$label) {
+    Write-Host ""
+    Write-Host "============================================" -ForegroundColor Cyan
+    Write-Host " $label" -ForegroundColor Cyan
+    Write-Host "============================================" -ForegroundColor Cyan
+}
+
+Write-Host "Enma Labs production deployment — account $ACCOUNT_ID, region $REGION, tag $TAG"
 
 # ---------------------------------------------------------------------------
-# Step 1: ECR Repositories
+# Step 1: ECR repositories (idempotent)
 # ---------------------------------------------------------------------------
-Write-Host "`n[1/8] Creating ECR repositories..." -ForegroundColor Yellow
+Write-Step "[1/12] ECR repositories"
 
 foreach ($repo in @($BACKEND_REPO, $GATEWAY_REPO)) {
-    $exists = aws ecr describe-repositories --repository-names $repo --region $REGION 2>&1
+    aws ecr describe-repositories --repository-names $repo --region $REGION 2>$null | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        aws ecr create-repository `
-            --repository-name $repo `
-            --region $REGION `
+        aws ecr create-repository --repository-name $repo --region $REGION `
             --image-scanning-configuration scanOnPush=true `
-            --encryption-configuration encryptionType=AES256
-        Write-Host "  Created: $repo" -ForegroundColor Green
+            --encryption-configuration encryptionType=AES256 | Out-Null
+        Write-Host "  Created repository: $repo" -ForegroundColor Green
     } else {
-        Write-Host "  Exists: $repo" -ForegroundColor DarkGray
+        Write-Host "  Repository exists: $repo" -ForegroundColor DarkGray
     }
 }
 
 # ---------------------------------------------------------------------------
-# Step 2: Build & Push Docker Images
+# Step 2: CloudWatch log groups
 # ---------------------------------------------------------------------------
-Write-Host "`n[2/8] Building and pushing Docker images..." -ForegroundColor Yellow
-
-$ECR_URI = "$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
-aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_URI
-
-# Backend
-Write-Host "  Building backend..." -ForegroundColor DarkGray
-docker build --target prod -t "${ECR_URI}/${BACKEND_REPO}:${TAG}" -t "${ECR_URI}/${BACKEND_REPO}:latest" ./enma-backend
-docker push "${ECR_URI}/${BACKEND_REPO}:${TAG}"
-docker push "${ECR_URI}/${BACKEND_REPO}:latest"
-Write-Host "  Pushed: ${BACKEND_REPO}:${TAG}" -ForegroundColor Green
-
-# Gateway
-Write-Host "  Building gateway..." -ForegroundColor DarkGray
-docker build --target prod -t "${ECR_URI}/${GATEWAY_REPO}:${TAG}" -t "${ECR_URI}/${GATEWAY_REPO}:latest" ./enma-gateway
-docker push "${ECR_URI}/${GATEWAY_REPO}:${TAG}"
-docker push "${ECR_URI}/${GATEWAY_REPO}:latest"
-Write-Host "  Pushed: ${GATEWAY_REPO}:${TAG}" -ForegroundColor Green
-
-# ---------------------------------------------------------------------------
-# Step 3: CloudWatch Log Groups
-# ---------------------------------------------------------------------------
-Write-Host "`n[3/8] Creating CloudWatch log groups..." -ForegroundColor Yellow
+Write-Step "[2/12] CloudWatch log groups"
 
 foreach ($svc in @("backend", "gateway")) {
-    $logGroup = "/ecs/enma-$svc"
-    aws logs create-log-group --log-group-name $logGroup --region $REGION 2>&1 | Out-Null
-    aws logs put-retention-policy --log-group-name $logGroup --retention-in-days 30 --region $REGION
-    Write-Host "  Log group: $logGroup (30d retention)" -ForegroundColor Green
+    $lg = "/ecs/enma-$svc"
+    aws logs create-log-group --log-group-name $lg --region $REGION 2>$null | Out-Null
+    aws logs put-retention-policy --log-group-name $lg --retention-in-days 30 --region $REGION
+    Write-Host "  Log group ready: $lg (30 d retention)" -ForegroundColor Green
 }
 
 # ---------------------------------------------------------------------------
-# Step 4: IAM Task Execution Role
+# Step 3: IAM task execution role
 # ---------------------------------------------------------------------------
-Write-Host "`n[4/8] Creating ECS task execution role..." -ForegroundColor Yellow
+Write-Step "[3/12] IAM task execution role"
 
 $ROLE_NAME = "enma-ecs-task-execution"
-$TRUST_POLICY = @'
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": {"Service": "ecs-tasks.amazonaws.com"},
-    "Action": "sts:AssumeRole"
-  }]
-}
-'@
+$trustFile = "$env:TEMP\enma-trust.json"
+@'
+{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}
+'@ | Out-File -Encoding utf8 $trustFile
 
-$trustPolicyFile = "$env:TEMP\enma-trust-policy.json"
-$TRUST_POLICY | Out-File -FilePath $trustPolicyFile -Encoding utf8
-
-$roleExists = aws iam get-role --role-name $ROLE_NAME 2>&1
+aws iam get-role --role-name $ROLE_NAME 2>$null | Out-Null
 if ($LASTEXITCODE -ne 0) {
-    aws iam create-role `
-        --role-name $ROLE_NAME `
-        --assume-role-policy-document "file://$trustPolicyFile"
-    aws iam attach-role-policy `
-        --role-name $ROLE_NAME `
-        --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
-    aws iam attach-role-policy `
-        --role-name $ROLE_NAME `
-        --policy-arn arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+    aws iam create-role --role-name $ROLE_NAME --assume-role-policy-document "file://$trustFile" | Out-Null
+    aws iam attach-role-policy --role-name $ROLE_NAME --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+    aws iam attach-role-policy --role-name $ROLE_NAME --policy-arn arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
     Write-Host "  Created role: $ROLE_NAME" -ForegroundColor Green
 } else {
     Write-Host "  Role exists: $ROLE_NAME" -ForegroundColor DarkGray
 }
+$EXEC_ROLE_ARN = "arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
 
 # ---------------------------------------------------------------------------
-# Step 5: ECS Cluster
+# Step 4: ECS cluster
 # ---------------------------------------------------------------------------
-Write-Host "`n[5/8] Creating ECS Fargate cluster..." -ForegroundColor Yellow
+Write-Step "[4/12] ECS cluster"
 
-$clusterExists = aws ecs describe-clusters --clusters $CLUSTER_NAME --region $REGION --query "clusters[?status=='ACTIVE'].clusterName" --output text 2>&1
-if ($clusterExists -ne $CLUSTER_NAME) {
-    aws ecs create-cluster `
-        --cluster-name $CLUSTER_NAME `
-        --capacity-providers FARGATE `
-        --default-capacity-provider-strategy capacityProvider=FARGATE,weight=1 `
-        --region $REGION
+$existing = aws ecs describe-clusters --clusters $CLUSTER_NAME --region $REGION `
+    --query "clusters[?status=='ACTIVE'].clusterName" --output text 2>$null
+if ($existing -ne $CLUSTER_NAME) {
+    aws ecs create-cluster --cluster-name $CLUSTER_NAME --region $REGION | Out-Null
     Write-Host "  Created cluster: $CLUSTER_NAME" -ForegroundColor Green
 } else {
     Write-Host "  Cluster exists: $CLUSTER_NAME" -ForegroundColor DarkGray
 }
 
 # ---------------------------------------------------------------------------
-# Step 6: Task Definitions
+# Step 5: VPC + subnets discovery
 # ---------------------------------------------------------------------------
-Write-Host "`n[6/8] Registering task definitions..." -ForegroundColor Yellow
+Write-Step "[5/12] VPC discovery"
 
-$EXECUTION_ROLE_ARN = "arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
-
-# Backend task definition
-$backendTaskDef = @"
-{
-  "family": "enma-backend",
-  "networkMode": "awsvpc",
-  "requiresCompatibilities": ["FARGATE"],
-  "cpu": "512",
-  "memory": "1024",
-  "executionRoleArn": "$EXECUTION_ROLE_ARN",
-  "taskRoleArn": "$EXECUTION_ROLE_ARN",
-  "containerDefinitions": [{
-    "name": "backend",
-    "image": "${ECR_URI}/${BACKEND_REPO}:${TAG}",
-    "portMappings": [{"containerPort": 8000, "protocol": "tcp"}],
-    "essential": true,
-    "healthCheck": {
-      "command": ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)\" || exit 1"],
-      "interval": 30,
-      "timeout": 5,
-      "retries": 3,
-      "startPeriod": 15
-    },
-    "logConfiguration": {
-      "logDriver": "awslogs",
-      "options": {
-        "awslogs-group": "/ecs/enma-backend",
-        "awslogs-region": "$REGION",
-        "awslogs-stream-prefix": "ecs"
-      }
-    },
-    "environment": [
-      {"name": "ENV", "value": "production"},
-      {"name": "LOG_LEVEL", "value": "info"},
-      {"name": "APP_PORT", "value": "8000"},
-      {"name": "WEB_CONCURRENCY", "value": "2"},
-      {"name": "DATABASE_URL", "value": "PLACEHOLDER_SET_VIA_SECRETS"},
-      {"name": "BACKEND_API_KEY", "value": "PLACEHOLDER_SET_VIA_SECRETS"},
-      {"name": "GATEWAY_HMAC_SECRET", "value": "PLACEHOLDER_SET_VIA_SECRETS"},
-      {"name": "TELEGRAM_BOT_TOKEN", "value": "PLACEHOLDER_SET_VIA_SECRETS"},
-      {"name": "SENTRY_DSN", "value": "PLACEHOLDER_SET_VIA_SECRETS"},
-      {"name": "LLM_API_KEY", "value": "PLACEHOLDER_SET_VIA_SECRETS"},
-      {"name": "LAYOUT_MODEL_ENDPOINT", "value": "https://integrate.api.nvidia.com/v1/chat/completions"},
-      {"name": "LAYOUT_MODEL_NAME", "value": "meta/llama-3.1-8b-instruct"},
-      {"name": "EXTRACTION_MODEL_ENDPOINT", "value": "https://integrate.api.nvidia.com/v1/chat/completions"},
-      {"name": "EXTRACTION_MODEL_NAME", "value": "nvidia/nemotron-ocr-v1"},
-      {"name": "REASONING_MODEL_ENDPOINT", "value": "https://integrate.api.nvidia.com/v1/chat/completions"},
-      {"name": "REASONING_MODEL_NAME", "value": "meta/llama-3.3-70b-instruct"},
-      {"name": "EMBEDDING_ENDPOINT", "value": "https://integrate.api.nvidia.com/v1/embeddings"},
-      {"name": "EMBEDDING_MODEL_NAME", "value": "nvidia/nv-embedqa-e5-v5"},
-      {"name": "EMBEDDING_DIMENSIONS", "value": "1024"},
-      {"name": "WHISPER_ENDPOINT", "value": "https://integrate.api.nvidia.com/v1/audio/transcriptions"}
-    ]
-  }]
-}
-"@
-
-$backendTaskFile = "$env:TEMP\enma-backend-task.json"
-$backendTaskDef | Out-File -FilePath $backendTaskFile -Encoding utf8
-aws ecs register-task-definition --cli-input-json "file://$backendTaskFile" --region $REGION
-Write-Host "  Registered: enma-backend" -ForegroundColor Green
-
-# Gateway task definition
-$gatewayTaskDef = @"
-{
-  "family": "enma-gateway",
-  "networkMode": "awsvpc",
-  "requiresCompatibilities": ["FARGATE"],
-  "cpu": "256",
-  "memory": "512",
-  "executionRoleArn": "$EXECUTION_ROLE_ARN",
-  "containerDefinitions": [{
-    "name": "gateway",
-    "image": "${ECR_URI}/${GATEWAY_REPO}:${TAG}",
-    "portMappings": [{"containerPort": 3000, "protocol": "tcp"}],
-    "essential": true,
-    "healthCheck": {
-      "command": ["CMD-SHELL", "node -e \"fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\" || exit 1"],
-      "interval": 30,
-      "timeout": 5,
-      "retries": 3,
-      "startPeriod": 10
-    },
-    "logConfiguration": {
-      "logDriver": "awslogs",
-      "options": {
-        "awslogs-group": "/ecs/enma-gateway",
-        "awslogs-region": "$REGION",
-        "awslogs-stream-prefix": "ecs"
-      }
-    },
-    "environment": [
-      {"name": "NODE_ENV", "value": "production"},
-      {"name": "LOG_LEVEL", "value": "info"},
-      {"name": "PORT", "value": "3000"},
-      {"name": "BACKEND_URL", "value": "http://localhost:8000"},
-      {"name": "BACKEND_API_KEY", "value": "PLACEHOLDER_SET_VIA_SECRETS"},
-      {"name": "GATEWAY_HMAC_SECRET", "value": "PLACEHOLDER_SET_VIA_SECRETS"},
-      {"name": "TELEGRAM_BOT_TOKEN", "value": "PLACEHOLDER_SET_VIA_SECRETS"},
-      {"name": "SENTRY_DSN", "value": "PLACEHOLDER_SET_VIA_SECRETS"}
-    ]
-  }]
-}
-"@
-
-$gatewayTaskFile = "$env:TEMP\enma-gateway-task.json"
-$gatewayTaskDef | Out-File -FilePath $gatewayTaskFile -Encoding utf8
-aws ecs register-task-definition --cli-input-json "file://$gatewayTaskFile" --region $REGION
-Write-Host "  Registered: enma-gateway" -ForegroundColor Green
-
-# ---------------------------------------------------------------------------
-# Step 7: Get Default VPC + Subnets
-# ---------------------------------------------------------------------------
-Write-Host "`n[7/8] Discovering VPC and subnets..." -ForegroundColor Yellow
-
-$VPC_ID = aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text --region $REGION
-Write-Host "  VPC: $VPC_ID" -ForegroundColor Green
-
-$SUBNETS = aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --query "Subnets[*].SubnetId" --output text --region $REGION
+$VPC_ID = aws ec2 describe-vpcs --filters Name=isDefault,Values=true `
+    --query "Vpcs[0].VpcId" --output text --region $REGION
+$SUBNETS = aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" `
+    --query "Subnets[*].SubnetId" --output text --region $REGION
 $SUBNET_LIST = $SUBNETS -split "`t"
-Write-Host "  Subnets: $($SUBNET_LIST -join ', ')" -ForegroundColor Green
+$SUBNET_CSV  = $SUBNET_LIST -join ","
+Write-Host "  VPC: $VPC_ID" -ForegroundColor Green
+Write-Host "  Subnets: $SUBNET_CSV" -ForegroundColor Green
 
-# Create security group for ECS tasks
-$SG_NAME = "enma-ecs-tasks"
-$sgExists = aws ec2 describe-security-groups --filters "Name=group-name,Values=$SG_NAME" "Name=vpc-id,Values=$VPC_ID" --query "SecurityGroups[0].GroupId" --output text --region $REGION 2>&1
-if ($sgExists -eq "None" -or $LASTEXITCODE -ne 0) {
-    $SG_ID = aws ec2 create-security-group `
-        --group-name $SG_NAME `
-        --description "Enma ECS tasks - backend 8000, gateway 3000" `
-        --vpc-id $VPC_ID `
-        --region $REGION `
+# ---------------------------------------------------------------------------
+# Step 6: Security groups — three-tier (ALB → ECS → Redis)
+# ---------------------------------------------------------------------------
+Write-Step "[6/12] Security groups"
+
+function Get-OrCreateSG([string]$name, [string]$description) {
+    $existing = aws ec2 describe-security-groups `
+        --filters "Name=group-name,Values=$name" "Name=vpc-id,Values=$VPC_ID" `
+        --query "SecurityGroups[0].GroupId" --output text --region $REGION 2>$null
+    if ($existing -and $existing -ne "None") {
+        Write-Host "  SG exists: $name → $existing" -ForegroundColor DarkGray
+        return $existing
+    }
+    $sgId = aws ec2 create-security-group --group-name $name `
+        --description $description --vpc-id $VPC_ID --region $REGION `
         --query "GroupId" --output text
+    Write-Host "  Created SG: $name → $sgId" -ForegroundColor Green
+    return $sgId
+}
 
-    # Allow inbound on 8000 and 3000
-    aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 8000 --cidr 0.0.0.0/0 --region $REGION
-    aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 3000 --cidr 0.0.0.0/0 --region $REGION
-    Write-Host "  Security group: $SG_ID" -ForegroundColor Green
+$ALB_SG   = Get-OrCreateSG $ALB_SG_NAME   "Public ALB ingress 80/443 from internet"
+$ECS_SG   = Get-OrCreateSG $ECS_SG_NAME   "ECS tasks - ingress from ALB-SG only"
+$REDIS_SG = Get-OrCreateSG $REDIS_SG_NAME "Redis 6379 - ingress from ECS-SG only"
+
+# --- Ingress rules (idempotent — failures here are usually "already exists") ---
+
+# ALB SG: allow 80 + 443 from the internet
+aws ec2 authorize-security-group-ingress --group-id $ALB_SG --protocol tcp --port 80  --cidr 0.0.0.0/0 --region $REGION 2>$null | Out-Null
+aws ec2 authorize-security-group-ingress --group-id $ALB_SG --protocol tcp --port 443 --cidr 0.0.0.0/0 --region $REGION 2>$null | Out-Null
+
+# ECS SG: revoke any wide-open rules (cleanup from previous deploy) and
+# only allow inbound from ALB SG on 8000 + 3000.
+aws ec2 revoke-security-group-ingress --group-id $ECS_SG --protocol tcp --port 8000 --cidr 0.0.0.0/0 --region $REGION 2>$null | Out-Null
+aws ec2 revoke-security-group-ingress --group-id $ECS_SG --protocol tcp --port 3000 --cidr 0.0.0.0/0 --region $REGION 2>$null | Out-Null
+aws ec2 authorize-security-group-ingress --group-id $ECS_SG --protocol tcp --port 8000 --source-group $ALB_SG --region $REGION 2>$null | Out-Null
+aws ec2 authorize-security-group-ingress --group-id $ECS_SG --protocol tcp --port 3000 --source-group $ALB_SG --region $REGION 2>$null | Out-Null
+
+# Redis SG: only ECS tasks may connect on 6379.
+aws ec2 authorize-security-group-ingress --group-id $REDIS_SG --protocol tcp --port 6379 --source-group $ECS_SG --region $REGION 2>$null | Out-Null
+
+Write-Host "  Ingress rules: ALB(0.0.0.0/0:80,443), ECS(ALB-SG:8000,3000), Redis(ECS-SG:6379)" -ForegroundColor Green
+
+# ---------------------------------------------------------------------------
+# Step 7: ElastiCache Serverless Redis
+# ---------------------------------------------------------------------------
+Write-Step "[7/12] ElastiCache Serverless Redis"
+
+# Subnet group — required for placing the cache in our VPC.
+$REDIS_SUBNET_GROUP = "enma-redis-subnets"
+aws elasticache describe-cache-subnet-groups --cache-subnet-group-name $REDIS_SUBNET_GROUP --region $REGION 2>$null | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    aws elasticache create-cache-subnet-group `
+        --cache-subnet-group-name $REDIS_SUBNET_GROUP `
+        --cache-subnet-group-description "Enma cache - default VPC subnets" `
+        --subnet-ids $SUBNET_LIST `
+        --region $REGION | Out-Null
+    Write-Host "  Created subnet group: $REDIS_SUBNET_GROUP" -ForegroundColor Green
 } else {
-    $SG_ID = $sgExists
-    Write-Host "  Security group exists: $SG_ID" -ForegroundColor DarkGray
+    Write-Host "  Subnet group exists: $REDIS_SUBNET_GROUP" -ForegroundColor DarkGray
+}
+
+# Serverless cache — auto-scales ECPU/storage, no node sizing.
+$existing = aws elasticache describe-serverless-caches --serverless-cache-name $REDIS_CACHE_NAME --region $REGION --query "ServerlessCaches[0].Status" --output text 2>$null
+if (-not $existing -or $existing -eq "None") {
+    aws elasticache create-serverless-cache `
+        --serverless-cache-name $REDIS_CACHE_NAME `
+        --engine redis `
+        --subnet-ids $SUBNET_LIST `
+        --security-group-ids $REDIS_SG `
+        --description "Enma production cache (rate-limit + LLM + tax verdict)" `
+        --region $REGION | Out-Null
+    Write-Host "  Creating Serverless cache: $REDIS_CACHE_NAME (status check follows)" -ForegroundColor Green
+} else {
+    Write-Host "  Cache exists: $REDIS_CACHE_NAME (status: $existing)" -ForegroundColor DarkGray
+}
+
+# Poll until the cache is available (can take 5-10 minutes on first create).
+Write-Host "  Waiting for cache to become available..." -ForegroundColor Yellow
+do {
+    Start-Sleep -Seconds 20
+    $status = aws elasticache describe-serverless-caches `
+        --serverless-cache-name $REDIS_CACHE_NAME --region $REGION `
+        --query "ServerlessCaches[0].Status" --output text
+    Write-Host "    status: $status" -ForegroundColor DarkGray
+} while ($status -ne "available")
+
+$REDIS_ENDPOINT = aws elasticache describe-serverless-caches `
+    --serverless-cache-name $REDIS_CACHE_NAME --region $REGION `
+    --query "ServerlessCaches[0].Endpoint.Address" --output text
+$REDIS_PORT = aws elasticache describe-serverless-caches `
+    --serverless-cache-name $REDIS_CACHE_NAME --region $REGION `
+    --query "ServerlessCaches[0].Endpoint.Port" --output text
+# ElastiCache Serverless enforces TLS — use rediss:// (note the double-s).
+$REDIS_URL = "rediss://${REDIS_ENDPOINT}:${REDIS_PORT}/0"
+Write-Host "  REDIS_URL → $REDIS_URL" -ForegroundColor Green
+
+# ---------------------------------------------------------------------------
+# Step 8: Application Load Balancer
+# ---------------------------------------------------------------------------
+Write-Step "[8/12] Application Load Balancer"
+
+# Public ALB — uses the same default-VPC subnets (they have IGW routes).
+$existing = aws elbv2 describe-load-balancers --names $ALB_NAME --region $REGION `
+    --query "LoadBalancers[0].LoadBalancerArn" --output text 2>$null
+if (-not $existing -or $existing -eq "None") {
+    $ALB_ARN = aws elbv2 create-load-balancer `
+        --name $ALB_NAME --type application --scheme internet-facing `
+        --subnets $SUBNET_LIST --security-groups $ALB_SG `
+        --region $REGION --query "LoadBalancers[0].LoadBalancerArn" --output text
+    Write-Host "  Created ALB: $ALB_NAME" -ForegroundColor Green
+} else {
+    $ALB_ARN = $existing
+    Write-Host "  ALB exists: $ALB_NAME" -ForegroundColor DarkGray
+}
+
+$ALB_DNS = aws elbv2 describe-load-balancers --load-balancer-arns $ALB_ARN --region $REGION `
+    --query "LoadBalancers[0].DNSName" --output text
+Write-Host "  ALB DNS: $ALB_DNS" -ForegroundColor Green
+
+# ---------------------------------------------------------------------------
+# Step 9: Target groups
+# ---------------------------------------------------------------------------
+Write-Step "[9/12] Target groups"
+
+function Get-OrCreateTG([string]$name, [int]$port, [string]$healthPath) {
+    $existing = aws elbv2 describe-target-groups --names $name --region $REGION `
+        --query "TargetGroups[0].TargetGroupArn" --output text 2>$null
+    if ($existing -and $existing -ne "None") {
+        Write-Host "  TG exists: $name → $existing" -ForegroundColor DarkGray
+        return $existing
+    }
+    $arn = aws elbv2 create-target-group --name $name --protocol HTTP --port $port `
+        --vpc-id $VPC_ID --target-type ip `
+        --health-check-protocol HTTP --health-check-path $healthPath `
+        --health-check-interval-seconds 30 --health-check-timeout-seconds 5 `
+        --healthy-threshold-count 2 --unhealthy-threshold-count 3 `
+        --matcher HttpCode=200 `
+        --region $REGION --query "TargetGroups[0].TargetGroupArn" --output text
+    # Faster deregistration drain so deploys roll cleanly.
+    aws elbv2 modify-target-group-attributes --target-group-arn $arn `
+        --attributes Key=deregistration_delay.timeout_seconds,Value=30 --region $REGION | Out-Null
+    Write-Host "  Created TG: $name → $arn" -ForegroundColor Green
+    return $arn
+}
+
+$BACKEND_TG_ARN = Get-OrCreateTG $BACKEND_TG 8000 "/health"
+$GATEWAY_TG_ARN = Get-OrCreateTG $GATEWAY_TG 3000 "/health"
+
+# ---------------------------------------------------------------------------
+# Step 10: ALB listeners + path rules
+# ---------------------------------------------------------------------------
+Write-Step "[10/12] ALB listeners and routing"
+
+# HTTP :80 listener — default forwards to backend; gateway gets explicit
+# path rule. For HTTPS, supply --certificates ARN and set --protocol HTTPS.
+$existing = aws elbv2 describe-listeners --load-balancer-arn $ALB_ARN --region $REGION `
+    --query "Listeners[?Port==``80``].ListenerArn" --output text 2>$null
+if (-not $existing) {
+    $LISTENER_ARN = aws elbv2 create-listener --load-balancer-arn $ALB_ARN `
+        --protocol HTTP --port 80 `
+        --default-actions Type=forward,TargetGroupArn=$BACKEND_TG_ARN `
+        --region $REGION --query "Listeners[0].ListenerArn" --output text
+    Write-Host "  Created listener :80 → backend TG" -ForegroundColor Green
+} else {
+    $LISTENER_ARN = $existing
+    Write-Host "  Listener :80 exists" -ForegroundColor DarkGray
+}
+
+# Path rule: /telegram/* → gateway TG (lets us expose a single hostname).
+# Priority 10 so it evaluates before the default backend forward.
+$rules = aws elbv2 describe-rules --listener-arn $LISTENER_ARN --region $REGION `
+    --query "Rules[?Priority=='10'].RuleArn" --output text
+if (-not $rules) {
+    aws elbv2 create-rule --listener-arn $LISTENER_ARN --priority 10 `
+        --conditions "Field=path-pattern,Values=/telegram/*" `
+        --actions Type=forward,TargetGroupArn=$GATEWAY_TG_ARN --region $REGION | Out-Null
+    Write-Host "  Path rule /telegram/* → gateway TG (priority 10)" -ForegroundColor Green
+} else {
+    Write-Host "  Path rule exists" -ForegroundColor DarkGray
 }
 
 # ---------------------------------------------------------------------------
-# Step 8: ECS Services
+# Step 11: Task definitions (re-registered every run with the latest TAG)
 # ---------------------------------------------------------------------------
-Write-Host "`n[8/8] Creating ECS services..." -ForegroundColor Yellow
+Write-Step "[11/12] Task definitions"
 
-$SUBNET_JSON = ($SUBNET_LIST | ForEach-Object { "`"$_`"" }) -join ","
+$ECR_URI = "${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
 
-# Backend service
-$backendSvcExists = aws ecs describe-services --cluster $CLUSTER_NAME --services enma-backend --region $REGION --query "services[?status=='ACTIVE'].serviceName" --output text 2>&1
-if ($backendSvcExists -ne "enma-backend") {
-    aws ecs create-service `
-        --cluster $CLUSTER_NAME `
-        --service-name enma-backend `
-        --task-definition enma-backend `
-        --desired-count 1 `
-        --launch-type FARGATE `
-        --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_JSON],securityGroups=[$SG_ID],assignPublicIp=ENABLED}" `
-        --region $REGION
-    Write-Host "  Created service: enma-backend" -ForegroundColor Green
-} else {
-    aws ecs update-service `
-        --cluster $CLUSTER_NAME `
-        --service enma-backend `
-        --task-definition enma-backend `
-        --force-new-deployment `
-        --region $REGION
-    Write-Host "  Updated service: enma-backend" -ForegroundColor Green
+function Register-Backend {
+    $envBlock = @"
+[
+  {"name":"ENV","value":"production"},
+  {"name":"LOG_LEVEL","value":"info"},
+  {"name":"APP_PORT","value":"8000"},
+  {"name":"WEB_CONCURRENCY","value":"2"},
+  {"name":"DATABASE_URL","value":"REPLACE_WITH_SUPABASE_DSN"},
+  {"name":"DB_POOL_SIZE","value":"5"},
+  {"name":"REDIS_URL","value":"$REDIS_URL"},
+  {"name":"RATE_LIMIT_DEFAULT","value":"100/minute"},
+  {"name":"BACKEND_API_KEY","value":"REPLACE_WITH_SECRET"},
+  {"name":"GATEWAY_HMAC_SECRET","value":"REPLACE_WITH_SECRET"},
+  {"name":"TELEGRAM_BOT_TOKEN","value":"REPLACE_WITH_SECRET"},
+  {"name":"SENTRY_DSN","value":"REPLACE_WITH_SECRET"},
+  {"name":"LLM_API_KEY","value":"REPLACE_WITH_SECRET"},
+  {"name":"LAYOUT_MODEL_ENDPOINT","value":"https://integrate.api.nvidia.com/v1/chat/completions"},
+  {"name":"LAYOUT_MODEL_NAME","value":"meta/llama-3.1-8b-instruct"},
+  {"name":"EXTRACTION_MODEL_ENDPOINT","value":"https://integrate.api.nvidia.com/v1/chat/completions"},
+  {"name":"EXTRACTION_MODEL_NAME","value":"nvidia/nemotron-ocr-v1"},
+  {"name":"REASONING_MODEL_ENDPOINT","value":"https://integrate.api.nvidia.com/v1/chat/completions"},
+  {"name":"REASONING_MODEL_NAME","value":"meta/llama-3.3-70b-instruct"},
+  {"name":"EMBEDDING_ENDPOINT","value":"https://integrate.api.nvidia.com/v1/embeddings"},
+  {"name":"EMBEDDING_MODEL_NAME","value":"nvidia/nv-embedqa-e5-v5"},
+  {"name":"EMBEDDING_DIMENSIONS","value":"1024"},
+  {"name":"WHISPER_ENDPOINT","value":"https://integrate.api.nvidia.com/v1/audio/transcriptions"},
+  {"name":"CORS_ORIGINS","value":"[\"*\"]"}
+]
+"@
+    $containerDefs = ConvertTo-Json -Compress @(
+        @{
+            name = "backend"
+            image = "${ECR_URI}/${BACKEND_REPO}:latest"
+            portMappings = @(@{ containerPort = 8000; protocol = "tcp" })
+            essential = $true
+            healthCheck = @{
+                command = @(
+                    "CMD-SHELL",
+                    "python -c `"import urllib.request; urllib.request.urlopen('http://localhost:8000/health',timeout=3)`" || exit 1"
+                )
+                interval = 30; timeout = 5; retries = 3; startPeriod = 15
+            }
+            logConfiguration = @{
+                logDriver = "awslogs"
+                options = @{
+                    "awslogs-group" = "/ecs/enma-backend"
+                    "awslogs-region" = $REGION
+                    "awslogs-stream-prefix" = "ecs"
+                }
+            }
+            environment = (ConvertFrom-Json $envBlock)
+        }
+    ) -Depth 10
+    $f = "$env:TEMP\enma-backend-containers.json"
+    $containerDefs | Out-File -Encoding utf8 $f
+    aws ecs register-task-definition --family enma-backend `
+        --network-mode awsvpc --requires-compatibilities FARGATE `
+        --cpu 512 --memory 1024 `
+        --execution-role-arn $EXEC_ROLE_ARN --task-role-arn $EXEC_ROLE_ARN `
+        --container-definitions "file://$f" --region $REGION `
+        --query "taskDefinition.{rev:revision,arn:taskDefinitionArn}" --output json
 }
 
-# Gateway service
-$gatewaySvcExists = aws ecs describe-services --cluster $CLUSTER_NAME --services enma-gateway --region $REGION --query "services[?status=='ACTIVE'].serviceName" --output text 2>&1
-if ($gatewaySvcExists -ne "enma-gateway") {
-    aws ecs create-service `
-        --cluster $CLUSTER_NAME `
-        --service-name enma-gateway `
-        --task-definition enma-gateway `
-        --desired-count 1 `
-        --launch-type FARGATE `
-        --network-configuration "awsvpcConfiguration={subnets=[$SUBNET_JSON],securityGroups=[$SG_ID],assignPublicIp=ENABLED}" `
-        --region $REGION
-    Write-Host "  Created service: enma-gateway" -ForegroundColor Green
-} else {
-    aws ecs update-service `
-        --cluster $CLUSTER_NAME `
-        --service enma-gateway `
-        --task-definition enma-gateway `
-        --force-new-deployment `
-        --region $REGION
-    Write-Host "  Updated service: enma-gateway" -ForegroundColor Green
+function Register-Gateway {
+    # Gateway calls backend via the ALB DNS name (now stable across deploys).
+    $envBlock = @"
+[
+  {"name":"NODE_ENV","value":"production"},
+  {"name":"LOG_LEVEL","value":"info"},
+  {"name":"PORT","value":"3000"},
+  {"name":"BACKEND_URL","value":"http://$ALB_DNS"},
+  {"name":"BACKEND_API_KEY","value":"REPLACE_WITH_SECRET"},
+  {"name":"GATEWAY_HMAC_SECRET","value":"REPLACE_WITH_SECRET"},
+  {"name":"TELEGRAM_BOT_TOKEN","value":"REPLACE_WITH_SECRET"},
+  {"name":"SENTRY_DSN","value":"REPLACE_WITH_SECRET"}
+]
+"@
+    $containerDefs = ConvertTo-Json -Compress @(
+        @{
+            name = "gateway"
+            image = "${ECR_URI}/${GATEWAY_REPO}:latest"
+            portMappings = @(@{ containerPort = 3000; protocol = "tcp" })
+            essential = $true
+            healthCheck = @{
+                command = @(
+                    "CMD-SHELL",
+                    "node -e `"fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))`" || exit 1"
+                )
+                interval = 30; timeout = 5; retries = 3; startPeriod = 10
+            }
+            logConfiguration = @{
+                logDriver = "awslogs"
+                options = @{
+                    "awslogs-group" = "/ecs/enma-gateway"
+                    "awslogs-region" = $REGION
+                    "awslogs-stream-prefix" = "ecs"
+                }
+            }
+            environment = (ConvertFrom-Json $envBlock)
+        }
+    ) -Depth 10
+    $f = "$env:TEMP\enma-gateway-containers.json"
+    $containerDefs | Out-File -Encoding utf8 $f
+    aws ecs register-task-definition --family enma-gateway `
+        --network-mode awsvpc --requires-compatibilities FARGATE `
+        --cpu 256 --memory 512 `
+        --execution-role-arn $EXEC_ROLE_ARN `
+        --container-definitions "file://$f" --region $REGION `
+        --query "taskDefinition.{rev:revision,arn:taskDefinitionArn}" --output json
 }
+
+Write-Host "  Registering backend task definition..." -ForegroundColor Yellow
+Register-Backend
+Write-Host "  Registering gateway task definition..." -ForegroundColor Yellow
+Register-Gateway
+Write-Host "  Task definitions registered." -ForegroundColor Green
+
+# ---------------------------------------------------------------------------
+# Step 12: ECS services — ALB-attached, no public IPs
+# ---------------------------------------------------------------------------
+Write-Step "[12/12] ECS services"
+
+function Upsert-Service {
+    param([string]$name, [string]$tgArn, [int]$containerPort)
+    $exists = aws ecs describe-services --cluster $CLUSTER_NAME --services $name `
+        --region $REGION --query "services[?status=='ACTIVE'].serviceName" --output text 2>$null
+    $netCfg = "awsvpcConfiguration={subnets=[$SUBNET_CSV],securityGroups=[$ECS_SG],assignPublicIp=ENABLED}"
+    # NOTE on assignPublicIp=ENABLED: default-VPC subnets are public; ECS
+    # tasks need a route to the internet to pull from ECR + call NIM.
+    # Inbound is still locked down by the ECS SG (ALB-only ingress).
+    # If you move to a private-subnet VPC with NAT, flip this to DISABLED.
+    if ($exists -ne $name) {
+        aws ecs create-service --cluster $CLUSTER_NAME --service-name $name `
+            --task-definition $name --desired-count 1 --launch-type FARGATE `
+            --network-configuration $netCfg `
+            --load-balancers "targetGroupArn=$tgArn,containerName=${name#enma-},containerPort=$containerPort" `
+            --health-check-grace-period-seconds 60 `
+            --region $REGION | Out-Null
+        Write-Host "  Created service: $name (attached to TG)" -ForegroundColor Green
+    } else {
+        aws ecs update-service --cluster $CLUSTER_NAME --service $name `
+            --task-definition $name --force-new-deployment --region $REGION | Out-Null
+        Write-Host "  Updated service: $name (forced rollout)" -ForegroundColor Green
+    }
+}
+
+# `${name#enma-}` removes the "enma-" prefix to match the container name in
+# the task definition (backend / gateway).
+Upsert-Service "enma-backend" $BACKEND_TG_ARN 8000
+Upsert-Service "enma-gateway" $GATEWAY_TG_ARN 3000
 
 # ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
-Write-Host "`n============================================" -ForegroundColor Cyan
-Write-Host " Deployment complete!" -ForegroundColor Cyan
-Write-Host "============================================" -ForegroundColor Cyan
+Write-Step "Deployment complete"
 Write-Host @"
 
+Public entry point (no SSL yet — add ACM cert + HTTPS listener for prod):
+  http://$ALB_DNS/         → backend
+  http://$ALB_DNS/telegram → gateway
+
+Internal addresses (used by ECS tasks):
+  Redis: $REDIS_URL
+  Backend (via ALB): http://$ALB_DNS
+
 Next steps:
-  1. Update task definitions with real secrets:
-     - DATABASE_URL (from Supabase dashboard)
-     - TELEGRAM_BOT_TOKEN (from BotFather)
-     - LLM_API_KEY (OpenAI key)
-     - SENTRY_DSN (from Sentry project settings)
-     - BACKEND_API_KEY (generate: openssl rand -hex 32)
-     - GATEWAY_HMAC_SECRET (generate: openssl rand -hex 32)
+  1. Replace REPLACE_WITH_SECRET values in task definitions by updating env
+     vars in AWS Secrets Manager or directly in the task definition JSON.
+     Then: aws ecs update-service --cluster enma-prod --service enma-backend
+            --force-new-deployment --region $REGION
 
-  2. Redeploy after updating secrets:
-     aws ecs update-service --cluster enma-prod --service enma-backend --force-new-deployment --region ap-south-1
-     aws ecs update-service --cluster enma-prod --service enma-gateway --force-new-deployment --region ap-south-1
+  2. Issue an ACM certificate for your domain, point the domain at the ALB,
+     and add an HTTPS :443 listener. The HTTP :80 listener should then
+     redirect to HTTPS.
 
-  3. Check health:
-     aws ecs describe-services --cluster enma-prod --services enma-backend enma-gateway --region ap-south-1
+  3. Smoke test:
+       curl http://$ALB_DNS/health
+       curl http://$ALB_DNS/ready
+       curl http://$ALB_DNS/telegram/health
 
-  4. View logs:
-     aws logs tail /ecs/enma-backend --follow --region ap-south-1
-     aws logs tail /ecs/enma-gateway --follow --region ap-south-1
+  4. Tail logs:
+       aws logs tail /ecs/enma-backend --follow --region $REGION
+       aws logs tail /ecs/enma-gateway --follow --region $REGION
 "@
