@@ -9,6 +9,18 @@ Node.js 20 service that owns Telegram I/O for Enma Labs. Zero business logic, ze
 - `node-cron` for scheduled jobs (Phase 7)
 - `dotenv` for local env loading
 - Vitest for unit tests, ESLint 9 + Prettier 3 for hygiene
+- `@sentry/node` for error capture with a PII scrubber (`src/observability/sentry.js`)
+
+## Production posture (Phase 8)
+
+- Sentry init is a no-op when `SENTRY_DSN` is unset; in staging/production
+  the scrubber strips request bodies, headers, breadcrumb data, and the
+  user object before transmission.
+- Daily idempotency-log cleanup is scheduled at 02:00 IST via
+  `src/cron/cron_scheduler.js` and dispatched to
+  `POST /worker/cron/idempotency-cleanup`.
+- Prod image is non-root (uid 10001), read-only filesystem, no added
+  capabilities. See `../docker-compose.prod.yml`.
 
 ## Layout (Phase 0 baseline)
 

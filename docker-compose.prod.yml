@@ -1,0 +1,92 @@
+# =============================================================================
+# Enma Labs — Production-like stack (local validation only).
+#
+# This compose file mirrors the production topology so you can sanity-check
+# the prod images end-to-end on a workstation before pushing. It is NOT what
+# runs in production — that lives on AWS Fargate / EKS with managed Postgres
+# (Supabase). The orchestrator's secret store replaces the env_file below.
+#
+# Run:    docker compose -f docker-compose.prod.yml --env-file .env.production up
+# Tear:   docker compose -f docker-compose.prod.yml down -v
+# =============================================================================
+
+name: enma-prod
+
+services:
+  postgres:
+    image: timescale/timescaledb-ha:pg16
+    container_name: enma-prod-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-enma}
+      POSTGRES_USER: ${POSTGRES_USER:-enma}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+    volumes:
+      - prod_pgdata:/home/postgres/pgdata/data
+      - ./scripts/init-extensions.sql:/docker-entrypoint-initdb.d/000_init-extensions.sql:ro
+    healthcheck:
+      test:
+        ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-enma} -d ${POSTGRES_DB:-enma}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  backend:
+    build:
+      context: ./enma-backend
+      dockerfile: Dockerfile
+      target: prod
+    image: enma/backend:prod
+    container_name: enma-prod-backend
+    restart: unless-stopped
+    env_file: .env.production
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1024M
+
+  gateway:
+    build:
+      context: ./enma-gateway
+      dockerfile: Dockerfile
+      target: prod
+    image: enma/gateway:prod
+    container_name: enma-prod-gateway
+    restart: unless-stopped
+    env_file: .env.production
+    environment:
+      BACKEND_URL: http://backend:8000
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+volumes:
+  prod_pgdata:
+    driver: local

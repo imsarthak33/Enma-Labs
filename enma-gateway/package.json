@@ -21,7 +21,8 @@
   },
   "dependencies": {
     "node-cron": "^3.0.3",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "@sentry/node": "^8.30.0"
   },
   "devDependencies": {
     "eslint": "^9.7.0",

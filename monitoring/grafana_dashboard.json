@@ -1,0 +1,142 @@
+{
+  "title": "Enma Labs — Production Health",
+  "uid": "enma-prod-health",
+  "schemaVersion": 38,
+  "version": 1,
+  "timezone": "browser",
+  "time": {"from": "now-24h", "to": "now"},
+  "refresh": "1m",
+  "tags": ["enma", "production"],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Active firms (today)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "targets": [
+        {
+          "refId": "A",
+          "rawSql": "SELECT firm_count FROM active_firms_today;",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Active clients",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "targets": [
+        {
+          "refId": "A",
+          "rawSql": "SELECT active_client_count FROM active_firms_today;",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Firms with uploads (24h)",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "targets": [
+        {
+          "refId": "A",
+          "rawSql": "SELECT firms_with_recent_uploads FROM active_firms_today;",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Idempotency log size",
+      "type": "stat",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "targets": [
+        {
+          "refId": "A",
+          "rawSql": "SELECT total_rows FROM idempotency_log_size;",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Pipeline latency p95 (per stage, hourly)",
+      "type": "timeseries",
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 4},
+      "targets": [
+        {
+          "refId": "A",
+          "rawSql": "SELECT bucket AS time, stage, p95_ms FROM processing_latency_hourly WHERE $__timeFilter(bucket) ORDER BY time;",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Pipeline failures (per stage, hourly)",
+      "type": "timeseries",
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 4},
+      "targets": [
+        {
+          "refId": "A",
+          "rawSql": "SELECT bucket AS time, stage, failures FROM processing_latency_hourly WHERE $__timeFilter(bucket) ORDER BY time;",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "title": "Token spend USD per model (24h)",
+      "type": "bargauge",
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 13},
+      "targets": [
+        {
+          "refId": "A",
+          "rawSql": "SELECT model, cost_usd FROM token_spend_last_24h;",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "title": "Token usage daily (input + output)",
+      "type": "timeseries",
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 13},
+      "targets": [
+        {
+          "refId": "A",
+          "rawSql": "SELECT day AS time, model, input_tokens + output_tokens AS total_tokens FROM token_usage_daily ORDER BY time;",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "id": 30,
+      "title": "Errors per endpoint (1h)",
+      "type": "table",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 20},
+      "targets": [
+        {
+          "refId": "A",
+          "rawSql": "SELECT endpoint, error_count, firms_impacted FROM error_rate_last_1h;",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "title": "Upload volume (hourly, last 24h)",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 20},
+      "targets": [
+        {
+          "refId": "A",
+          "rawSql": "SELECT hour AS time, document_count, firms, clients FROM upload_volume_last_24h ORDER BY time;",
+          "format": "time_series"
+        }
+      ]
+    }
+  ]
+}

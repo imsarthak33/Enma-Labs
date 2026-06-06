@@ -1,0 +1,4 @@
+# Pinned versions used by perf/locustfile.py and perf/assert_budget.py.
+# Kept separate from enma-backend/pyproject.toml so the perf harness can be
+# installed in a CI runner without dragging the full app dependency tree.
+locust==2.31.5

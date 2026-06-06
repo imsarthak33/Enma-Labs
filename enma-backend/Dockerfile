@@ -58,12 +58,20 @@ USER enma
 
 EXPOSE 8000
 
-# Gunicorn manages workers; UvicornWorker speaks ASGI.
-CMD ["gunicorn", "app.main:app", \
-     "--worker-class", "uvicorn.workers.UvicornWorker", \
-     "--workers", "2", \
-     "--bind", "0.0.0.0:8000", \
-     "--access-logfile", "-", \
-     "--error-logfile", "-", \
-     "--graceful-timeout", "30", \
-     "--timeout", "60"]
+# Probe the liveness endpoint. Falls back to exit 1 on any non-2xx.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD python -c "import sys, urllib.request as u; \
+sys.exit(0 if u.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)" \
+    || exit 1
+
+# Gunicorn manages workers; UvicornWorker speaks ASGI. WEB_CONCURRENCY lets
+# the orchestrator (Fargate/EKS) right-size workers without rebuilding.
+ENV WEB_CONCURRENCY=2
+CMD ["sh", "-c", "exec gunicorn app.main:app \
+     --worker-class uvicorn.workers.UvicornWorker \
+     --workers ${WEB_CONCURRENCY} \
+     --bind 0.0.0.0:8000 \
+     --access-logfile - \
+     --error-logfile - \
+     --graceful-timeout 30 \
+     --timeout 60"]

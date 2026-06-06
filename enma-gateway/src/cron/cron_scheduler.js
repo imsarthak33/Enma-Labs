@@ -48,6 +48,13 @@ export const CRON_JOBS = Object.freeze([
     schedule: "30 3 28 * *",
     description: "Chase clients with missing docs on the 28th, 09:00 IST.",
   },
+  {
+    // Spec §2.4 — daily prune of idempotency_log entries older than 72 h.
+    // Runs at 02:00 IST (20:30 UTC the previous day) when traffic is lowest.
+    kind: "cron_idempotency_cleanup",
+    schedule: "0 2 * * *",
+    description: "Daily prune of idempotency_log (72 h TTL).",
+  },
 ]);
 
 /**

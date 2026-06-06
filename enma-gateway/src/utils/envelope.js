@@ -46,6 +46,8 @@ export const ENVELOPE_KINDS = Object.freeze([
   "cron_task_heartbeat",
   "cron_morning_briefing",
   "cron_client_chase",
+  // Phase 8 — daily idempotency_log prune (spec §2.4).
+  "cron_idempotency_cleanup",
 ]);
 
 /** Subset that callers can use to recognise cron envelopes. */
@@ -53,6 +55,7 @@ export const CRON_ENVELOPE_KINDS = Object.freeze([
   "cron_task_heartbeat",
   "cron_morning_briefing",
   "cron_client_chase",
+  "cron_idempotency_cleanup",
 ]);
 
 /**
@@ -154,16 +157,7 @@ export function signPayload(payloadB64, secret) {
  * @param {string} [args.nonce]
  * @returns {{ inner: InnerEnvelope, outer: OuterEnvelope }}
  */
-export function buildEnvelope({
-  kind,
-  chatId,
-  messageId,
-  updateId,
-  payload,
-  secret,
-  now,
-  nonce,
-}) {
+export function buildEnvelope({ kind, chatId, messageId, updateId, payload, secret, now, nonce }) {
   const inner = buildInnerEnvelope({ kind, chatId, messageId, updateId, payload, now, nonce });
   const payload_b64 = encodeInner(inner);
   const signature = signPayload(payload_b64, secret);

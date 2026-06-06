@@ -29,6 +29,10 @@ from app.db.models.firm import CaFirm
 from app.db.queries.clients import ClientQuery
 from app.db.queries.documents import DocumentQuery
 from app.db.queries.firms import list_all_firms
+from app.db.queries.idempotency import (
+    DEFAULT_CLEANUP_AGE_HOURS,
+    cleanup_idempotency_log,
+)
 from app.db.queries.notifications import (
     CHASE_COOLDOWN_DAYS,
     NotificationQuery,
@@ -103,9 +107,7 @@ async def _heartbeat_for_firm(firm: CaFirm) -> None:
                 )
             )
             try:
-                await telegram.send_message(
-                    chat_id=firm.admin_chat_id, html_text=html
-                )
+                await telegram.send_message(chat_id=firm.admin_chat_id, html_text=html)
             except telegram.TelegramAPIError as exc:
                 _log.warning("heartbeat_send_failed", task_id=str(task.id), error=str(exc))
                 continue
@@ -132,9 +134,7 @@ async def _briefing_for_firm(firm: CaFirm) -> None:
         open_tasks = list(await tasks_q.list_open())
         overdue_tasks = list(await tasks_q.list_overdue())
         current_docs = list(
-            await docs_q.list_by_filing_period(
-                year=current_period.year, month=current_period.month
-            )
+            await docs_q.list_by_filing_period(year=current_period.year, month=current_period.month)
         )
         upcoming_docs = list(
             await docs_q.list_by_filing_period(
@@ -160,9 +160,7 @@ async def _briefing_for_firm(firm: CaFirm) -> None:
         _log.warning("briefing_send_failed", firm_id=str(firm.id), error=str(exc))
 
 
-async def _chase_for_firm(
-    firm: CaFirm, *, batch_cap: int = CLIENT_CHASE_BATCH_CAP
-) -> None:
+async def _chase_for_firm(firm: CaFirm, *, batch_cap: int = CLIENT_CHASE_BATCH_CAP) -> None:
     """Identify clients missing docs for the upcoming period; ping ≤ batch_cap."""
     factory = get_sessionmaker()
     next_period = _next_period(FilingPeriod.from_date(now_ist().date()))
@@ -171,9 +169,7 @@ async def _chase_for_firm(
         notifications_q = NotificationQuery(session=session, ca_firm_id=firm.id)
 
         candidates = list(
-            await clients_q.list_missing_filing_docs(
-                month=next_period.month, year=next_period.year
-            )
+            await clients_q.list_missing_filing_docs(month=next_period.month, year=next_period.year)
         )
         sent = 0
         for client in candidates:
@@ -188,14 +184,10 @@ async def _chase_for_firm(
                 + " — no documents yet for filing "
                 + code(f"{next_period.month:02d}/{next_period.year}")
                 + ".\n"
-                + italic(
-                    f"Cooldown {CHASE_COOLDOWN_DAYS} days before the next chase."
-                )
+                + italic(f"Cooldown {CHASE_COOLDOWN_DAYS} days before the next chase.")
             )
             try:
-                await telegram.send_message(
-                    chat_id=firm.admin_chat_id, html_text=html
-                )
+                await telegram.send_message(chat_id=firm.admin_chat_id, html_text=html)
             except telegram.TelegramAPIError as exc:
                 _log.warning(
                     "chase_send_failed",
@@ -252,6 +244,22 @@ async def _run_chase(_envelope: DecodedEnvelope) -> None:
     await _fanout(_chase_for_firm, label="client_chase")
 
 
+async def _run_idempotency_cleanup(_envelope: DecodedEnvelope) -> None:
+    """Daily prune of ``idempotency_log`` entries older than 72 hours.
+
+    Spec §2.4. Not a fan-out — the idempotency_log is global (no ca_firm_id
+    filter applies to the row at insert time, by design — see
+    ``app/db/queries/idempotency.py``).
+    """
+    factory = get_sessionmaker()
+    async with factory() as session:
+        deleted = await cleanup_idempotency_log(
+            session,
+            max_age_hours=DEFAULT_CLEANUP_AGE_HOURS,
+        )
+    _log.info("idempotency_cleanup_complete", deleted=deleted)
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -278,9 +286,7 @@ async def _process_cron(
     if verdict.is_duplicate:
         return ORJSONResponse(status_code=status.HTTP_200_OK, content=_duplicate_body())
     _spawn(runner(envelope), name=f"cron:{label}")
-    return ORJSONResponse(
-        status_code=status.HTTP_202_ACCEPTED, content=_accepted_body(verdict)
-    )
+    return ORJSONResponse(status_code=status.HTTP_202_ACCEPTED, content=_accepted_body(verdict))
 
 
 @router.post("/task-heartbeat", summary="Cron — overdue task heartbeat")
@@ -300,11 +306,20 @@ async def cron_morning_briefing(
 
 
 @router.post("/client-chase", summary="Cron — 28th-of-month client chase")
-async def cron_client_chase(
-    envelope: VerifiedCronEnvelopeDep, verdict: IdempotencyDep
-) -> Response:
+async def cron_client_chase(envelope: VerifiedCronEnvelopeDep, verdict: IdempotencyDep) -> Response:
     _assert_kind(envelope, "cron_client_chase")
     return await _process_cron(envelope, verdict, _run_chase, "client_chase")
+
+
+@router.post(
+    "/idempotency-cleanup",
+    summary="Cron — daily idempotency_log cleanup (72hr TTL)",
+)
+async def cron_idempotency_cleanup(
+    envelope: VerifiedCronEnvelopeDep, verdict: IdempotencyDep
+) -> Response:
+    _assert_kind(envelope, "cron_idempotency_cleanup")
+    return await _process_cron(envelope, verdict, _run_idempotency_cleanup, "idempotency_cleanup")
 
 
 __all__ = [

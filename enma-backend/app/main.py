@@ -23,6 +23,7 @@ from app.db.session import dispose_engine, get_engine
 from app.logging_setup import configure_logging, get_logger
 from app.services.telegram import close_client as close_telegram_client
 from app.utils.background import shutdown_registry
+from app.utils.masking import sentry_before_send
 
 
 def _init_sentry() -> None:
@@ -34,6 +35,7 @@ def _init_sentry() -> None:
         environment=settings.env.value,
         release=__version__,
         send_default_pii=False,
+        before_send=sentry_before_send,
         integrations=[
             FastApiIntegration(transaction_style="endpoint"),
             StarletteIntegration(transaction_style="endpoint"),

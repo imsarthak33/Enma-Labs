@@ -294,7 +294,7 @@ async def _resolve_from_session(
         .order_by(Conversation.created_at.desc())
         .limit(1)
     )
-    result = await session.execute(stmt)
+    result = await session.execute(stmt)  # audit:allow-direct-session — ca_firm_id filtered above
     return result.scalar_one_or_none()
 
 
@@ -331,7 +331,7 @@ async def _resolve_from_caption(
         .order_by(similarity.desc())
         .limit(2)
     )
-    result = await session.execute(stmt)
+    result = await session.execute(stmt)  # audit:allow-direct-session — ca_firm_id filtered above
     rows = result.all()
     if not rows:
         return None
@@ -411,7 +411,7 @@ async def _resolve_from_vendor_history(
         .order_by(hit_count.desc())
         .limit(2)
     )
-    result = await session.execute(stmt)
+    result = await session.execute(stmt)  # audit:allow-direct-session — ca_firm_id filtered above
     rows = result.all()
     if not rows:
         return None
@@ -474,7 +474,7 @@ async def _emit(
         confidence=confidence.value if confidence is not None else None,
         resolution_time_ms=elapsed_ms,
     )
-    session.add(audit)
+    session.add(audit)  # audit:allow-direct-session — audit log uses ca_firm_id from outer scope
     await session.flush()
     _log.info(
         "identity_resolved",

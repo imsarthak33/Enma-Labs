@@ -94,4 +94,42 @@ async def insert_if_new(
     return inserted_id
 
 
-__all__ = ["hash_payload", "insert_if_new"]
+_CLEANUP_SQL: Final[str] = """
+DELETE FROM idempotency_log
+WHERE processed_at < NOW() - make_interval(hours => :max_age_hours)
+"""
+
+# Spec §2.4 — the cleanup window must outlive any reasonable Telegram retry
+# (Telegram retries for up to ~24h on transient failures) but not grow
+# unbounded. 72 hours is the canonical floor.
+DEFAULT_CLEANUP_AGE_HOURS: Final[int] = 72
+
+
+async def cleanup_idempotency_log(
+    session: AsyncSession,
+    *,
+    max_age_hours: int = DEFAULT_CLEANUP_AGE_HOURS,
+) -> int:
+    """Delete idempotency-log rows older than ``max_age_hours``.
+
+    Called from the daily ``/worker/cron/idempotency-cleanup`` route.
+    Returns the number of rows removed so the operator can chart trend.
+    """
+    if max_age_hours <= 0:
+        raise ValueError("max_age_hours must be > 0")
+    result = await session.execute(
+        text(_CLEANUP_SQL),
+        {"max_age_hours": max_age_hours},
+    )
+    deleted = result.rowcount or 0
+    await session.commit()
+    _log.info("idempotency_cleanup", deleted=deleted, max_age_hours=max_age_hours)
+    return int(deleted)
+
+
+__all__ = [
+    "DEFAULT_CLEANUP_AGE_HOURS",
+    "cleanup_idempotency_log",
+    "hash_payload",
+    "insert_if_new",
+]

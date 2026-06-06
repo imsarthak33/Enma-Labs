@@ -58,7 +58,12 @@ ALLOWED_KINDS: Final[frozenset[str]] = frozenset(
 # which uses identical HMAC + freshness checks but a different allow-list
 # (these envelopes carry ``chat_id=null`` and no Telegram message_id).
 CRON_KINDS: Final[frozenset[str]] = frozenset(
-    {"cron_task_heartbeat", "cron_morning_briefing", "cron_client_chase"}
+    {
+        "cron_task_heartbeat",
+        "cron_morning_briefing",
+        "cron_client_chase",
+        "cron_idempotency_cleanup",
+    }
 )
 
 

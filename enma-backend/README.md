@@ -10,6 +10,21 @@ Python service that owns all business logic for Enma Labs: LLM orchestration, ta
 - PostgreSQL 16 with pgvector, TimescaleDB, pg_trgm
 - structlog for JSON logging, Sentry for error capture
 
+## Production posture (Phase 8)
+
+- Sentry initialised with `send_default_pii=False` and the
+  `app.utils.masking.sentry_before_send` scrubber. PII (PAN, GSTIN,
+  bot tokens, HMAC secrets) is redacted before transmission.
+- 20-item security audit gates CI via `scripts/security_audit.py`. Local
+  smoke: `python scripts/security_audit.py` from the repo root.
+- `processing_metrics`, `token_usage`, `error_log` hypertables land in
+  migration `004_phase8_metrics_hypertables.py`. Dashboards live in
+  `monitoring/`.
+- Idempotency log auto-prunes via the daily
+  `/worker/cron/idempotency-cleanup` route (gateway schedules 02:00 IST).
+- Production env template: `../.env.production.example`. Deployment
+  runbook: `../docs/DEPLOYMENT.md`.
+
 ## Layout (Phase 0 baseline)
 
 ```

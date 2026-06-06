@@ -11,13 +11,20 @@
 
 import { config, safeConfigSnapshot } from "./config.js";
 import { logger } from "./utils/logger.js";
+import { initSentry } from "./observability/sentry.js";
 import { startServer } from "./server.js";
 import { initRouter, routeUpdate, getBuffer } from "./routing/message_router.js";
 import { startPoller } from "./polling/telegram_poller.js";
 import { startCronScheduler } from "./cron/cron_scheduler.js";
 
 async function main() {
-  logger.info("boot", { config: safeConfigSnapshot() });
+  // Sentry must initialise BEFORE other modules so uncaught errors during
+  // boot still surface. The call is a no-op when SENTRY_DSN is unset.
+  const sentryActive = initSentry();
+  logger.info("boot", {
+    config: safeConfigSnapshot(),
+    sentry_active: sentryActive,
+  });
 
   // 1. HTTP server (health, metrics).
   const { stop: stopServer } = startServer(config.port);
