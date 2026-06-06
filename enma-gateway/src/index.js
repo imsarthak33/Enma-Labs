@@ -14,6 +14,7 @@ import { logger } from "./utils/logger.js";
 import { startServer } from "./server.js";
 import { initRouter, routeUpdate, getBuffer } from "./routing/message_router.js";
 import { startPoller } from "./polling/telegram_poller.js";
+import { startCronScheduler } from "./cron/cron_scheduler.js";
 
 async function main() {
   logger.info("boot", { config: safeConfigSnapshot() });
@@ -27,9 +28,13 @@ async function main() {
   // 3. Telegram long-polling.
   const { stop: stopPoller } = startPoller({ routeFn: routeUpdate });
 
+  // 4. Phase 7 — cron scheduler (task heartbeat, briefing, client chase).
+  const { stop: stopCron } = startCronScheduler();
+
   // Shutdown task list — executed in order on SIGINT / SIGTERM.
   const shutdownTasks = [
     stopPoller,
+    stopCron,
     () => {
       getBuffer().clear();
     },

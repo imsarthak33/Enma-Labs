@@ -48,3 +48,8 @@ yarn-error.log*
 
 # Postgres dev data (in case anyone binds it locally)
 pgdata/
+
+# Local tooling installers — not part of the repo
+*.msi
+install_oci.ps1
+install_oci.py

@@ -23,8 +23,6 @@ What it does NOT validate:
 
 from __future__ import annotations
 
-from pgvector import sqlalchemy
-from sentry_sdk.integrations import fastapi
 import json
 from typing import Any, Final
 

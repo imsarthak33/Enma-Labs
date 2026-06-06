@@ -4,6 +4,8 @@ import {
   ROUTE_BY_KIND,
   routeForKind,
   dispatchEnvelope,
+  Semaphore,
+  DISPATCH_CONCURRENCY,
 } from "../src/dispatch/backend_client.js";
 
 /** @returns {import("../src/dispatch/backend_client.js").OuterEnvelope} */
@@ -106,5 +108,70 @@ describe("dispatchEnvelope", () => {
       apiKey: "k",
     });
     expect(result).toEqual({ ok: false, status: 502 });
+  });
+
+  it("acquires and releases the semaphore around the HTTP call", async () => {
+    const sem = new Semaphore(1);
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const fetchImpl = vi.fn(async () => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      // Simulate async work so concurrent calls could overlap.
+      await Promise.resolve();
+      inFlight--;
+      return new Response("", { status: 200 });
+    });
+    // Fire 3 dispatches through a semaphore of 1 — only 1 at a time.
+    await Promise.all([
+      dispatchEnvelope(fakeOuter(), { fetchImpl, backendUrl: "http://b", apiKey: "k", semaphore: sem }),
+      dispatchEnvelope(fakeOuter(), { fetchImpl, backendUrl: "http://b", apiKey: "k", semaphore: sem }),
+      dispatchEnvelope(fakeOuter(), { fetchImpl, backendUrl: "http://b", apiKey: "k", semaphore: sem }),
+    ]);
+    expect(maxInFlight).toBe(1);
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it("semaphore with limit=0 allows unlimited concurrency", async () => {
+    const sem = new Semaphore(0);
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const fetchImpl = vi.fn(async () => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await Promise.resolve();
+      inFlight--;
+      return new Response("", { status: 200 });
+    });
+    await Promise.all(
+      Array.from({ length: 5 }, () =>
+        dispatchEnvelope(fakeOuter(), { fetchImpl, backendUrl: "http://b", apiKey: "k", semaphore: sem }),
+      ),
+    );
+    expect(maxInFlight).toBeGreaterThan(1);
+  });
+});
+
+describe("Semaphore", () => {
+  it("has sensible default concurrency", () => {
+    expect(DISPATCH_CONCURRENCY).toBeGreaterThanOrEqual(0);
+  });
+
+  it("serialises work when limit=1", async () => {
+    const sem = new Semaphore(1);
+    const order = [];
+    async function worker(id) {
+      await sem.acquire();
+      order.push(`start-${id}`);
+      await Promise.resolve(); // yield
+      order.push(`end-${id}`);
+      sem.release();
+    }
+    await Promise.all([worker(1), worker(2), worker(3)]);
+    // Each worker must start and end before the next starts.
+    for (let i = 0; i < order.length - 1; i += 2) {
+      expect(order[i]).toMatch(/start-/);
+      expect(order[i + 1]).toMatch(/end-/);
+    }
   });
 });

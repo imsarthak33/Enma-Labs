@@ -1,6 +1,6 @@
 """Morning briefing — pure-Python HTML digest builder.
 
-Pulled together at 09:00 IST Mon–Sat. No LLM call — the briefing is
+Pulled together at 09:00 IST Mon-Sat. No LLM call — the briefing is
 structured aggregation. Pieces:
 
   1. **Greeting** with the firm name + IST date.
@@ -55,8 +55,11 @@ class BriefingData:
 
 def _render_header(data: BriefingData) -> str:
     date_str = data.as_of_ist.strftime("%a %d %b %Y")
+    # ``bold()`` escapes its argument once; we therefore pass the firm name
+    # in raw and let ``bold`` do the single escape (rather than calling
+    # ``safe_text`` here, which would cause a double escape).
     return (
-        bold("Morning brief — " + safe_text(data.firm_name))
+        bold(f"Morning brief — {data.firm_name}")
         + "\n"
         + italic(date_str + " IST")
     )

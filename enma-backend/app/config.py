@@ -8,7 +8,7 @@ Actual deployment stack:
   - Database  : Supabase (managed PostgreSQL 17, ap-northeast-1)
   - Vector RAG: pgvector on Supabase — for ca_firm_rules semantic search
   - Data RAG  : PageOne Index API — vectorless RAG over structured Supabase data
-  - Deployment: GCP (Cloud Run / GKE)
+  - Deployment: AWS (Fargate / EKS)
 """
 
 from __future__ import annotations
@@ -72,7 +72,7 @@ class Settings(BaseSettings):
     #     pool_size can be non-zero.
     #
     # Default below points to session mode — override with transaction mode
-    # in Cloud Run via DATABASE_URL env var in GCP Secret Manager.
+    # in Fargate via DATABASE_URL env var in AWS Secrets Manager.
     database_url: PostgresDsn = Field(
         default=PostgresDsn("postgresql+asyncpg://postgres:dev_password@localhost:5432/postgres"),
         description=(
@@ -156,28 +156,28 @@ class Settings(BaseSettings):
         description="PageOne Index API base URL.",
     )
 
-    # -- GCP deployment -------------------------------------------------------
-    # GCP project ID — used for Cloud Logging, Secret Manager, and
-    # service-to-service auth (Cloud Run invoker tokens).
-    gcp_project_id: str | None = Field(
+    # -- AWS deployment -------------------------------------------------------
+    # AWS account ID — used for CloudWatch, Secrets Manager, and
+    # service-to-service auth.
+    aws_account_id: str | None = Field(
         default=None,
-        description="GCP project ID for Cloud Logging and Secret Manager.",
+        description="AWS account ID for CloudWatch and Secrets Manager.",
     )
-    # Service account for Workload Identity (GKE) or Cloud Run SA.
-    # Leave None for local dev — ADC (Application Default Credentials) is used.
-    gcp_service_account: str | None = Field(
+    # IAM Role for EKS or Fargate task execution.
+    # Leave None for local dev — AWS profile is used.
+    aws_iam_role: str | None = Field(
         default=None,
         description=(
-            "GCP service account email. "
-            "Used for Workload Identity on GKE. "
-            "Leave unset for local dev (ADC takes over)."
+            "AWS IAM role ARN. "
+            "Used for EKS or Fargate tasks. "
+            "Leave unset for local dev (AWS profile takes over)."
         ),
     )
-    # Cloud Run specific: the service URL of this backend (used for
+    # Fargate specific: the service URL of this backend (used for
     # service-to-service calls and health check registration).
-    cloud_run_service_url: str | None = Field(
+    fargate_service_url: str | None = Field(
         default=None,
-        description="Full Cloud Run service URL (e.g. https://enma-backend-xxx-an.a.run.app).",
+        description="Full Fargate service URL.",
     )
 
     # -- Observability --------------------------------------------------------
@@ -271,8 +271,8 @@ class Settings(BaseSettings):
             "extraction_model_name": self.extraction_model_name,
             "reasoning_model_name": self.reasoning_model_name,
             "pageone_configured": bool(self.pageone_api_key),
-            "gcp_project_id": self.gcp_project_id,
-            "cloud_run_service_url": self.cloud_run_service_url,
+            "aws_account_id": self.aws_account_id,
+            "fargate_service_url": self.fargate_service_url,
             "sentry_dsn_configured": bool(self.sentry_dsn),
         }
 

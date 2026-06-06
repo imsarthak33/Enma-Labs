@@ -231,7 +231,7 @@ VerifiedEnvelopeDep = Annotated[DecodedEnvelope, Depends(verify_envelope)]
 # ---------------------------------------------------------------------------
 
 
-async def verify_cron_envelope(
+async def verify_cron_envelope(  # noqa: PLR0912 — linear validator, branches are early returns
     request: Request,
     x_enma_api_key: Annotated[str | None, Header(alias="X-Enma-Api-Key")] = None,
     x_enma_signature: Annotated[str | None, Header(alias="X-Enma-Signature")] = None,

@@ -29,10 +29,12 @@ Helpers in this module build the right shape from raw image / PDF bytes.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import random
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Any, Final
 
 import httpx
 import sentry_sdk
@@ -45,6 +47,7 @@ _log = get_logger(__name__)
 __all__ = [
     "ChatMessage",
     "ChatResponse",
+    "LLM_MAX_RETRIES",
     "LLMError",
     "LLMRole",
     "NoEndpointConfigured",
@@ -54,6 +57,19 @@ __all__ = [
     "close_client",
     "get_client",
 ]
+
+# ---------------------------------------------------------------------------
+# Retry config
+# ---------------------------------------------------------------------------
+
+LLM_MAX_RETRIES: Final[int] = 3
+"""Maximum retry attempts on 429 / 503 from the LLM provider."""
+
+_LLM_BASE_BACKOFF_S: Final[float] = 1.0
+_LLM_MAX_BACKOFF_S: Final[float] = 30.0
+
+# HTTP status codes that are safe to retry.
+_RETRYABLE_STATUSES: Final[frozenset[int]] = frozenset({429, 503})
 
 
 # ---------------------------------------------------------------------------
@@ -242,34 +258,84 @@ async def call_chat(
     http = client or get_client()
     headers = {"Content-Type": "application/json", **_auth_header()}
 
-    try:
-        resp = await http.post(endpoint, json=body, headers=headers)
-    except httpx.HTTPError as exc:
-        _log.error(
-            "llm_request_failed",
-            role=role.value,
-            model=model,
-            error=str(exc),
-        )
-        sentry_sdk.capture_exception(exc)
-        raise LLMError(f"LLM request failed: {exc}") from exc
+    backoff = _LLM_BASE_BACKOFF_S
+    for attempt in range(LLM_MAX_RETRIES + 1):
+        try:
+            resp = await http.post(endpoint, json=body, headers=headers)
+        except httpx.HTTPError as exc:
+            _log.error(
+                "llm_request_failed",
+                role=role.value,
+                model=model,
+                error=str(exc),
+                attempt=attempt,
+            )
+            sentry_sdk.capture_exception(exc)
+            raise LLMError(f"LLM request failed: {exc}") from exc
 
-    if resp.status_code != httpx.codes.OK:
-        _log.error(
-            "llm_non_2xx",
-            role=role.value,
-            model=model,
-            status=resp.status_code,
-            body=resp.text[:500],
-        )
-        raise LLMError(f"LLM returned HTTP {resp.status_code}: {resp.text[:200]}")
+        if resp.status_code in _RETRYABLE_STATUSES:
+            if attempt >= LLM_MAX_RETRIES:
+                _log.error(
+                    "llm_retries_exhausted",
+                    role=role.value,
+                    model=model,
+                    status=resp.status_code,
+                    attempts=attempt + 1,
+                )
+                raise LLMError(
+                    f"LLM returned HTTP {resp.status_code} after "
+                    f"{LLM_MAX_RETRIES} retries: {resp.text[:200]}"
+                )
+            # Parse Retry-After if present (same pattern as Telegram).
+            retry_after = _parse_llm_retry_after(resp, backoff)
+            jitter = random.uniform(0, 1)  # noqa: S311 — retry jitter only
+            sleep_s = min(retry_after + jitter, _LLM_MAX_BACKOFF_S)
+            _log.warning(
+                "llm_rate_limited",
+                role=role.value,
+                model=model,
+                status=resp.status_code,
+                attempt=attempt + 1,
+                sleep_s=sleep_s,
+            )
+            await asyncio.sleep(sleep_s)
+            backoff = min(backoff * 2, _LLM_MAX_BACKOFF_S)
+            continue
 
-    try:
-        data: dict[str, Any] = resp.json()
-    except ValueError as exc:
-        raise LLMError(f"LLM response was not JSON: {exc}") from exc
+        if resp.status_code != httpx.codes.OK:
+            _log.error(
+                "llm_non_2xx",
+                role=role.value,
+                model=model,
+                status=resp.status_code,
+                body=resp.text[:500],
+            )
+            raise LLMError(f"LLM returned HTTP {resp.status_code}: {resp.text[:200]}")
 
-    return _parse_response(data, role=role, model=model)
+        try:
+            data: dict[str, Any] = resp.json()
+        except ValueError as exc:
+            raise LLMError(f"LLM response was not JSON: {exc}") from exc
+
+        return _parse_response(data, role=role, model=model)
+
+    # Unreachable — the loop always returns or raises.
+    raise LLMError("unexpected exit from retry loop")  # pragma: no cover
+
+
+def _parse_llm_retry_after(resp: httpx.Response, default: float) -> float:
+    """Return the wait time (s) from a 429/503 LLM response.
+
+    Checks the ``Retry-After`` header then ``error.message`` patterns.
+    Falls back to ``default`` if nothing parseable is found.
+    """
+    raw = resp.headers.get("Retry-After")
+    if raw is not None:
+        try:
+            return min(float(raw), _LLM_MAX_BACKOFF_S)
+        except ValueError:
+            pass
+    return min(default, _LLM_MAX_BACKOFF_S)
 
 
 def _parse_response(data: dict[str, Any], *, role: LLMRole, model: str) -> ChatResponse:

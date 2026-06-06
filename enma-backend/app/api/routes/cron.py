@@ -230,7 +230,7 @@ async def _fanout(per_firm: Any, *, label: str) -> None:
     for firm in firms:
         try:
             await per_firm(firm)
-        except Exception as exc:  # noqa: BLE001 — log + continue, never let one firm break others
+        except Exception as exc:  # — log + continue, never let one firm break others
             _log.error(
                 "cron_per_firm_failed",
                 label=label,

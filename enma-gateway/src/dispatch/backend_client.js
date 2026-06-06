@@ -12,6 +12,19 @@
 // We deliberately reject 4xx/5xx loudly in logs so they show up in Sentry
 // during Phase 8, but we don't retry — the poller will re-deliver the same
 // update on the next loop iteration if Telegram hasn't been ACKed yet.
+//
+// Concurrency cap (Phase 8 — rate limiting)
+// ------------------------------------------
+// Without a cap, a media-group burst (Telegram delivers all N photos at
+// once) or a cron fan-out can fire 100+ simultaneous HTTP calls to the
+// backend, potentially overwhelming it. We use a simple semaphore
+// (DISPATCH_CONCURRENCY) to cap the number of concurrent in-flight
+// requests. Callers queue behind the semaphore rather than failing;
+// because the gateway is fire-and-forget this adds latency without
+// dropping messages.
+//
+// Default: 20 concurrent dispatches. Override via DISPATCH_CONCURRENCY
+// env var. Setting it to 0 disables the cap (test / high-throughput mode).
 // =============================================================================
 
 import { config } from "../config.js";
@@ -31,6 +44,54 @@ export const ROUTE_BY_KIND = Object.freeze({
 });
 
 const DEFAULT_TIMEOUT_MS = 5000;
+
+// ---------------------------------------------------------------------------
+// Concurrency semaphore
+// ---------------------------------------------------------------------------
+
+/**
+ * Default max concurrent outbound dispatch calls.
+ * 0 = unlimited (useful for isolated unit tests).
+ */
+export const DISPATCH_CONCURRENCY =
+  process.env.DISPATCH_CONCURRENCY !== undefined
+    ? Math.max(0, Number.parseInt(process.env.DISPATCH_CONCURRENCY, 10) || 0)
+    : 20;
+
+/**
+ * A minimal promise-based semaphore.
+ * Callers call ``acquire()`` to wait for a slot and ``release()`` when done.
+ */
+export class Semaphore {
+  /** @param {number} limit  0 = unlimited */
+  constructor(limit) {
+    this._limit = limit;
+    this._count = 0;
+    /** @type {Array<() => void>} */
+    this._queue = [];
+  }
+
+  /** @returns {Promise<void>} */
+  acquire() {
+    if (this._limit === 0 || this._count < this._limit) {
+      this._count++;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => this._queue.push(resolve));
+  }
+
+  release() {
+    this._count--;
+    if (this._queue.length > 0) {
+      this._count++;
+      const next = this._queue.shift();
+      if (next) next();
+    }
+  }
+}
+
+/** Process-wide semaphore for backend dispatch. */
+export const dispatchSemaphore = new Semaphore(DISPATCH_CONCURRENCY);
 
 /**
  * @param {string} kind
@@ -67,11 +128,15 @@ function joinUrl(base, path) {
  * @property {string} [backendUrl]
  * @property {string} [apiKey]
  * @property {string} [requestId]
+ * @property {Semaphore} [semaphore]   override for tests (pass new Semaphore(0) for unlimited)
  */
 
 /**
  * Dispatch an envelope to the backend. Resolves once the response status is
  * known; the caller decides whether to await or to fire-and-forget.
+ *
+ * Acquires a slot from :data:`dispatchSemaphore` before making the HTTP call
+ * so burst traffic is queued rather than dropped.
  *
  * @param {OuterEnvelope} outer
  * @param {DispatchOptions} [opts]
@@ -82,6 +147,7 @@ export async function dispatchEnvelope(outer, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const backendUrl = opts.backendUrl ?? config.backend.url;
   const apiKey = opts.apiKey ?? config.backend.apiKey;
+  const semaphore = opts.semaphore ?? dispatchSemaphore;
 
   const route = routeForKind(outer.kind);
   const url = joinUrl(backendUrl, route);
@@ -90,6 +156,9 @@ export async function dispatchEnvelope(outer, opts = {}) {
     kind: outer.kind,
     route,
   });
+
+  // Wait for a semaphore slot (no-op when limit=0).
+  await semaphore.acquire();
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -124,6 +193,7 @@ export async function dispatchEnvelope(outer, opts = {}) {
     return { ok: false, status: 0 };
   } finally {
     clearTimeout(timer);
+    semaphore.release();
   }
 }
 

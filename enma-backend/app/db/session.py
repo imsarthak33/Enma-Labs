@@ -10,13 +10,13 @@ Supabase exposes two connection endpoints:
 
   Session mode    (port 5432)
     Standard persistent connections. Supports ``SET`` commands.
-    Use for GKE pods / long-lived processes.
+    Use for EKS pods / long-lived processes.
     SQLAlchemy pool_size > 0 is fine here.
 
   Transaction mode (port 6543, via Supavisor)
     Stateless — connection returned to the pool after each transaction.
     Does NOT support ``SET`` / ``RESET`` (session-level commands).
-    Required for Cloud Run (no persistent connections).
+    Required for AWS Fargate (no persistent connections).
     SQLAlchemy MUST use NullPool (pool_size=0) — Supavisor pools externally.
 
 RLS firm-ID injection
@@ -77,11 +77,11 @@ def _build_engine() -> AsyncEngine:
     }
 
     if settings.uses_transaction_pooling() or settings.db_pool_size == 0:
-        # Cloud Run / transaction mode: disable SQLAlchemy pooling entirely.
+        # AWS Fargate / transaction mode: disable SQLAlchemy pooling entirely.
         # pool_pre_ping is also disabled — Supavisor guarantees fresh conns.
         return create_async_engine(url, poolclass=NullPool, **common_kwargs)
 
-    # Session mode (GKE / local dev): use a bounded connection pool.
+    # Session mode (EKS / local dev): use a bounded connection pool.
     return create_async_engine(
         url,
         pool_size=settings.db_pool_size,
