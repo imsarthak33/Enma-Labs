@@ -90,7 +90,7 @@ class RuleQuery(BaseQuery):
         """Insert a new firm rule. Generates the embedding for ``rule_text``."""
         if source not in _SOURCE_RANK:
             raise ValueError(f"unknown rule source: {source!r}")
-        vector = await embed_text(rule_text)
+        vector = await embed_text(rule_text, input_type="passage")
         cid: uuid.UUID | None
         if client_id is None:
             cid = None

@@ -66,7 +66,7 @@ class Embedder(ABC):
     """Single-method interface — returns a 1024-dim list of floats."""
 
     @abstractmethod
-    async def embed(self, text: str) -> list[float]: ...
+    async def embed(self, text: str, *, input_type: str = "query") -> list[float]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -88,11 +88,13 @@ class HttpEmbedder(Embedder):
         endpoint: str,
         model_name: str,
         dimensions: int = EMBEDDING_DIMENSIONS,
+        input_type: str = "query",
         client: httpx.AsyncClient | None = None,
     ) -> None:
         self._endpoint = endpoint
         self._model = model_name
         self._dim = dimensions
+        self._input_type = input_type
         self._client = client
 
     async def _http(self) -> httpx.AsyncClient:
@@ -105,11 +107,14 @@ class HttpEmbedder(Embedder):
 
         return get_client()
 
-    async def embed(self, text: str) -> list[float]:
+    async def embed(self, text: str, *, input_type: str = "query") -> list[float]:
+        # Allow per-call override; fall back to instance default.
+        effective_type = input_type or self._input_type
         body: dict[str, Any] = {
             "model": self._model,
             "input": text,
             "dimensions": self._dim,
+            "input_type": effective_type,
         }
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if settings.llm_api_key is not None:
@@ -175,7 +180,7 @@ class DeterministicHashEmbedder(Embedder):
     def __init__(self, dimensions: int = EMBEDDING_DIMENSIONS) -> None:
         self._dim = dimensions
 
-    async def embed(self, text: str) -> list[float]:
+    async def embed(self, text: str, *, input_type: str = "query") -> list[float]:
         # Cycle SHA-256 digests until we have enough bytes for ``_dim``
         # floats. Each byte maps to ``(b - 128) / 128.0`` ∈ [-1, 1).
         out: list[float] = []
@@ -242,6 +247,11 @@ def reset_embedder() -> None:
     _embedder = None
 
 
-async def embed_text(text: str) -> list[float]:
-    """Embed ``text`` with the active embedder."""
-    return await get_embedder().embed(text)
+async def embed_text(text: str, *, input_type: str = "query") -> list[float]:
+    """Embed ``text`` with the active embedder.
+
+    For NVIDIA asymmetric models, pass ``input_type="passage"`` when
+    *storing* a rule or document, and leave the default ``"query"``
+    when *searching*.
+    """
+    return await get_embedder().embed(text, input_type=input_type)

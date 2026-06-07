@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.middleware.envelope_verify import (
     CRON_KINDS,
     DecodedEnvelope,
+    verify_cron_envelope,
     verify_envelope,
 )
 from app.db.queries import idempotency as idem_queries
@@ -131,9 +132,48 @@ def _select_dedup_key(envelope: DecodedEnvelope) -> tuple[int | None, int | None
 IdempotencyDep = Annotated[IdempotencyVerdict, Depends(check_idempotency)]
 
 
+async def check_idempotency_cron(
+    envelope: Annotated[DecodedEnvelope, Depends(verify_cron_envelope)],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> IdempotencyVerdict:
+    """Same logic as check_idempotency but uses verify_cron_envelope.
+
+    Cron routes must use IdempotencyCronDep so the dep chain never calls
+    verify_envelope (which rejects cron kinds as not in ALLOWED_KINDS).
+    """
+    chat_id, message_id = _select_dedup_key(envelope)
+    if chat_id is None or message_id is None:
+        return IdempotencyVerdict(is_duplicate=False, log_id=None)
+
+    payload_hash = idem_queries.hash_payload(envelope.nonce)
+    inserted = await idem_queries.insert_if_new(
+        session,
+        chat_id=chat_id,
+        message_id=message_id,
+        update_id=envelope.update_id,
+        payload_hash=payload_hash,
+    )
+
+    if inserted is None:
+        _log.info(
+            "envelope_duplicate_dropped",
+            chat_id=chat_id,
+            message_id=message_id,
+            kind=envelope.kind,
+        )
+        return IdempotencyVerdict(is_duplicate=True, log_id=None)
+
+    return IdempotencyVerdict(is_duplicate=False, log_id=inserted)
+
+
+IdempotencyCronDep = Annotated[IdempotencyVerdict, Depends(check_idempotency_cron)]
+
+
 __all__ = [
     "CRON_CHAT_ID",
+    "IdempotencyCronDep",
     "IdempotencyDep",
     "IdempotencyVerdict",
     "check_idempotency",
+    "check_idempotency_cron",
 ]

@@ -24,7 +24,7 @@ from app.api.middleware.envelope_verify import (
     DecodedEnvelope,
     VerifiedCronEnvelopeDep,
 )
-from app.api.middleware.idempotency import IdempotencyDep, IdempotencyVerdict
+from app.api.middleware.idempotency import IdempotencyCronDep, IdempotencyVerdict
 from app.db.models.firm import CaFirm
 from app.db.queries.clients import ClientQuery
 from app.db.queries.documents import DocumentQuery
@@ -297,7 +297,7 @@ async def _process_cron(
 @router.post("/task-heartbeat", summary="Cron — overdue task heartbeat")
 async def cron_task_heartbeat(
     envelope: VerifiedCronEnvelopeDep,
-    verdict: IdempotencyDep,
+    verdict: IdempotencyCronDep,
 ) -> Response:
     _assert_kind(envelope, "cron_task_heartbeat")
     return await _process_cron(envelope, verdict, _run_heartbeat, "task_heartbeat")
@@ -306,7 +306,7 @@ async def cron_task_heartbeat(
 @router.post("/morning-briefing", summary="Cron — daily firm digest")
 async def cron_morning_briefing(
     envelope: VerifiedCronEnvelopeDep,
-    verdict: IdempotencyDep,
+    verdict: IdempotencyCronDep,
 ) -> Response:
     _assert_kind(envelope, "cron_morning_briefing")
     return await _process_cron(envelope, verdict, _run_briefing, "morning_briefing")
@@ -315,7 +315,7 @@ async def cron_morning_briefing(
 @router.post("/client-chase", summary="Cron — 28th-of-month client chase")
 async def cron_client_chase(
     envelope: VerifiedCronEnvelopeDep,
-    verdict: IdempotencyDep,
+    verdict: IdempotencyCronDep,
 ) -> Response:
     _assert_kind(envelope, "cron_client_chase")
     return await _process_cron(envelope, verdict, _run_chase, "client_chase")
@@ -327,7 +327,7 @@ async def cron_client_chase(
 )
 async def cron_idempotency_cleanup(
     envelope: VerifiedCronEnvelopeDep,
-    verdict: IdempotencyDep,
+    verdict: IdempotencyCronDep,
 ) -> Response:
     _assert_kind(envelope, "cron_idempotency_cleanup")
     return await _process_cron(envelope, verdict, _run_idempotency_cleanup, "idempotency_cleanup")
