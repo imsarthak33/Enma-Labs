@@ -24,9 +24,9 @@ from typing import cast
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models.firm import CaFirm
+from app.db.models.firm import CaFirm, FirmUser
 
-__all__ = ["find_firm_by_admin_chat_id", "get_firm_by_id", "list_all_firms"]
+__all__ = ["create_firm_with_admin", "find_firm_by_admin_chat_id", "get_firm_by_id", "list_all_firms"]
 
 
 async def find_firm_by_admin_chat_id(session: AsyncSession, chat_id: int) -> CaFirm | None:
@@ -60,3 +60,32 @@ async def list_all_firms(session: AsyncSession) -> Sequence[CaFirm]:
     stmt = select(CaFirm).order_by(CaFirm.created_at.asc())
     result = await session.execute(stmt)
     return result.scalars().all()
+
+
+async def create_firm_with_admin(
+    session: AsyncSession,
+    *,
+    firm_name: str,
+    admin_chat_id: int,
+    telegram_bot_token: str,
+) -> CaFirm:
+    """Create a new CA firm and its admin FirmUser in one transaction.
+
+    Used by the onboarding flow (``/start``). The caller is responsible
+    for committing the session after this call returns.
+    """
+    firm = CaFirm(
+        firm_name=firm_name,
+        admin_chat_id=admin_chat_id,
+        telegram_bot_token=telegram_bot_token,
+    )
+    session.add(firm)
+    await session.flush()  # Populate firm.id
+
+    admin_user = FirmUser(
+        ca_firm_id=firm.id,
+        chat_id=admin_chat_id,
+        role="admin",
+    )
+    session.add(admin_user)
+    return firm

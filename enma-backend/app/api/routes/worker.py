@@ -40,6 +40,11 @@ from app.agents.commands import (
     is_slash_command,
     parse_command,
 )
+from app.agents.onboarding import (
+    handle_onboarding_reply,
+    handle_start,
+    is_in_onboarding,
+)
 from app.agents.filing_approval import (
     APPROVAL_REGEX,
     FilingPeriodAlreadyLocked,
@@ -279,6 +284,8 @@ async def _run_command_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PLR
 
     Order of precedence:
 
+        0. /start (onboarding — runs WITHOUT a firm).
+        0b. Mid-onboarding reply (runs WITHOUT a firm).
         1. ENMA APPROVE FILING <Month> <Year>  → parse + send confirm.
         2. ENMA CONFIRM FILING <hash8>         → finalize the approval.
         3. Slash command (/add_client, …)      → deterministic dispatch.
@@ -294,12 +301,38 @@ async def _run_command_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PLR
 
     factory = get_sessionmaker()
     async with factory() as session:
+
+        # ---- 0. /start (onboarding) — BEFORE firm lookup -----------------
+        if text.lower().startswith("/start"):
+            html = await handle_start(session, envelope.chat_id)
+            await telegram.send_message(
+                chat_id=envelope.chat_id,
+                html_text=html,
+                reply_to_message_id=envelope.message_id,
+            )
+            return
+
+        # ---- 0b. Mid-onboarding reply — BEFORE firm lookup ---------------
+        if is_in_onboarding(envelope.chat_id):
+            html = await handle_onboarding_reply(
+                session, envelope.chat_id, text
+            )
+            if html is not None:
+                await telegram.send_message(
+                    chat_id=envelope.chat_id,
+                    html_text=html,
+                    reply_to_message_id=envelope.message_id,
+                )
+                return
+            # html is None → not an onboarding reply, fall through
+
+        # ---- Firm lookup gate (unchanged) --------------------------------
         firm = await find_firm_by_admin_chat_id(session, envelope.chat_id)
         if firm is None:
             await _send_user_error(
                 envelope.chat_id,
                 "No firm is registered for this Telegram account. "
-                "Please contact your administrator.",
+                "Type /start to register your firm.",
             )
             return
 
