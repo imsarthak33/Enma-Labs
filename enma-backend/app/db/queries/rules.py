@@ -154,7 +154,7 @@ class RuleQuery(BaseQuery):
             if client_id is None or isinstance(client_id, uuid.UUID)
             else uuid.UUID(str(client_id))
         )
-        vector = await embed_text(query_text)
+        vector = await embed_text(query_text, input_type="query")
         stmt = (
             select(
                 CaFirmRule.id,

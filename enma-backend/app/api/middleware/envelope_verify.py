@@ -52,7 +52,17 @@ _log = get_logger(__name__)
 ENVELOPE_VERSION: Final[int] = 1
 REPLAY_WINDOW_SECONDS: Final[int] = 300  # 5 minutes
 ALLOWED_KINDS: Final[frozenset[str]] = frozenset(
-    {"document", "document_batch", "command", "voice", "callback"}
+    {
+        "document",
+        "document_batch",
+        "command",
+        "voice",
+        "callback",
+        "cron_task_heartbeat",
+        "cron_morning_briefing",
+        "cron_client_chase",
+        "cron_idempotency_cleanup",
+    }
 )
 # Phase 7 — gateway-driven cron kinds. Verified by ``verify_cron_envelope``
 # which uses identical HMAC + freshness checks but a different allow-list
