@@ -20,7 +20,7 @@ class _RecordingEmbedder(Embedder):
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    async def embed(self, text: str) -> list[float]:
+    async def embed(self, text: str, *, input_type: str = "query") -> list[float]:
         self.calls.append(text)
         return [0.0] * EMBEDDING_DIMENSIONS
 
@@ -85,3 +85,22 @@ class TestHttpEmbedderRequest:
         )
         assert embedder._dim == 1024
         assert embedder._model == "text-embedding-3-large"
+        assert embedder._send_dimensions is True
+
+    def test_nvidia_e5_v5_omits_dimensions(self) -> None:
+        """nvidia/nv-embedqa-e5-v5 rejects the dimensions param."""
+        embedder = HttpEmbedder(
+            endpoint="https://integrate.api.nvidia.com/v1/embeddings",
+            model_name="nvidia/nv-embedqa-e5-v5",
+            dimensions=1024,
+        )
+        assert embedder._send_dimensions is False
+
+    def test_generic_model_includes_dimensions(self) -> None:
+        embedder = HttpEmbedder(
+            endpoint="https://api.openai.com/v1/embeddings",
+            model_name="text-embedding-3-large",
+            dimensions=1024,
+        )
+        assert embedder._send_dimensions is True
+

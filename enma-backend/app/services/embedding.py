@@ -80,7 +80,18 @@ class HttpEmbedder(Embedder):
     Sends ``{model, input, dimensions}`` to the configured endpoint.
     Treats anything other than HTTP 200 with a well-formed
     ``data[0].embedding`` array of the expected dimension as an error.
+
+    Some models (e.g. ``nvidia/nv-embedqa-e5-v5``) natively output
+    the desired dimension count and *reject* the ``dimensions``
+    parameter with HTTP 400.  For those models we omit the field.
     """
+
+    # Models whose API rejects the ``dimensions`` request parameter.
+    _MODELS_WITHOUT_DIMENSIONS: frozenset[str] = frozenset({
+        "nvidia/nv-embedqa-e5-v5",
+        "nvidia/embed-qa-4",
+        "snowflake/arctic-embed-l",
+    })
 
     def __init__(
         self,
@@ -96,6 +107,7 @@ class HttpEmbedder(Embedder):
         self._dim = dimensions
         self._input_type = input_type
         self._client = client
+        self._send_dimensions = model_name not in self._MODELS_WITHOUT_DIMENSIONS
 
     async def _http(self) -> httpx.AsyncClient:
         if self._client is not None:
@@ -113,9 +125,10 @@ class HttpEmbedder(Embedder):
         body: dict[str, Any] = {
             "model": self._model,
             "input": text,
-            "dimensions": self._dim,
             "input_type": effective_type,
         }
+        if self._send_dimensions:
+            body["dimensions"] = self._dim
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if settings.llm_api_key is not None:
             headers["Authorization"] = f"Bearer {settings.llm_api_key.get_secret_value()}"
