@@ -21,12 +21,20 @@ import uuid
 from collections.abc import Sequence
 from typing import cast
 
+from datetime import UTC, datetime
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models.firm import CaFirm, FirmUser
 
-__all__ = ["create_firm_with_admin", "find_firm_by_admin_chat_id", "get_firm_by_id", "list_all_firms"]
+__all__ = [
+    "create_firm_with_admin",
+    "find_firm_by_admin_chat_id",
+    "get_firm_by_id",
+    "link_chat_to_firm",
+    "list_all_firms",
+]
 
 
 async def find_firm_by_admin_chat_id(session: AsyncSession, chat_id: int) -> CaFirm | None:
@@ -71,13 +79,17 @@ async def create_firm_with_admin(
 ) -> CaFirm:
     """Create a new CA firm and its admin FirmUser in one transaction.
 
-    Used by the onboarding flow (``/start``). The caller is responsible
-    for committing the session after this call returns.
+    Legacy path — only used when a user types `/start` with no payload
+    and no pre-existing frontend row. The web onboarding is the canonical
+    creation path. Caller commits.
     """
     firm = CaFirm(
         firm_name=firm_name,
         admin_chat_id=admin_chat_id,
+        telegram_chat_id=str(admin_chat_id),
+        telegram_linked_at=datetime.now(UTC),
         telegram_bot_token=telegram_bot_token,
+        onboarding_completed=True,
     )
     session.add(firm)
     await session.flush()  # Populate firm.id
@@ -88,4 +100,48 @@ async def create_firm_with_admin(
         role="admin",
     )
     session.add(admin_user)
+    return firm
+
+
+async def link_chat_to_firm(
+    session: AsyncSession,
+    *,
+    firm: CaFirm,
+    chat_id: int,
+    telegram_bot_token: str,
+) -> CaFirm:
+    """Bind a Telegram chat to a firm row created by the web onboarding.
+
+    Idempotent: re-linking the same chat_id is a no-op. Linking a *new*
+    chat_id over an existing link is rejected by the caller — silent
+    overwrite would orphan whoever owned the prior link.
+
+    Writes both ``admin_chat_id`` (BigInteger, used by the bot pipeline)
+    and ``telegram_chat_id`` (text, used by the frontend dashboard).
+    Caller commits.
+    """
+    firm.admin_chat_id = chat_id
+    firm.telegram_chat_id = str(chat_id)
+    firm.telegram_linked_at = datetime.now(UTC)
+    if not firm.telegram_bot_token:
+        firm.telegram_bot_token = telegram_bot_token
+    firm.onboarding_completed = True
+
+    # Insert the admin FirmUser row if one doesn't exist yet.
+    existing_user = await session.execute(
+        select(FirmUser).where(
+            FirmUser.ca_firm_id == firm.id,
+            FirmUser.chat_id == chat_id,
+        )
+    )
+    if existing_user.scalar_one_or_none() is None:
+        session.add(
+            FirmUser(
+                ca_firm_id=firm.id,
+                chat_id=chat_id,
+                role="admin",
+                display_name=firm.ca_name,
+            )
+        )
+
     return firm

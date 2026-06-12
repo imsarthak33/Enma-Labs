@@ -192,6 +192,15 @@ class Settings(BaseSettings):
         description="Full Fargate service URL.",
     )
 
+    # -- Web onboarding redirect ---------------------------------------------
+    # Shown to Telegram users who type /start without a deep-link payload
+    # and don't already have a firm. The web flow collects consents and
+    # password — we don't reproduce that over Telegram.
+    web_onboarding_url: str = Field(
+        default="https://enmalabs.in/onboarding",
+        description="Public URL of the marketing-site onboarding form.",
+    )
+
     # -- Observability --------------------------------------------------------
     sentry_dsn: str | None = None
     sentry_traces_sample_rate: float = Field(default=0.1, ge=0.0, le=1.0)

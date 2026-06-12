@@ -304,7 +304,8 @@ async def _run_command_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PLR
 
         # ---- 0. /start (onboarding) — BEFORE firm lookup -----------------
         if text.lower().startswith("/start"):
-            html = await handle_start(session, envelope.chat_id)
+            payload = text[6:].strip() if len(text) > 6 else None
+            html = await handle_start(session, envelope.chat_id, payload)
             await telegram.send_message(
                 chat_id=envelope.chat_id,
                 html_text=html,
@@ -332,7 +333,8 @@ async def _run_command_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PLR
             await _send_user_error(
                 envelope.chat_id,
                 "No firm is registered for this Telegram account. "
-                "Type /start to register your firm.",
+                "Please complete signup at https://enmalabs.in/onboarding "
+                "and then tap the link from your dashboard.",
             )
             return
 
