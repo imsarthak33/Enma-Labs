@@ -20,7 +20,13 @@ from app.logging_setup import get_logger
 from app.prompts.master_prompt import build_classifier_prompt
 from app.prompts.tax_law_library import DOCUMENT_TYPES
 from app.services import llm
-from app.services.llm import ChatMessage, LLMRole, build_image_content
+from app.services.file_processor import FileKind, detect_kind, is_image
+from app.services.llm import (
+    ChatMessage,
+    LLMRole,
+    build_image_content,
+    build_pdf_content,
+)
 
 _log = get_logger(__name__)
 
@@ -72,22 +78,36 @@ class ClassificationResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-async def classify_document(image_bytes: bytes) -> ClassificationResult:
-    """Classify ``image_bytes`` (single image or rasterised page) by type.
+async def classify_document(document_bytes: bytes) -> ClassificationResult:
+    """Classify ``document_bytes`` (single image or single-page PDF) by type.
+
+    ``document_bytes`` may be either:
+
+    * Raw image bytes (PNG / JPEG / WebP) — passed via ``image_url`` part.
+    * A single-page PDF (``%PDF-`` magic) — passed via the OpenAI ``file``
+      part. The vision LLMs we use (NVIDIA NIM nemotron-ocr, gpt-4o)
+      accept PDF pages natively, so we don't rasterise.
 
     Always returns a :class:`ClassificationResult`. On any failure that
     isn't catastrophic (e.g., LLM returns a non-enum type), we fall back
     to ``UNKNOWN`` with confidence ``LOW`` so the pipeline keeps moving
     and the CA can correct.
     """
-    image_part = build_image_content(image_bytes)
+    kind = detect_kind(document_bytes)
+    if is_image(kind):
+        content_part = build_image_content(document_bytes)
+    elif kind is FileKind.PDF:
+        content_part = build_pdf_content(document_bytes)
+    else:
+        # Unknown kind — let the image builder raise its detailed MIME error.
+        content_part = build_image_content(document_bytes)
     messages: list[ChatMessage] = [
         {"role": "system", "content": build_classifier_prompt()},
         {
             "role": "user",
             "content": [
                 {"type": "text", "text": "Classify the attached document."},
-                image_part,
+                content_part,
             ],
         },
     ]

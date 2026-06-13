@@ -103,3 +103,30 @@ async def test_missing_required_keys_raises(monkeypatch: pytest.MonkeyPatch) -> 
     _patch_llm(monkeypatch, json.dumps(partial))
     with pytest.raises(ExtractorError, match="totals"):
         await extract_document(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16, document_type="B2B_INVOICE")
+
+
+@pytest.mark.asyncio
+async def test_pdf_input_uses_file_content_part(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refactor H: PDF input must build a ``file`` part, not ``image_url``."""
+    captured = _patch_llm(monkeypatch, json.dumps(_valid_extraction()))
+    pdf_bytes = b"%PDF-1.4\n%\x00\x00\x00\x00" + b"\x00" * 32
+    await extract_document(pdf_bytes, document_type="B2B_INVOICE")
+    parts = captured[0]["messages"][1]["content"]
+    content_types = [p["type"] for p in parts]
+    assert "file" in content_types
+    file_part = next(p for p in parts if p["type"] == "file")
+    assert file_part["file"]["file_data"].startswith("data:application/pdf;base64,")
+
+
+@pytest.mark.asyncio
+async def test_image_input_still_uses_image_url_part(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _patch_llm(monkeypatch, json.dumps(_valid_extraction()))
+    await extract_document(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32, document_type="B2B_INVOICE")
+    parts = captured[0]["messages"][1]["content"]
+    content_types = [p["type"] for p in parts]
+    assert "image_url" in content_types
+    assert "file" not in content_types

@@ -76,6 +76,51 @@ async def test_invalid_json_raises_classifier_error(
 
 
 @pytest.mark.asyncio
+async def test_pdf_input_uses_file_content_part(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refactor H: PDF input must build a ``file`` part, not ``image_url``.
+
+    Production regression — the pipeline's _prepare_image_bytes returns
+    single-page PDF bytes for PDFs; the classifier previously passed those
+    bytes to ``build_image_content`` which only knows PNG/JPEG/WebP magic,
+    so every PDF upload died with HTTP 400 "could not detect image MIME"
+    during the classification stage.
+    """
+    captured = _patch_llm(
+        monkeypatch,
+        json.dumps({"document_type": "B2B_INVOICE", "confidence": "HIGH", "reasoning": "ok"}),
+    )
+    # Minimal valid-looking PDF: %PDF- magic plus padding.
+    pdf_bytes = b"%PDF-1.4\n%\x00\x00\x00\x00" + b"\x00" * 32
+    await classify_document(pdf_bytes)
+    user_msg = captured[0]["messages"][1]
+    parts = user_msg["content"]
+    content_types = [p["type"] for p in parts]
+    assert "file" in content_types, (
+        f"expected a ``file`` content part for PDF input, got types={content_types}"
+    )
+    file_part = next(p for p in parts if p["type"] == "file")
+    assert file_part["file"]["file_data"].startswith("data:application/pdf;base64,")
+
+
+@pytest.mark.asyncio
+async def test_image_input_still_uses_image_url_part(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard: the image path must NOT regress to the file shape."""
+    captured = _patch_llm(
+        monkeypatch,
+        json.dumps({"document_type": "B2B_INVOICE", "confidence": "HIGH", "reasoning": "ok"}),
+    )
+    await classify_document(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    parts = captured[0]["messages"][1]["content"]
+    content_types = [p["type"] for p in parts]
+    assert "image_url" in content_types
+    assert "file" not in content_types
+
+
+@pytest.mark.asyncio
 async def test_unknown_type_falls_back_to_unknown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -42,7 +42,13 @@ __all__ = [
 
 
 def safe_text(value: object) -> str:
-    """Escape ``& < >`` (and ``"`` for attribute safety) for Telegram HTML.
+    """Escape ``& < >`` for Telegram HTML body text.
+
+    Telegram's HTML parse mode (https://core.telegram.org/bots/api#html-style)
+    only decodes the three core entities — ``&amp;``, ``&lt;``, ``&gt;``.
+    Anything else (``&quot;``, ``&#x27;``, named/numeric entities) is rendered
+    LITERALLY in the message. So ``html.escape(s, quote=True)`` over-escapes:
+    a plain apostrophe becomes the visible string ``&#x27;`` in chat.
 
     ``None`` becomes an empty string so callers don't have to pre-check.
     Anything non-string is coerced via ``str()`` first — this is intentional
@@ -51,7 +57,7 @@ def safe_text(value: object) -> str:
     """
     if value is None:
         return ""
-    return _html_escape(str(value), quote=True)
+    return _html_escape(str(value), quote=False)
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +112,8 @@ def link(url: str, text: object) -> str:
             f"link url scheme {parsed.scheme!r} not in allowlist "
             f"{sorted(_ALLOWED_LINK_SCHEMES)}"
         )
-    # The href attribute itself needs escaping. ``safe_text`` already does
-    # ``quote=True`` which escapes ``"`` to ``&quot;`` — exactly what we want.
-    return f'<a href="{safe_text(url)}">{safe_text(text)}</a>'
+    # ``safe_text`` no longer escapes ``"`` (Telegram doesn't decode &quot;)
+    # so the href attribute is escaped explicitly here. Telegram's parser
+    # tolerates ``&quot;`` inside attribute values.
+    href = _html_escape(url, quote=True)
+    return f'<a href="{href}">{safe_text(text)}</a>'

@@ -31,7 +31,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.logging_setup import get_logger
 from app.prompts.master_prompt import build_extractor_prompt
 from app.services import llm
-from app.services.llm import ChatMessage, LLMRole, build_image_content
+from app.services.file_processor import FileKind, detect_kind, is_image
+from app.services.llm import (
+    ChatMessage,
+    LLMRole,
+    build_image_content,
+    build_pdf_content,
+)
 
 _log = get_logger(__name__)
 
@@ -69,17 +75,26 @@ class ExtractionResult(BaseModel):
 
 
 async def extract_document(
-    image_bytes: bytes,
+    document_bytes: bytes,
     *,
     document_type: str,
 ) -> ExtractionResult:
-    """Run the extractor on ``image_bytes``.
+    """Run the extractor on ``document_bytes`` (single image or PDF page).
 
     ``document_type`` is the classifier's choice; we route the relevant
     law-context paragraph into the prompt so the model has the right
     framing (e.g., restaurant bills get the blocked-credit caveat).
+
+    Content-part selection matches :func:`classify_document` — PDF pages
+    go in as ``file`` parts, images as ``image_url`` parts.
     """
-    image_part = build_image_content(image_bytes)
+    kind = detect_kind(document_bytes)
+    if is_image(kind):
+        content_part = build_image_content(document_bytes)
+    elif kind is FileKind.PDF:
+        content_part = build_pdf_content(document_bytes)
+    else:
+        content_part = build_image_content(document_bytes)
     messages: list[ChatMessage] = [
         {"role": "system", "content": build_extractor_prompt(document_type)},
         {
@@ -87,9 +102,9 @@ async def extract_document(
             "content": [
                 {
                     "type": "text",
-                    "text": (f"Extract structured fields from this " f"{document_type} document."),
+                    "text": f"Extract structured fields from this {document_type} document.",
                 },
-                image_part,
+                content_part,
             ],
         },
     ]

@@ -14,9 +14,13 @@ class TestSafeText:
     def test_escapes_ampersand_lt_gt(self) -> None:
         assert safe_text("a & b < c > d") == "a &amp; b &lt; c &gt; d"
 
-    def test_escapes_double_quote(self) -> None:
-        # quote=True path — important for href attributes.
-        assert safe_text('a "b" c') == "a &quot;b&quot; c"
+    def test_does_not_escape_quote_or_apostrophe(self) -> None:
+        # Telegram's HTML parse mode only decodes &amp; &lt; &gt;. Numeric
+        # entities like &#x27; and named entities like &quot; render
+        # literally in chat, so safe_text must NOT emit them for body text.
+        # The href attribute in link() does its own escaping with quote=True.
+        assert safe_text("don't") == "don't"
+        assert safe_text('a "b" c') == 'a "b" c'
 
     def test_none_is_empty(self) -> None:
         assert safe_text(None) == ""
