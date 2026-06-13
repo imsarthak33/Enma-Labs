@@ -508,6 +508,11 @@ async def test_r2_pending_assignment_prompt_includes_extracted_buyer(
     assert "Which client" in html
     # Extracted buyer GSTIN surfaces verbatim in the prompt body.
     assert "27AABCU9603R1ZN" in html
+    # R4 — vendor GSTIN must also surface so the CA can route an
+    # outward-supply invoice without re-reading the PDF.
+    assert "29AAAGU0010P1Z5" in html
+    assert "Vendor:" in html
+    assert "Buyer:" in html
 
 
 @pytest.mark.asyncio

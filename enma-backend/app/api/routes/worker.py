@@ -292,12 +292,24 @@ async def _send_informed_pending_prompt(
         )
         return
 
-    buyer_name = _safe_str(extraction, "buyer", "name") or "the buyer"
+    # R4 — show BOTH parties so the CA can route an outward-supply
+    # invoice (their client is the vendor) without re-reading the PDF.
+    vendor_name = _safe_str(extraction, "vendor", "name")
+    vendor_gstin = _safe_str(extraction, "vendor", "gstin")
+    buyer_name = _safe_str(extraction, "buyer", "name")
     buyer_gstin = _safe_str(extraction, "buyer", "gstin")
     header = bold("Which client is this document for?")
-    detected = "\nI extracted an invoice for " + safe_text(buyer_name)
-    if buyer_gstin:
-        detected += " · GSTIN " + code(buyer_gstin)
+    detected = ""
+    if vendor_name or vendor_gstin:
+        detected += "\nVendor: " + safe_text(vendor_name or "(unknown)")
+        if vendor_gstin:
+            detected += " · GSTIN " + code(vendor_gstin)
+    if buyer_name or buyer_gstin:
+        detected += "\nBuyer: " + safe_text(buyer_name or "(unknown)")
+        if buyer_gstin:
+            detected += " · GSTIN " + code(buyer_gstin)
+    if not detected:
+        detected = "\nI couldn't read the parties on this invoice clearly."
     # R3 — drop the /assign slash-command syntax demand. Just reply with
     # the name. The pre-supervisor pending-assignment matcher will
     # resolve free-form text against the active client list.

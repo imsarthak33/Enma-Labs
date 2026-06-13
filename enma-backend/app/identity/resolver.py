@@ -129,6 +129,8 @@ class ResolutionStage(IntEnum):
     EXPLICIT_ASK = 5
     BUYER_GSTIN = 6
     BUYER_NAME = 7
+    VENDOR_GSTIN = 8
+    VENDOR_NAME = 9
 
 
 class ResolutionConfidence(StrEnum):
@@ -227,9 +229,30 @@ async def resolve_identity(  # noqa: PLR0912 — linear cascade, splitting hurts
         else None
     )
 
+    # R4 — symmetric vendor extraction. A CA firm processes both inward
+    # supplies (their client is the buyer, claiming ITC) and outward
+    # supplies (their client is the seller, collecting GST). The Karo
+    # Pitch flow always tried both sides; R2 only tried buyer.
+    vendor = (extraction or {}).get("vendor") if isinstance(extraction, dict) else None
+    vendor_gstin = (
+        str(vendor["gstin"]).strip().upper()
+        if isinstance(vendor, dict)
+        and isinstance(vendor.get("gstin"), str)
+        and vendor["gstin"].strip()
+        else None
+    )
+    vendor_name = (
+        str(vendor["name"]).strip()
+        if isinstance(vendor, dict)
+        and isinstance(vendor.get("name"), str)
+        and vendor["name"].strip()
+        else None
+    )
+
+    client_q = ClientQuery(session=session, ca_firm_id=ca_firm_id)
+
     # ---- R2 Stage 1: BUYER GSTIN (deterministic, HIGH) -------------------
     if buyer_gstin is not None and is_valid_gstin(buyer_gstin):
-        client_q = ClientQuery(session=session, ca_firm_id=ca_firm_id)
         hit = await client_q.get_by_gstin(buyer_gstin)
         if hit is not None and hit.is_active:
             return await _emit(
@@ -242,7 +265,23 @@ async def resolve_identity(  # noqa: PLR0912 — linear cascade, splitting hurts
                 started=started,
             )
 
-    # ---- R2 Stage 2: BUYER NAME (fuzzy, HIGH ≥ 0.85 or MEDIUM ≥ 0.55) ----
+    # ---- R4 Stage 2: VENDOR GSTIN (deterministic, HIGH) ------------------
+    # Fires when the buyer side missed but the CA's client is the seller
+    # on this invoice (outward supply). Same precision as BUYER_GSTIN.
+    if vendor_gstin is not None and is_valid_gstin(vendor_gstin):
+        hit = await client_q.get_by_gstin(vendor_gstin)
+        if hit is not None and hit.is_active:
+            return await _emit(
+                session=session,
+                ca_firm_id=ca_firm_id,
+                stage=ResolutionStage.VENDOR_GSTIN,
+                confidence=ResolutionConfidence.HIGH,
+                client_id=hit.id,
+                pending_id=None,
+                started=started,
+            )
+
+    # ---- R2 Stage 3: BUYER NAME (fuzzy, HIGH ≥ 0.85 or MEDIUM ≥ 0.55) ----
     if buyer_name is not None:
         buyer_match = await _resolve_from_buyer_name(
             session=session, ca_firm_id=ca_firm_id, buyer_name=buyer_name
@@ -261,6 +300,25 @@ async def resolve_identity(  # noqa: PLR0912 — linear cascade, splitting hurts
                 )
             # MEDIUM: hold this candidate but keep checking the fallback
             # stages — a deterministic session/GSTIN signal still wins.
+
+    # ---- R4 Stage 4: VENDOR NAME (fuzzy, HIGH ≥ 0.85) --------------------
+    # Mirror of BUYER_NAME — same threshold, same tie-break rules.
+    if vendor_name is not None:
+        vendor_match = await _resolve_from_buyer_name(
+            session=session, ca_firm_id=ca_firm_id, buyer_name=vendor_name
+        )
+        if vendor_match is not None:
+            client_id, confidence = vendor_match
+            if confidence is ResolutionConfidence.HIGH:
+                return await _emit(
+                    session=session,
+                    ca_firm_id=ca_firm_id,
+                    stage=ResolutionStage.VENDOR_NAME,
+                    confidence=confidence,
+                    client_id=client_id,
+                    pending_id=None,
+                    started=started,
+                )
 
     # ---- Stage 3 (legacy): session context -------------------------------
     client_id = await _resolve_from_session(
