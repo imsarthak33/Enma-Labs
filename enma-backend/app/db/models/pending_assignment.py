@@ -21,6 +21,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    String,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -85,6 +86,20 @@ class PendingAssignment(Base):
     )
     expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
+    )
+    extraction: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment=(
+            "Cached extract_only output (R1). Populated when an upload "
+            "reaches EXPLICIT_ASK so /assign + inline-button confirmation "
+            "do not re-OCR the file. R2 consumes this; R1 leaves it NULL."
+        ),
+    )
+    extraction_document_type: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        comment="Classifier's document_type when extraction was cached.",
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

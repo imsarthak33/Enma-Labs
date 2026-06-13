@@ -63,11 +63,14 @@ from app.utils.date_utils import FilingPeriod, now_ist, parse_iso_date
 _log = get_logger(__name__)
 
 __all__ = [
+    "ExtractionOutcome",
     "PipelineResult",
     "PipelineStage",
     "PipelineStageStatus",
     "PipelineStageOutcome",
     "PipelineError",
+    "extract_only",
+    "finalize_document",
     "run_pipeline",
 ]
 
@@ -95,6 +98,27 @@ class PipelineStageOutcome:
     status: PipelineStageStatus
     duration_ms: int
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class ExtractionOutcome:
+    """Output of the extract-only phase (R1 split).
+
+    Carries everything routing needs to pick a client *before* persistence
+    runs: the classifier's document_type, the extractor's structured JSON
+    (vendor + buyer + line items + totals), and the per-stage outcomes
+    accumulated so far. The downstream :func:`finalize_document` extends
+    these stages and produces the full :class:`PipelineResult`.
+
+    ``extraction`` is ``None`` when the extractor failed — the caller can
+    still inspect ``document_type`` (e.g. ``UNKNOWN``) and decide whether
+    to prompt or refuse the upload.
+    """
+
+    document_type: str
+    extraction: dict[str, Any] | None
+    verification: VerificationResult | None
+    stages: tuple[PipelineStageOutcome, ...]
 
 
 @dataclass(frozen=True)
@@ -133,27 +157,24 @@ def _now_ms() -> int:
 # ---------------------------------------------------------------------------
 
 
-async def run_pipeline(  # noqa: PLR0912, PLR0915 — linear orchestrator, splitting hurts readability
-    *,
-    session: AsyncSession,
-    ca_firm_id: uuid.UUID,
-    client_id: uuid.UUID,
-    file_bytes: bytes,
-    filing_period_month: int | None = None,
-    filing_period_year: int | None = None,
-    source_file_ids: list[str] | None = None,
-) -> PipelineResult:
-    """Run the full extraction pipeline for a single document.
+async def extract_only(file_bytes: bytes) -> ExtractionOutcome:
+    """Run the client-independent half of the pipeline (R1 split).
 
-    The function is a single async sequence — no fan-out. Pipeline-level
-    parallelism (e.g. processing all pages of a multi-page PDF) is
-    handled by the caller; one ``run_pipeline`` invocation = one
-    document row.
+    file_processing → classification → extraction → verification.
+
+    This is the "scout pass" the autonomous-routing flow needs: we get
+    the buyer's GSTIN/name and the vendor's GSTIN/name from the extractor
+    BEFORE we have to decide which client the document belongs to.
+    Routing then keys off the extracted fields rather than the upload's
+    caption/filename. Tax verdict + persistence are deferred to
+    :func:`finalize_document`, which receives the resolved ``client_id``.
 
     Raises:
-        PipelineError: when a stage that has no useful fallback fails
-            (unsupported file kind, classifier error before we even know
-            the type, persistence failure).
+        PipelineError: when file processing or classification fail
+            irrecoverably. Extraction and verification failures are
+            recorded as stage outcomes but do not raise — the caller can
+            still inspect ``document_type`` and decide whether to prompt
+            the CA or refuse the upload.
     """
     stages: list[PipelineStageOutcome] = []
 
@@ -184,7 +205,6 @@ async def run_pipeline(  # noqa: PLR0912, PLR0915 — linear orchestrator, split
     try:
         classification: ClassificationResult = await classify_document(image_bytes)
     except Exception as exc:
-        # We have no document_type — pipeline cannot proceed.
         stages.append(
             PipelineStageOutcome(
                 stage=PipelineStage.CLASSIFICATION,
@@ -229,7 +249,7 @@ async def run_pipeline(  # noqa: PLR0912, PLR0915 — linear orchestrator, split
         extraction_result.data if extraction_result is not None else None
     )
 
-    # ---- Stage 4: verification -------------------------------------------
+    # ---- Stage 4: verification (pure Python, no client_id needed) --------
     verification: VerificationResult | None = None
     t0 = _now_ms()
     if extraction_data is not None:
@@ -260,6 +280,40 @@ async def run_pipeline(  # noqa: PLR0912, PLR0915 — linear orchestrator, split
             )
         )
 
+    return ExtractionOutcome(
+        document_type=classification.document_type,
+        extraction=extraction_data,
+        verification=verification,
+        stages=tuple(stages),
+    )
+
+
+async def finalize_document(  # noqa: PLR0912, PLR0915 — linear orchestrator
+    *,
+    session: AsyncSession,
+    ca_firm_id: uuid.UUID,
+    client_id: uuid.UUID,
+    outcome: ExtractionOutcome,
+    filing_period_month: int | None = None,
+    filing_period_year: int | None = None,
+    source_file_ids: list[str] | None = None,
+) -> PipelineResult:
+    """Finalise an already-extracted document against a resolved client.
+
+    Runs the tax engine, enforces the locked-period invariant, and
+    persists a ``documents`` row. Carries forward the per-stage timings
+    accumulated by :func:`extract_only` so a single PipelineResult still
+    audits the entire pipeline.
+
+    Raises:
+        PipelineError: only on persistence failure. Tax-verdict failures
+            land as observable stage outcomes (the document still saves).
+    """
+    stages: list[PipelineStageOutcome] = list(outcome.stages)
+    classification_type = outcome.document_type
+    extraction_data = outcome.extraction
+    verification = outcome.verification
+
     # ---- Stage 5: tax verdict --------------------------------------------
     verdict: TaxVerdict | None = None
     t0 = _now_ms()
@@ -270,7 +324,7 @@ async def run_pipeline(  # noqa: PLR0912, PLR0915 — linear orchestrator, split
                 ca_firm_id=ca_firm_id,
                 client_id=client_id,
                 extraction=extraction_data,
-                document_type=classification.document_type,
+                document_type=classification_type,
                 filing_period_month=filing_period_month,
                 filing_period_year=filing_period_year,
             )
@@ -344,7 +398,7 @@ async def run_pipeline(  # noqa: PLR0912, PLR0915 — linear orchestrator, split
             )
             return PipelineResult(
                 document_id=None,
-                document_type=classification.document_type,
+                document_type=classification_type,
                 extraction=extraction_data,
                 verification=verification,
                 tax_verdict=verdict,
@@ -358,7 +412,7 @@ async def run_pipeline(  # noqa: PLR0912, PLR0915 — linear orchestrator, split
     try:
         doc = await queries.create(
             client_id=client_id,
-            document_type=classification.document_type,
+            document_type=classification_type,
             source_file_ids={"file_ids": source_file_ids or []},
             extraction_data=extraction_data or {},
             tax_verdict=verdict.to_jsonb() if verdict is not None else None,
@@ -392,11 +446,46 @@ async def run_pipeline(  # noqa: PLR0912, PLR0915 — linear orchestrator, split
 
     return PipelineResult(
         document_id=document_id,
-        document_type=classification.document_type,
+        document_type=classification_type,
         extraction=extraction_data,
         verification=verification,
         tax_verdict=verdict,
         stages=tuple(stages),
+    )
+
+
+async def run_pipeline(
+    *,
+    session: AsyncSession,
+    ca_firm_id: uuid.UUID,
+    client_id: uuid.UUID,
+    file_bytes: bytes,
+    filing_period_month: int | None = None,
+    filing_period_year: int | None = None,
+    source_file_ids: list[str] | None = None,
+) -> PipelineResult:
+    """Thin backward-compat wrapper that runs the full pipeline end-to-end.
+
+    Preserved for callers that already have a resolved ``client_id`` and
+    want a one-shot extract-and-persist call. New code targeting the
+    autonomous-routing flow should call :func:`extract_only` first
+    (to obtain the routing keys), then :func:`finalize_document` once a
+    client has been picked.
+
+    Raises:
+        PipelineError: bubbled from :func:`extract_only` (file processing
+            or classification) and from :func:`finalize_document`
+            (persistence failure).
+    """
+    outcome = await extract_only(file_bytes)
+    return await finalize_document(
+        session=session,
+        ca_firm_id=ca_firm_id,
+        client_id=client_id,
+        outcome=outcome,
+        filing_period_month=filing_period_month,
+        filing_period_year=filing_period_year,
+        source_file_ids=source_file_ids,
     )
 
 

@@ -17,9 +17,12 @@ from app.agents import pipeline as pipeline_module
 from app.agents.classifier import ClassificationResult
 from app.agents.extractor import ExtractionResult
 from app.agents.pipeline import (
+    ExtractionOutcome,
     PipelineError,
     PipelineStage,
     PipelineStageStatus,
+    extract_only,
+    finalize_document,
     run_pipeline,
 )
 from pypdf import PdfWriter
@@ -394,4 +397,92 @@ async def test_dirty_extraction_records_verification_issues(
     assert "vendor_gstin_invalid" in codes
     assert "cgst_math_mismatch" in codes
     # Pipeline overall is OK (no STAGE failed); verifier flagged issues.
+    assert result.overall_status is PipelineStageStatus.OK
+
+
+# ---------------------------------------------------------------------------
+# R1 split — extract_only + finalize_document
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_extract_only_returns_extraction_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R1: extract_only must run file→classify→extract→verify with no DB access.
+
+    The function takes raw file bytes and returns an ExtractionOutcome
+    carrying enough data for the autonomous router to pick a client.
+    """
+    _classify_stub(monkeypatch, document_type="B2B_INVOICE")
+    _extract_stub(monkeypatch)
+
+    outcome = await extract_only(_PNG_BYTES)
+
+    assert isinstance(outcome, ExtractionOutcome)
+    assert outcome.document_type == "B2B_INVOICE"
+    assert outcome.extraction is not None
+    assert "vendor" in outcome.extraction
+    # Exactly the four R1 stages should be present (file, classify, extract, verify).
+    stage_names = [s.stage for s in outcome.stages]
+    assert PipelineStage.FILE_PROCESSING in stage_names
+    assert PipelineStage.CLASSIFICATION in stage_names
+    assert PipelineStage.EXTRACTION in stage_names
+    assert PipelineStage.VERIFICATION in stage_names
+    # No tax verdict or persistence stages yet — those belong to finalize_document.
+    assert PipelineStage.TAX_VERDICT not in stage_names
+    assert PipelineStage.PERSISTENCE not in stage_names
+
+
+@pytest.mark.asyncio
+async def test_finalize_document_persists_and_carries_stages(
+    monkeypatch: pytest.MonkeyPatch,
+    db_session: Any,
+) -> None:
+    """R1: finalize_document takes an ExtractionOutcome + client_id and persists."""
+    session, firm_id, client_id = db_session
+    _classify_stub(monkeypatch)
+    _extract_stub(monkeypatch)
+    _no_firm_rules(monkeypatch)
+
+    outcome = await extract_only(_PNG_BYTES)
+    result = await finalize_document(
+        session=session,
+        ca_firm_id=firm_id,
+        client_id=client_id,
+        outcome=outcome,
+        source_file_ids=["tg-file-1"],
+    )
+    assert result.document_id is not None
+    assert result.document_type == "B2B_INVOICE"
+    # All seven stage entries (4 from extract_only + 3 from finalize) must
+    # appear in a single audit log.
+    stage_names = {s.stage for s in result.stages}
+    for s in PipelineStage:
+        assert s in stage_names, f"missing stage {s}"
+    statuses = {s.stage: s.status for s in result.stages}
+    assert statuses[PipelineStage.PERSISTENCE] is PipelineStageStatus.OK
+
+
+@pytest.mark.asyncio
+async def test_run_pipeline_is_thin_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+    db_session: Any,
+) -> None:
+    """R1: run_pipeline must remain a no-behaviour-change wrapper.
+
+    Existing callers (worker route, tests) must keep working without
+    changes. The wrapper composes extract_only + finalize_document.
+    """
+    session, firm_id, client_id = db_session
+    _classify_stub(monkeypatch)
+    _extract_stub(monkeypatch)
+    _no_firm_rules(monkeypatch)
+
+    result = await run_pipeline(
+        session=session,
+        ca_firm_id=firm_id,
+        client_id=client_id,
+        file_bytes=_PNG_BYTES,
+        source_file_ids=["tg-file-1"],
+    )
+    assert result.document_id is not None
     assert result.overall_status is PipelineStageStatus.OK
