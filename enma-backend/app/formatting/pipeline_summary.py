@@ -107,7 +107,27 @@ def _extraction_block(extraction: dict[str, Any]) -> str:
             f"Grand total: {code(safe_text(totals.get('grand_total')))} "
             f"(taxable {safe_text(totals.get('taxable_value') or '—')})"
         )
+        # O — surface the CGST/SGST/IGST breakdown (canonical, never LLM math).
+        for tax_label, key in (
+            ("CGST", "total_cgst"),
+            ("SGST", "total_sgst"),
+            ("IGST", "total_igst"),
+        ):
+            amount = totals.get(key)
+            if amount not in (None, "", "0", "0.00"):
+                lines.append(f"{tax_label}: {code(safe_text(amount))}")
     lines.append(f"Line items: {bold(len(line_items) if isinstance(line_items, list) else 0)}")
+    # O — surface reconciler discrepancies so the CA sees what disagreed
+    # between the printed invoice and the canonical math.
+    reconciliation = extraction.get("reconciliation") or {}
+    if isinstance(reconciliation, dict):
+        discrepancies = reconciliation.get("discrepancies") or []
+        if isinstance(discrepancies, list) and discrepancies:
+            lines.append("")
+            lines.append(bold("Reconciliation flags"))
+            for d in discrepancies[:5]:
+                if isinstance(d, dict) and d.get("message"):
+                    lines.append(f"• {italic(safe_text(d['message']))}")
     return "\n".join(lines)
 
 

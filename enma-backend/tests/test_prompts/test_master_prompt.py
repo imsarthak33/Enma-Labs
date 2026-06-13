@@ -37,19 +37,29 @@ class TestExtractorPrompt:
         assert module_for_document_type(dt) in prompt
 
     def test_includes_schema_fields(self) -> None:
+        """The schema string must mention every field the reconciler reads.
+
+        After O, ``observed_totals`` replaces the LLM-computed ``totals``
+        block, and the per-line ``*_amount`` fields for CGST / SGST / IGST
+        are dropped — the Python reconciler computes them from
+        rate × canonical taxable so the LLM never has to do math.
+        """
         prompt = build_extractor_prompt("B2B_INVOICE")
         for required_field in (
             "vendor",
             "buyer",
             "line_items",
-            "totals",
-            "grand_total",
-            "cgst_amount",
-            "sgst_amount",
-            "igst_amount",
+            "observed_totals",
+            "label",
+            "amount",
+            "line_amount",
+            "tax_amount",
+            "cgst_rate",
+            "sgst_rate",
+            "igst_rate",
             "invoice_date",
         ):
-            assert required_field in prompt
+            assert required_field in prompt, f"missing {required_field} in schema"
 
     def test_unknown_type_falls_back_gracefully(self) -> None:
         prompt = build_extractor_prompt("MADE_UP_TYPE")

@@ -394,9 +394,20 @@ async def test_dirty_extraction_records_verification_issues(
     )
     assert result.verification is not None
     codes = {i.code for i in result.verification.issues}
+    # GSTIN format check is unchanged — still fires.
     assert "vendor_gstin_invalid" in codes
-    assert "cgst_math_mismatch" in codes
-    # Pipeline overall is OK (no STAGE failed); verifier flagged issues.
+    # O architectural shift: bad LLM math (CGST=100 on taxable=100) is
+    # now SILENTLY FIXED by the Python reconciler before the verifier
+    # runs. The verifier sees consistent reconciled values, so
+    # cgst_math_mismatch must NOT appear. The hallucinated cell never
+    # reaches the CA — they see canonical numbers instead.
+    assert "cgst_math_mismatch" not in codes
+    # Reconciler did its job: the persisted extraction now carries
+    # canonical totals computed from rate × taxable.
+    assert result.extraction is not None
+    canonical_cgst = result.extraction["totals"]["total_cgst"]
+    # 100 * 9% = 9.00 — the correct number, not the hallucinated 100.
+    assert canonical_cgst in {"9.00", "9"}
     assert result.overall_status is PipelineStageStatus.OK
 
 

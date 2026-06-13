@@ -114,24 +114,33 @@ _EXTRACTOR_OUTPUT_SCHEMA: Final[str] = (
     '      "description": "<string>",\n'
     '      "hsn_sac": "<string or null>",\n'
     '      "quantity": "<numeric string or null>",\n'
-    '      "unit_price": "<numeric string or null>",\n'
-    '      "taxable_value": "<numeric string>",\n'
+    '      "unit_price": "<numeric string from the RATE column or null>",\n'
+    '      "tax_amount": "<numeric string from the TAX column or null>",\n'
+    '      "line_amount": "<numeric string from the AMOUNT column or null>",\n'
     '      "cgst_rate": "<numeric string or null>",\n'
-    '      "cgst_amount": "<numeric string or null>",\n'
     '      "sgst_rate": "<numeric string or null>",\n'
-    '      "sgst_amount": "<numeric string or null>",\n'
-    '      "igst_rate": "<numeric string or null>",\n'
-    '      "igst_amount": "<numeric string or null>"\n'
+    '      "igst_rate": "<numeric string or null>"\n'
     "    }\n"
     "  ],\n"
-    '  "totals": {\n'
-    '    "taxable_value": "<numeric string>",\n'
-    '    "total_cgst": "<numeric string>",\n'
-    '    "total_sgst": "<numeric string>",\n'
-    '    "total_igst": "<numeric string>",\n'
-    '    "grand_total": "<numeric string>"\n'
-    "  }\n"
+    '  "observed_totals": [\n'
+    "    {\n"
+    '      "label": "<verbatim label from the totals block,'
+    ' e.g. \\"Taxable Amount\\" or \\"CGST @2.5%\\">",\n'
+    '      "amount": "<numeric string>"\n'
+    "    }\n"
+    "  ]\n"
     "}\n"
+    "\n"
+    "DO NOT DO MATH. Python will compute the canonical totals from the\n"
+    "raw cells you extracted. Specifically:\n"
+    "  * Per line: copy what you see in each column verbatim. Do NOT\n"
+    "    compute taxable_value = quantity * unit_price yourself.\n"
+    "  * Do NOT split a line's tax_amount into CGST/SGST yourself.\n"
+    "  * For ``observed_totals``: copy the bottom-of-invoice totals\n"
+    "    block as a list of {label, amount} entries verbatim. Include\n"
+    "    EVERY labelled total: 'Subtotal', 'Taxable Amount', 'CGST @X%',\n"
+    "    'SGST @X%', 'IGST @X%', 'Total Amount', 'Round Off', etc.\n"
+    "    Preserve the printed label exactly so Python can parse the rate.\n"
     "Return ONLY the JSON object. No prose. No markdown. No code fences."
 )
 

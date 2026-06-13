@@ -54,7 +54,13 @@ _MAX_TOKENS: Final[int] = 4096
 
 
 _REQUIRED_TOP_LEVEL_KEYS: Final[frozenset[str]] = frozenset(
-    {"vendor", "buyer", "line_items", "totals"}
+    # ``totals`` was required when the LLM was responsible for computing
+    # the canonical totals. After O it's populated by the Python
+    # reconciler from ``observed_totals`` + ``line_items``, so we drop
+    # it from the required set. Either ``observed_totals`` (preferred)
+    # or ``line_items`` is enough for the reconciler to produce an
+    # answer; missing both is still an extraction failure.
+    {"vendor", "buyer", "line_items"}
 )
 
 

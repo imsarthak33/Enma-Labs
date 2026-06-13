@@ -98,11 +98,32 @@ async def test_array_payload_raises(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.asyncio
 async def test_missing_required_keys_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """O — ``totals`` is now optional (the Python reconciler computes
+    canonical totals from line items + observed labels). But the other
+    required keys (vendor, buyer, line_items) still must be present.
+    """
     partial = _valid_extraction()
-    del partial["totals"]
+    del partial["line_items"]
     _patch_llm(monkeypatch, json.dumps(partial))
-    with pytest.raises(ExtractorError, match="totals"):
+    with pytest.raises(ExtractorError, match="line_items"):
         await extract_document(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16, document_type="B2B_INVOICE")
+
+
+@pytest.mark.asyncio
+async def test_totals_not_required_after_reconciler(monkeypatch: pytest.MonkeyPatch) -> None:
+    """O regression: extractor must accept payloads with no ``totals`` block.
+
+    The new schema instructs the LLM to emit ``observed_totals[]`` instead
+    of a computed ``totals`` block; legacy extractions still carry
+    ``totals``; both must validate cleanly so the reconciler can take over.
+    """
+    payload = _valid_extraction()
+    payload.pop("totals", None)
+    _patch_llm(monkeypatch, json.dumps(payload))
+    result = await extract_document(
+        b"\x89PNG\r\n\x1a\n" + b"\x00" * 16, document_type="B2B_INVOICE"
+    )
+    assert result.data["vendor"]["gstin"] == "29AAAGU0010P1Z5"
 
 
 @pytest.mark.asyncio

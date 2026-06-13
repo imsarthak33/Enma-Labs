@@ -36,6 +36,7 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass, field
+from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 
@@ -57,6 +58,8 @@ from app.services.file_processor import (
     is_image,
     rasterize_pdf_page,
 )
+from app.tax.reconciler import reconcile_extraction
+from app.utils.decimal_utils import quantize_money
 from app.tax.itc import PeriodContext
 from app.utils.date_utils import FilingPeriod, now_ist, parse_iso_date
 
@@ -79,6 +82,7 @@ class PipelineStage(StrEnum):
     FILE_PROCESSING = "file_processing"
     CLASSIFICATION = "classification"
     EXTRACTION = "extraction"
+    RECONCILIATION = "reconciliation"
     VERIFICATION = "verification"
     TAX_VERDICT = "tax_verdict"
     PERSISTENCE = "persistence"
@@ -248,6 +252,74 @@ async def extract_only(file_bytes: bytes) -> ExtractionOutcome:
     extraction_data: dict[str, Any] | None = (
         extraction_result.data if extraction_result is not None else None
     )
+
+    # ---- Stage 3.5: reconciliation (O — Python-driven invoice math) ------
+    # The extractor LLM is good at OCR but bad at picking which printed
+    # number is the taxable vs the tax. The reconciler computes canonical
+    # totals from line_items + observed_totals (NEVER from the LLM's
+    # ``totals`` block), then overwrites ``totals`` and ``line_items[].*``
+    # amounts with the canonical values so every downstream consumer
+    # (verifier, tax engine, summary) reads from a single source of truth.
+    t0 = _now_ms()
+    if extraction_data is not None:
+        try:
+            reconciled = reconcile_extraction(extraction_data)
+        except Exception as exc:
+            stages.append(
+                PipelineStageOutcome(
+                    stage=PipelineStage.RECONCILIATION,
+                    status=PipelineStageStatus.FAILED,
+                    duration_ms=_now_ms() - t0,
+                    error=str(exc),
+                )
+            )
+            _log.error("pipeline_reconciliation_failed", error=str(exc))
+        else:
+            # Patch the extraction so downstream code reads canonical numbers.
+            extraction_data["totals"] = {
+                "taxable_value": str(reconciled.taxable),
+                "total_cgst": str(reconciled.cgst_amount),
+                "total_sgst": str(reconciled.sgst_amount),
+                "total_igst": str(reconciled.igst_amount),
+                "grand_total": str(reconciled.grand_total),
+            }
+            # Per-line math: overwrite the hallucinated *_amount fields
+            # with values derived from canonical taxable × rate. Rates the
+            # LLM read straight off the column header are preserved.
+            for idx, rec_line in enumerate(reconciled.line_items):
+                if not (
+                    isinstance(extraction_data.get("line_items"), list)
+                    and idx < len(extraction_data["line_items"])
+                    and isinstance(extraction_data["line_items"][idx], dict)
+                ):
+                    continue
+                target = extraction_data["line_items"][idx]
+                target["taxable_value"] = str(rec_line.taxable)
+                target["cgst_amount"] = str(
+                    quantize_money(rec_line.taxable * reconciled.cgst_rate / Decimal(100))
+                )
+                target["sgst_amount"] = str(
+                    quantize_money(rec_line.taxable * reconciled.sgst_rate / Decimal(100))
+                )
+                target["igst_amount"] = str(
+                    quantize_money(rec_line.taxable * reconciled.igst_rate / Decimal(100))
+                )
+            extraction_data["reconciliation"] = reconciled.to_dict()
+            stages.append(
+                PipelineStageOutcome(
+                    stage=PipelineStage.RECONCILIATION,
+                    status=PipelineStageStatus.OK,
+                    duration_ms=_now_ms() - t0,
+                )
+            )
+    else:
+        stages.append(
+            PipelineStageOutcome(
+                stage=PipelineStage.RECONCILIATION,
+                status=PipelineStageStatus.SKIPPED,
+                duration_ms=_now_ms() - t0,
+            )
+        )
 
     # ---- Stage 4: verification (pure Python, no client_id needed) --------
     verification: VerificationResult | None = None
