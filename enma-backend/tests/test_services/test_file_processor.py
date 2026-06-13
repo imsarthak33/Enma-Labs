@@ -10,11 +10,13 @@ import io
 
 import pytest
 from app.services.file_processor import (
+    MAX_RASTER_BYTES,
     FileKind,
     FileProcessingError,
     detect_kind,
     inspect_pdf,
     is_image,
+    rasterize_pdf_page,
     split_pdf_pages,
 )
 from pypdf import PdfReader, PdfWriter
@@ -153,3 +155,47 @@ class TestSplitPdfPages:
             pytest.raises(FileProcessingError, match="encrypted"),
         ):
             split_pdf_pages(b"%PDF-fake")
+
+
+# ---------------------------------------------------------------------------
+# rasterize_pdf_page
+# ---------------------------------------------------------------------------
+
+
+class TestRasterizePdfPage:
+    """Refactor I: PDF → PNG via PyMuPDF.
+
+    NVIDIA NIM's chat-completions schema rejects the OpenAI ``file`` content
+    part with HTTP 400 ``"data did not match any variant of untagged enum
+    ChatCompletionRequestUserMessageContent"``. Rasterising the page to
+    PNG locally lets us send it through the standard ``image_url`` path,
+    which works across every vision LLM we use.
+    """
+
+    def test_renders_first_page_as_png(self) -> None:
+        png = rasterize_pdf_page(_make_pdf(pages=2))
+        # PNG magic — 8-byte header.
+        assert png.startswith(b"\x89PNG\r\n\x1a\n")
+        # Non-trivial size for a 72x72 blank page at 200 DPI.
+        assert len(png) > 100
+
+    def test_page_index_out_of_range_raises(self) -> None:
+        with pytest.raises(FileProcessingError, match="out of range"):
+            rasterize_pdf_page(_make_pdf(pages=1), page_index=5)
+
+    def test_bad_pdf_raises(self) -> None:
+        with pytest.raises(FileProcessingError, match="failed to open PDF"):
+            rasterize_pdf_page(b"not-a-pdf-at-all")
+
+    def test_oversized_png_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Cap raster bytes to a value below what 200 DPI on a blank page
+        # produces, to exercise the size guard.
+        from app.services import file_processor as fp
+
+        monkeypatch.setattr(fp, "MAX_RASTER_BYTES", 1)
+        with pytest.raises(FileProcessingError, match="exceeding limit"):
+            rasterize_pdf_page(_make_pdf())
+
+    def test_max_raster_bytes_is_a_constant(self) -> None:
+        # Cheap sanity check — make sure the public constant is exported.
+        assert MAX_RASTER_BYTES > 0

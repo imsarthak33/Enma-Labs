@@ -55,7 +55,7 @@ from app.services.file_processor import (
     FileProcessingError,
     detect_kind,
     is_image,
-    split_pdf_pages,
+    rasterize_pdf_page,
 )
 from app.tax.itc import PeriodContext
 from app.utils.date_utils import FilingPeriod, now_ist, parse_iso_date
@@ -485,9 +485,15 @@ def _prepare_image_bytes(file_bytes: bytes) -> bytes:
     """Return image bytes suitable for handing to the vision LLM.
 
     For an image input: pass through as-is.
-    For a PDF input: split and return the FIRST page only (Phase 4
-    handles one page at a time; multi-page processing is a Phase 4.5
-    extension if needed).
+    For a PDF input: rasterise the first page to PNG via PyMuPDF.
+
+    We rasterise rather than pass PDF bytes through because NVIDIA NIM's
+    OpenAI-compatible schema rejects the ``file`` content part — only
+    ``text`` and ``image_url`` are accepted. Rasterising upstream of the
+    LLM keeps every vision model we use (NIM nemotron-ocr, Llama vision,
+    gpt-4o) on the same single code path. Phase 4 still handles one
+    page per ``run_pipeline`` call; multi-page handling is a Phase 4.5
+    extension if needed.
 
     Anything else raises :class:`FileProcessingError`.
     """
@@ -495,8 +501,5 @@ def _prepare_image_bytes(file_bytes: bytes) -> bytes:
     if is_image(kind):
         return file_bytes
     if kind is FileKind.PDF:
-        pages = split_pdf_pages(file_bytes)
-        if not pages:
-            raise FileProcessingError("PDF split returned zero pages")
-        return pages[0]
+        return rasterize_pdf_page(file_bytes, page_index=0)
     raise FileProcessingError(f"unsupported file kind: {kind.value}")

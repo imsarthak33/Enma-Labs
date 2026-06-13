@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
 
+import pymupdf
 from pypdf import PdfReader, PdfWriter
 
 from app.logging_setup import get_logger
@@ -46,6 +47,16 @@ MAX_PDF_PAGES: Final[int] = 50
 # Maximum per-page PDF size after split. Sanity guard against a single
 # pathological page consuming gigabytes.
 MAX_PAGE_BYTES: Final[int] = 20 * 1024 * 1024  # 20 MB
+
+# PDF→PNG rasterisation DPI. 200 hits the sweet spot for the OCR /
+# vision LLMs we target — high enough that fine print and stamped
+# GSTINs read cleanly, low enough that the PNG fits the per-call
+# token budget after base64 encoding.
+PDF_RASTER_DPI: Final[int] = 200
+
+# Cap rasterised PNG size so a single pathological page can't blow the
+# LLM request budget. ~6 MB at 200 DPI for a typical A4 invoice.
+MAX_RASTER_BYTES: Final[int] = 8 * 1024 * 1024  # 8 MB
 
 
 # Magic numbers — read the first few bytes to identify file type. We never
@@ -166,14 +177,66 @@ def split_pdf_pages(data: bytes, *, max_pages: int = MAX_PDF_PAGES) -> list[byte
     return out
 
 
+def rasterize_pdf_page(
+    data: bytes,
+    *,
+    page_index: int = 0,
+    dpi: int = PDF_RASTER_DPI,
+) -> bytes:
+    """Render a PDF page to PNG bytes via PyMuPDF.
+
+    NVIDIA NIM's OpenAI-compatible chat-completions schema accepts ``text``
+    and ``image_url`` content parts only — the OpenAI ``file`` part is
+    rejected with HTTP 400 ``"data did not match any variant of untagged
+    enum ChatCompletionRequestUserMessageContent"``. Rasterising the
+    page to PNG locally lets us send it through the standard
+    ``image_url`` path, which works with every vision LLM we use
+    (nvidia/nemotron-ocr-v1, meta/llama-3.2-*-vision-instruct, gpt-4o).
+
+    Raises:
+        FileProcessingError: when ``data`` is not a parseable PDF, the
+            page index is out of range, the PDF is encrypted, or the
+            rendered PNG exceeds :data:`MAX_RASTER_BYTES`.
+    """
+    try:
+        doc = pymupdf.open(stream=data, filetype="pdf")
+    except Exception as exc:
+        raise FileProcessingError(f"failed to open PDF: {exc}") from exc
+    try:
+        if doc.is_encrypted:
+            raise FileProcessingError("PDF is encrypted; cannot rasterise")
+        if page_index < 0 or page_index >= doc.page_count:
+            raise FileProcessingError(
+                f"PDF page_index {page_index} out of range (0..{doc.page_count - 1})"
+            )
+        page = doc.load_page(page_index)
+        # ``dpi`` is the canonical PyMuPDF param; alpha=False drops the
+        # transparency channel (LLMs don't care, smaller PNG).
+        pixmap = page.get_pixmap(dpi=dpi, alpha=False)
+        png_bytes: bytes = pixmap.tobytes("png")
+    finally:
+        doc.close()
+
+    if len(png_bytes) > MAX_RASTER_BYTES:
+        raise FileProcessingError(
+            f"rasterised page is {len(png_bytes)} bytes, "
+            f"exceeding limit of {MAX_RASTER_BYTES}"
+        )
+    _log.debug("pdf_rasterised", page=page_index, dpi=dpi, bytes=len(png_bytes))
+    return png_bytes
+
+
 __all__ = [
     "MAX_PAGE_BYTES",
     "MAX_PDF_PAGES",
+    "MAX_RASTER_BYTES",
+    "PDF_RASTER_DPI",
     "FileKind",
     "FileProcessingError",
     "PdfMetadata",
     "detect_kind",
     "inspect_pdf",
     "is_image",
+    "rasterize_pdf_page",
     "split_pdf_pages",
 ]

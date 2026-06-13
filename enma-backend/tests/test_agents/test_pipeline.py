@@ -236,6 +236,68 @@ async def test_pdf_first_page_extracted(monkeypatch: pytest.MonkeyPatch, db_sess
 
 
 @pytest.mark.asyncio
+async def test_pdf_input_classifier_receives_png_not_pdf(
+    monkeypatch: pytest.MonkeyPatch,
+    db_session: Any,
+) -> None:
+    """Refactor I regression: PDFs must reach classifier/extractor as PNG.
+
+    NVIDIA NIM rejects the OpenAI ``file`` content part. Before this fix,
+    _prepare_image_bytes returned single-page PDF bytes to the classifier
+    which then handed them to the LLM as a ``file`` part — surfaced in
+    prod as HTTP 400 "data did not match any variant of untagged enum
+    ChatCompletionRequestUserMessageContent". Now the pipeline rasterises
+    the PDF page to PNG locally so the classifier/extractor see image
+    bytes and use the ``image_url`` content part NIM accepts.
+    """
+    session, firm_id, client_id = db_session
+    _no_firm_rules(monkeypatch)
+
+    received_bytes: dict[str, bytes] = {}
+
+    async def fake_classify(image_bytes: bytes) -> ClassificationResult:
+        received_bytes["classifier"] = image_bytes
+        return ClassificationResult(
+            document_type="B2B_INVOICE",
+            confidence="HIGH",
+            reasoning="ok",
+        )
+
+    async def fake_extract(image_bytes: bytes, *, document_type: str) -> ExtractionResult:
+        received_bytes["extractor"] = image_bytes
+        return ExtractionResult(
+            document_type=document_type,
+            data={
+                "vendor": {"name": "V", "gstin": None},
+                "buyer": {"name": "B", "gstin": None},
+                "totals": {"grand_total": "0.00"},
+                "line_items": [],
+            },
+            model_name="m",
+            input_tokens=1,
+            output_tokens=1,
+        )
+
+    monkeypatch.setattr(pipeline_module, "classify_document", fake_classify)
+    monkeypatch.setattr(pipeline_module, "extract_document", fake_extract)
+
+    await run_pipeline(
+        session=session,
+        ca_firm_id=firm_id,
+        client_id=client_id,
+        file_bytes=_make_pdf(2),
+    )
+
+    # Both agents must have received PNG-magic bytes, not %PDF- bytes.
+    assert received_bytes["classifier"].startswith(b"\x89PNG\r\n\x1a\n"), (
+        "classifier received non-PNG bytes — PDF rasterisation regressed"
+    )
+    assert received_bytes["extractor"].startswith(b"\x89PNG\r\n\x1a\n"), (
+        "extractor received non-PNG bytes — PDF rasterisation regressed"
+    )
+
+
+@pytest.mark.asyncio
 async def test_unsupported_file_kind_raises(
     monkeypatch: pytest.MonkeyPatch, db_session: Any
 ) -> None:
