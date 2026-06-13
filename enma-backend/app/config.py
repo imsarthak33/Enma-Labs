@@ -142,6 +142,16 @@ class Settings(BaseSettings):
     )
     embedding_model_name: str = Field(default="nvidia/nv-embedqa-e5-v5")
     embedding_dimensions: int = Field(default=1024, ge=64, le=4096)
+    # Force-override the embedder's "send dimensions?" auto-detection.
+    # None  = auto (OpenAI text-embedding-3-* sends; everything else omits,
+    #         with one-shot retry-without-dimensions if the model 400s).
+    # True  = always send (use when running a Matryoshka model the heuristic
+    #         doesn't recognise).
+    # False = never send (force-omit for an unknown NIM model).
+    embedding_send_dimensions: bool | None = Field(
+        default=None,
+        description="Override embedding-client dimensions-parameter behaviour.",
+    )
 
     # LLM API key. Required at first LLM call (not at boot, so tests
     # that mock the client don't need it set).

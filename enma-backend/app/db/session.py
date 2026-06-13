@@ -68,12 +68,36 @@ def _build_engine() -> AsyncEngine:
 
     Transaction mode (port 6543): NullPool — Supavisor handles pooling.
     Session mode (port 5432):     QueuePool with configured size.
+
+    asyncpg prepared-statement cache
+    --------------------------------
+    Supavisor's transaction-pooling mode rebinds physical Postgres
+    connections to different client sessions between transactions. Any
+    server-side prepared statements that asyncpg cached for the previous
+    client (under names like ``__asyncpg_stmt_11__``) then collide on the
+    next checkout, surfacing as
+    ``DuplicatePreparedStatementError: prepared statement
+    "__asyncpg_stmt_NN__" already exists``.
+
+    The canonical Supabase + asyncpg + SQLAlchemy fix is to disable the
+    asyncpg prepared-statement cache entirely (``statement_cache_size=0``)
+    and unique-ify any remaining server-side prepares via
+    ``prepared_statement_name_func`` — required even when the cache is off,
+    because some driver paths still issue ``PREPARE`` once.
     """
     url = str(settings.database_url)
+
+    asyncpg_connect_args: dict[str, Any] = {
+        "server_settings": _ASYNCPG_SERVER_SETTINGS,
+        # Disable client-side prepared-statement caching — pooled connections
+        # are not stable identity carriers under Supavisor transaction mode.
+        "statement_cache_size": 0,
+    }
+
     common_kwargs: dict[str, Any] = {
         "echo": settings.db_echo,
         "future": True,
-        "connect_args": {"server_settings": _ASYNCPG_SERVER_SETTINGS},
+        "connect_args": asyncpg_connect_args,
     }
 
     if settings.uses_transaction_pooling() or settings.db_pool_size == 0:

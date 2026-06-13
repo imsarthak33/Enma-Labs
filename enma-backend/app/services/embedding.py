@@ -77,21 +77,35 @@ class Embedder(ABC):
 class HttpEmbedder(Embedder):
     """OpenAI-compatible ``/v1/embeddings`` client.
 
-    Sends ``{model, input, dimensions}`` to the configured endpoint.
+    Sends ``{model, input, [dimensions]}`` to the configured endpoint.
     Treats anything other than HTTP 200 with a well-formed
     ``data[0].embedding`` array of the expected dimension as an error.
 
-    Some models (e.g. ``nvidia/nv-embedqa-e5-v5``) natively output
-    the desired dimension count and *reject* the ``dimensions``
-    parameter with HTTP 400.  For those models we omit the field.
+    Dimension-parameter policy
+    --------------------------
+    OpenAI ``text-embedding-3-*`` supports Matryoshka truncation via the
+    ``dimensions`` request field. Most NVIDIA NIM embedding models
+    (``nvidia/nv-embedqa-*``, ``nvidia/llama-3.2-nv-embedqa-*``,
+    ``snowflake/arctic-embed-*``, …) **reject** ``dimensions`` with HTTP
+    400, and the set of NIM models grows over time.
+
+    Rather than maintain a fragile deny-list, the embedder uses a small
+    allow-list of model-name *prefixes* known to accept ``dimensions``;
+    every other model defaults to omitting the field. As a runtime
+    safety net, if a request with ``dimensions`` is rejected with the
+    canonical "does not support 'dimensions'" 400, the embedder retries
+    once without it and remembers the result for the process lifetime.
+
+    The behaviour can be force-overridden via ``settings.embedding_send_dimensions``
+    (``True``/``False``) when a new model breaks the heuristic.
     """
 
-    # Models whose API rejects the ``dimensions`` request parameter.
-    _MODELS_WITHOUT_DIMENSIONS: frozenset[str] = frozenset({
-        "nvidia/nv-embedqa-e5-v5",
-        "nvidia/embed-qa-4",
-        "snowflake/arctic-embed-l",
-    })
+    # Prefix-matched allow-list: models that accept the ``dimensions`` field.
+    # Keep this conservative. Default for unrecognised models is OFF.
+    _MODEL_PREFIXES_WITH_DIMENSIONS: tuple[str, ...] = (
+        "text-embedding-3-",  # OpenAI Matryoshka family
+        "openai/text-embedding-3-",
+    )
 
     def __init__(
         self,
@@ -101,13 +115,24 @@ class HttpEmbedder(Embedder):
         dimensions: int = EMBEDDING_DIMENSIONS,
         input_type: str = "query",
         client: httpx.AsyncClient | None = None,
+        send_dimensions: bool | None = None,
     ) -> None:
         self._endpoint = endpoint
         self._model = model_name
         self._dim = dimensions
         self._input_type = input_type
         self._client = client
-        self._send_dimensions = model_name not in self._MODELS_WITHOUT_DIMENSIONS
+        if send_dimensions is None:
+            self._send_dimensions = self._model_supports_dimensions(model_name)
+        else:
+            self._send_dimensions = send_dimensions
+
+    @classmethod
+    def _model_supports_dimensions(cls, model_name: str) -> bool:
+        return any(
+            model_name.startswith(prefix)
+            for prefix in cls._MODEL_PREFIXES_WITH_DIMENSIONS
+        )
 
     async def _http(self) -> httpx.AsyncClient:
         if self._client is not None:
@@ -119,21 +144,25 @@ class HttpEmbedder(Embedder):
 
         return get_client()
 
-    async def embed(self, text: str, *, input_type: str = "query") -> list[float]:
-        # Allow per-call override; fall back to instance default.
-        effective_type = input_type or self._input_type
+    def _build_body(self, text: str, input_type: str, *, with_dimensions: bool) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": self._model,
             "input": text,
-            "input_type": effective_type,
+            "input_type": input_type,
         }
-        if self._send_dimensions:
+        if with_dimensions:
             body["dimensions"] = self._dim
+        return body
+
+    async def embed(self, text: str, *, input_type: str = "query") -> list[float]:
+        # Allow per-call override; fall back to instance default.
+        effective_type = input_type or self._input_type
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if settings.llm_api_key is not None:
             headers["Authorization"] = f"Bearer {settings.llm_api_key.get_secret_value()}"
 
         http = await self._http()
+        body = self._build_body(text, effective_type, with_dimensions=self._send_dimensions)
         try:
             resp = await http.post(self._endpoint, json=body, headers=headers)
         except httpx.HTTPError as exc:
@@ -141,9 +170,31 @@ class HttpEmbedder(Embedder):
             sentry_sdk.capture_exception(exc)
             raise EmbeddingError(f"embedding request failed: {exc}") from exc
 
+        # One-shot self-correction: if we sent ``dimensions`` and the model
+        # explicitly rejected it, retry once without and remember for the
+        # process lifetime. Prevents one bad env var from silencing RAG.
+        if (
+            self._send_dimensions
+            and resp.status_code == httpx.codes.BAD_REQUEST
+            and "does not support 'dimensions'" in resp.text
+        ):
+            _log.warning(
+                "embedding_dimensions_unsupported_disabling",
+                model=self._model,
+                response=resp.text[:200],
+            )
+            self._send_dimensions = False
+            retry_body = self._build_body(text, effective_type, with_dimensions=False)
+            try:
+                resp = await http.post(self._endpoint, json=retry_body, headers=headers)
+            except httpx.HTTPError as exc:
+                _log.error("embedding_request_failed", error=str(exc))
+                sentry_sdk.capture_exception(exc)
+                raise EmbeddingError(f"embedding request failed: {exc}") from exc
+
         if resp.status_code != httpx.codes.OK:
             raise EmbeddingError(
-                f"embedding endpoint returned HTTP {resp.status_code}: " f"{resp.text[:200]}"
+                f"embedding endpoint returned HTTP {resp.status_code}: {resp.text[:200]}"
             )
 
         try:
@@ -234,6 +285,7 @@ def _build_default_embedder() -> Embedder:
             endpoint=settings.embedding_endpoint,
             model_name=model,
             dimensions=settings.embedding_dimensions,
+            send_dimensions=settings.embedding_send_dimensions,
         )
     if settings.env.value in {"test", "development"}:
         return DeterministicHashEmbedder()
