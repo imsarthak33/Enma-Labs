@@ -6,7 +6,7 @@ import uuid
 from collections.abc import Sequence
 from typing import cast
 
-from sqlalchemy import exists, or_, select
+from sqlalchemy import exists, func, or_, select
 
 from app.db.models.client import Client
 from app.db.models.document import Document
@@ -64,6 +64,41 @@ class ClientQuery(BaseQuery):
             )
         )
         return await self._fetch_all(stmt)
+
+    async def search_by_name_ranked(
+        self,
+        name: str,
+        *,
+        min_similarity: float = 0.55,
+        limit: int = 3,
+    ) -> list[tuple[Client, float]]:
+        """R3 — pg_trgm-ranked fuzzy search returning (client, similarity).
+
+        Returned list is ordered by similarity descending. Empty when
+        nothing crosses ``min_similarity``. The caller decides how to
+        treat the top result (e.g., ≥ 0.85 = auto-resolve, 0.55-0.85 =
+        disambiguate, < 0.55 = fall through to supervisor).
+
+        Used by the agentic routing reply (R3): when an open
+        pending_assignment is awaiting a client, free-form user replies
+        like "CLEIND" should resolve it without forcing slash syntax.
+        """
+        clean = name.strip()
+        if len(clean) < 2:
+            return []
+        sim_trade = func.similarity(Client.trade_name, clean)
+        sim_legal = func.similarity(func.coalesce(Client.legal_name, ""), clean)
+        similarity = func.greatest(sim_trade, sim_legal).label("similarity")
+        stmt = (
+            select(Client, similarity)
+            .where(Client.ca_firm_id == self.ca_firm_id)
+            .where(Client.is_active.is_(True))
+            .where(similarity >= min_similarity)
+            .order_by(similarity.desc())
+            .limit(limit)
+        )
+        result = await self.session.execute(stmt)
+        return [(row[0], float(row[1])) for row in result.all()]
 
     async def create(
         self,

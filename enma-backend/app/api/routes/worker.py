@@ -73,6 +73,10 @@ from app.db.session import get_sessionmaker
 from app.formatting.pipeline_summary import render_pipeline_summary
 from app.formatting.telegram_html import bold, code, italic, safe_text
 from app.identity import resolve_identity
+from app.identity.resolver import (
+    BUYER_NAME_TRGM_HIGH_THRESHOLD,
+    BUYER_NAME_TRGM_THRESHOLD,
+)
 from app.logging_setup import get_logger
 from app.services import telegram
 from app.services.llm import LLMError
@@ -294,7 +298,10 @@ async def _send_informed_pending_prompt(
     detected = "\nI extracted an invoice for " + safe_text(buyer_name)
     if buyer_gstin:
         detected += " · GSTIN " + code(buyer_gstin)
-    hint = "\nReply with " + code('/assign "Client Name"') + "."
+    # R3 — drop the /assign slash-command syntax demand. Just reply with
+    # the name. The pre-supervisor pending-assignment matcher will
+    # resolve free-form text against the active client list.
+    hint = "\nJust reply with the client's name."
     sample = "\n".join("• " + safe_text(c.trade_name) for c in active[:10])
     extra = "" if len(active) <= 10 else f"\n{italic(f'+ {len(active) - 10} more')}"
     html = header + detected + hint + "\n" + sample + extra
@@ -372,6 +379,103 @@ async def _process_document_for_client(
             html_text=html,
             reply_to_message_id=reply_to_message_id,
         )
+
+
+async def _try_resolve_pending_from_text(
+    *,
+    session: Any,
+    firm: CaFirm,
+    chat_id: int,
+    reply_to_message_id: int | None,
+    text: str,
+) -> bool:
+    """R3 — agentic routing: free-form text resolves an open pending doc.
+
+    Triggered before the slash-command branch in the command pipeline.
+    Cascade:
+
+    * No open pending_assignment for this chat → ``False`` (caller falls
+      through to slash / supervisor as usual).
+    * Open pending + text fuzzy-matches exactly one client at HIGH
+      similarity (≥ :data:`BUYER_NAME_TRGM_HIGH_THRESHOLD`) → resolve
+      the pending row + fire the cached-extraction finalize. Returns
+      ``True``.
+    * Open pending + ambiguous (multiple candidates ≥ 0.55) → send a
+      tighter "did you mean A or B?" follow-up and return ``True`` so
+      the supervisor isn't invoked for a routing reply.
+    * Open pending + no match → ``False`` (the caller routes to the
+      supervisor, which still has tools to handle messy phrasings).
+
+    The caller has already done firm lookup and basic text validation.
+    """
+    pending_q = PendingAssignmentQuery(session=session, ca_firm_id=firm.id)
+    open_rows = list(await pending_q.list_open_for_chat(chat_id=chat_id))
+    if not open_rows:
+        return False
+    most_recent = open_rows[0]
+
+    clients_q = ClientQuery(session=session, ca_firm_id=firm.id)
+    ranked = await clients_q.search_by_name_ranked(
+        text, min_similarity=BUYER_NAME_TRGM_THRESHOLD, limit=3
+    )
+    if not ranked:
+        # No fuzzy match — let the supervisor try its luck with the LLM.
+        return False
+
+    top_client, top_sim = ranked[0]
+
+    # Single-candidate HIGH: deterministic resolve + cached-extraction finalise.
+    if (
+        top_sim >= BUYER_NAME_TRGM_HIGH_THRESHOLD
+        and (len(ranked) == 1 or (ranked[1][1] < top_sim - 0.05))
+    ):
+        resolved = await pending_q.resolve(
+            pending_id=most_recent.id, client_id=top_client.id
+        )
+        if resolved is None:
+            # Race / TTL: nothing to do, let supervisor handle it.
+            return False
+        await session.commit()
+        await telegram.send_message(
+            chat_id=chat_id,
+            html_text=(
+                bold("Routed to ")
+                + safe_text(top_client.trade_name)
+                + italic(f" (matched {int(top_sim * 100)}%)")
+            ),
+            reply_to_message_id=reply_to_message_id,
+        )
+        await _resume_pipeline_for_pending_assignment(
+            session=session,
+            firm=firm,
+            chat_id=chat_id,
+            pending_assignment_id=most_recent.id,
+        )
+        return True
+
+    # MEDIUM or multiple HIGH candidates → ask informally, no syntax demanded.
+    candidates_html = "\n".join(
+        "• "
+        + safe_text(c.trade_name)
+        + italic(f" ({int(sim * 100)}% match)")
+        for c, sim in ranked[:3]
+    )
+    body = (
+        bold("Did you mean one of these?")
+        + "\n"
+        + candidates_html
+        + "\n"
+        + italic("Reply with the exact name and I'll route it there.")
+    )
+    try:
+        await telegram.send_message(
+            chat_id=chat_id,
+            html_text=body,
+            reply_to_message_id=reply_to_message_id,
+        )
+    except telegram.TelegramAPIError as exc:
+        _log.error("pending_disambiguation_send_failed", error=str(exc))
+    return True
 
 
 async def _resume_pipeline_for_pending_assignment(
@@ -484,9 +588,8 @@ async def _send_pending_assignment_prompt(
     extra = "" if len(active) <= 10 else f"\n{italic(f'+ {len(active) - 10} more')}"
     html = (
         bold("Which client is this document for?")
-        + "\nReply with "
-        + code('/assign "Client Name"')
-        + ".\n"
+        + "\nJust reply with the client's name."
+        + "\n"
         + sample
         + extra
     )
@@ -620,6 +723,31 @@ async def _run_command_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PLR
                 "and then tap the link from your dashboard.",
             )
             return
+
+        # ---- 0c. Agentic routing reply (R3) ------------------------------
+        # If there's an open pending_assignment waiting in this chat and
+        # the user's text fuzzy-matches a client, resolve it directly —
+        # NO /assign syntax required. This is the "Cursor for accounting"
+        # move: the bot infers intent from context instead of demanding
+        # a command.
+        #
+        # Skip slash commands and reserved verbs so power-users can still
+        # type "/assign", "/status", "ENMA APPROVE FILING ..." even when
+        # a pending doc is open.
+        if (
+            not is_slash_command(text)
+            and not APPROVAL_REGEX.fullmatch(text)
+            and not _CONFIRM_REGEX.fullmatch(text)
+        ):
+            handled = await _try_resolve_pending_from_text(
+                session=session,
+                firm=firm,
+                chat_id=envelope.chat_id,
+                reply_to_message_id=envelope.message_id,
+                text=text,
+            )
+            if handled:
+                return
 
         # ---- 1. Filing approval ------------------------------------------
         if APPROVAL_REGEX.fullmatch(text):
