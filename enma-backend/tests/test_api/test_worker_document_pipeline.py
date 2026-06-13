@@ -258,6 +258,140 @@ async def test_missing_file_id_sends_error(monkeypatch: pytest.MonkeyPatch) -> N
     assert "Could not find a file" in captures["sends"][0]["html_text"]
 
 
+# ---------------------------------------------------------------------------
+# Refactor B — resume pipeline after /assign
+# ---------------------------------------------------------------------------
+
+
+class _FakePendingRow:
+    """In-memory stand-in for a resolved pending_assignments row."""
+
+    def __init__(
+        self,
+        *,
+        file_ids: list[str],
+        message_id: int | None,
+        resolved_client_id: uuid.UUID,
+    ) -> None:
+        self.file_ids = file_ids
+        self.message_id = message_id
+        self.resolved_client_id = resolved_client_id
+
+
+@pytest.mark.asyncio
+async def test_resume_after_assign_fires_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Refactor B regression: ``/assign`` → resume pipeline → summary sent.
+
+    Reproduces the screenshot bug from prod: previously, ``/assign`` resolved
+    the pending_assignment row but never ran ``run_pipeline``, leaving the
+    queued document orphaned. Now the helper must fire extraction for every
+    file_id in the row and reply-to the ORIGINAL document message_id.
+    """
+    captures = _patch_common(monkeypatch, firm=_FakeFirm(), client=_FakeClient())
+
+    fake_row = _FakePendingRow(
+        file_ids=["tg-file-7", "tg-file-8"],
+        message_id=42,  # the original upload's message_id
+        resolved_client_id=uuid.uuid4(),
+    )
+
+    class _FakePendingQuery:
+        def __init__(self, **_kw: Any) -> None: ...
+
+        def _scoped_select(self, _model: Any) -> Any:  # noqa: ANN401
+            class _Stmt:
+                def where(self, *_a: Any, **_kw: Any) -> _Stmt:
+                    return self
+
+            return _Stmt()
+
+    monkeypatch.setattr(worker_module, "PendingAssignmentQuery", _FakePendingQuery)
+
+    # Patch the AsyncSession.execute call to return our fake row.
+    class _FakeResult:
+        def scalar_one_or_none(self) -> Any:  # noqa: ANN401
+            return fake_row
+
+    async def fake_execute(_stmt: Any) -> _FakeResult:  # noqa: ANN401
+        return _FakeResult()
+
+    # The session is a _FakeSession instance; attach execute() to it.
+    original_factory = worker_module.get_sessionmaker
+
+    @asynccontextmanager
+    async def session_with_execute():
+        s = _FakeSession()
+        s.execute = fake_execute  # type: ignore[attr-defined]
+        yield s
+
+    def factory_returning_executable():
+        return session_with_execute
+
+    monkeypatch.setattr(worker_module, "get_sessionmaker", factory_returning_executable)
+
+    pending_id = uuid.uuid4()
+    async with session_with_execute() as session:
+        await worker_module._resume_pipeline_for_pending_assignment(
+            session=session,
+            firm=_FakeFirm(),
+            chat_id=999,
+            pending_assignment_id=pending_id,
+        )
+
+    # Both queued files were downloaded.
+    assert captures["downloads"] == ["tg-file-7", "tg-file-8"]
+    # Pipeline ran for each.
+    assert len(captures["pipeline_calls"]) == 2
+    # Two summaries sent, each threaded onto the ORIGINAL message_id (42),
+    # not the /assign reply.
+    assert len(captures["sends"]) == 2
+    for send in captures["sends"]:
+        assert send["chat_id"] == 999
+        assert send["reply_to_message_id"] == 42
+        assert "Document processed" in send["html_text"]
+
+    # Restore so subsequent tests aren't poisoned.
+    monkeypatch.setattr(worker_module, "get_sessionmaker", original_factory)
+
+
+@pytest.mark.asyncio
+async def test_resume_with_missing_row_logs_and_returns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If the pending row was already deleted, resume is a no-op (no crash)."""
+    captures = _patch_common(monkeypatch, firm=_FakeFirm(), client=_FakeClient())
+
+    class _FakePendingQuery:
+        def __init__(self, **_kw: Any) -> None: ...
+
+        def _scoped_select(self, _model: Any) -> Any:  # noqa: ANN401
+            class _Stmt:
+                def where(self, *_a: Any, **_kw: Any) -> _Stmt:
+                    return self
+
+            return _Stmt()
+
+    monkeypatch.setattr(worker_module, "PendingAssignmentQuery", _FakePendingQuery)
+
+    class _FakeResult:
+        def scalar_one_or_none(self) -> Any:  # noqa: ANN401
+            return None
+
+    async def fake_execute(_stmt: Any) -> _FakeResult:  # noqa: ANN401
+        return _FakeResult()
+
+    session = _FakeSession()
+    session.execute = fake_execute  # type: ignore[attr-defined]
+    await worker_module._resume_pipeline_for_pending_assignment(
+        session=session,
+        firm=_FakeFirm(),
+        chat_id=999,
+        pending_assignment_id=uuid.uuid4(),
+    )
+    # No pipeline ran, no message sent — pure no-op on missing/already-gone row.
+    assert captures["downloads"] == []
+    assert captures["pipeline_calls"] == []
+    assert captures["sends"] == []
+
+
 @pytest.mark.asyncio
 async def test_download_failure_sends_error(monkeypatch: pytest.MonkeyPatch) -> None:
     captures = _patch_common(monkeypatch, firm=_FakeFirm(), client=_FakeClient())
@@ -283,7 +417,10 @@ async def test_pipeline_error_sends_error(monkeypatch: pytest.MonkeyPatch) -> No
     assert captures["pipeline_calls"]  # was attempted
     # Single error message sent (no summary).
     assert len(captures["sends"]) == 1
-    assert "Document processing failed" in captures["sends"][0]["html_text"]
+    # Refactor B: pipeline errors now surface as a warm one-liner —
+    # the raw exception text never reaches the user. The underlying
+    # cause is logged + captured to Sentry by the LLM / embedding services.
+    assert "extract this document" in captures["sends"][0]["html_text"]
 
 
 @pytest.mark.asyncio

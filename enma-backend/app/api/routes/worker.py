@@ -30,6 +30,7 @@ parts of the codebase.
 from __future__ import annotations
 
 import re
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, status
@@ -56,9 +57,12 @@ from app.agents.pipeline import PipelineError, run_pipeline
 from app.agents.supervisor import SupervisorContext, run_supervisor
 from app.api.middleware.envelope_verify import DecodedEnvelope, VerifiedEnvelopeDep
 from app.api.middleware.idempotency import IdempotencyDep, IdempotencyVerdict
+from app.db.models.client import Client
+from app.db.models.firm import CaFirm
 from app.db.queries.clients import ClientQuery
 from app.db.queries.conversations import RECENT_WINDOW_TURNS, ConversationQuery
 from app.db.queries.firms import find_firm_by_admin_chat_id
+from app.db.queries.pending_assignments import PendingAssignmentQuery
 from app.db.session import get_sessionmaker
 from app.formatting.pipeline_summary import render_pipeline_summary
 from app.formatting.telegram_html import bold, code, italic, safe_text
@@ -135,7 +139,7 @@ async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PL
             )
             return
 
-        assert outcome.client_id is not None  # — narrowed by is_resolved
+        assert outcome.client_id is not None  # noqa: S101 — narrowed by is_resolved
 
         clients = ClientQuery(session=session, ca_firm_id=firm.id)
         client = await clients.get_by_id(outcome.client_id)
@@ -146,15 +150,54 @@ async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PL
             )
             return
 
-        # Download file bytes from Telegram.
+        await _process_document_for_client(
+            session=session,
+            firm=firm,
+            client=client,
+            file_ids=[file_id],
+            chat_id=envelope.chat_id,
+            reply_to_message_id=envelope.message_id,
+        )
+
+
+async def _process_document_for_client(
+    *,
+    session: Any,
+    firm: CaFirm,
+    client: Client,
+    file_ids: list[str],
+    chat_id: int,
+    reply_to_message_id: int | None,
+) -> None:
+    """Run the extraction pipeline for each file_id and reply with the summary.
+
+    Shared by two call sites:
+
+    * :func:`_run_document_pipeline` — the natural path, fired right after
+      identity resolution succeeds.
+    * :func:`_resume_pipeline_for_pending_assignment` — the recovery path,
+      fired after ``/assign`` (or a natural-language assignment via the
+      supervisor) resolves an open pending_assignment that was created
+      because identity stage 5 (EXPLICIT_ASK) had fired.
+
+    Errors are reported to the user as warm one-liners; the underlying
+    cause is logged + captured to Sentry via the LLM/embedding services.
+    """
+    for file_id in file_ids:
         try:
             file_bytes = await telegram.download_file(file_id)
         except telegram.TelegramAPIError as exc:
-            _log.error("document_pipeline_download_failed", error=str(exc))
-            await _send_user_error(envelope.chat_id, "Could not download the file from Telegram.")
-            return
+            _log.error(
+                "document_pipeline_download_failed",
+                error=str(exc),
+                file_id=file_id,
+            )
+            await _send_user_error(
+                chat_id,
+                "I couldn't download that file from Telegram. Could you try again?",
+            )
+            continue
 
-        # Run the pipeline.
         try:
             result = await run_pipeline(
                 session=session,
@@ -164,19 +207,85 @@ async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PL
                 source_file_ids=[file_id],
             )
         except PipelineError as exc:
-            _log.error("document_pipeline_failed", error=str(exc))
-            await _send_user_error(
-                envelope.chat_id,
-                f"Document processing failed: {exc}",
+            _log.error(
+                "document_pipeline_failed",
+                error=str(exc),
+                file_id=file_id,
             )
-            return
+            await _send_user_error(
+                chat_id,
+                "I couldn't extract this document. Our team has been notified.",
+            )
+            continue
 
-    # Pipeline returned; send the HTML summary.
-    html = render_pipeline_summary(result)
-    await telegram.send_message(
-        chat_id=envelope.chat_id,
-        html_text=html,
-        reply_to_message_id=envelope.message_id,
+        html = render_pipeline_summary(result)
+        await telegram.send_message(
+            chat_id=chat_id,
+            html_text=html,
+            reply_to_message_id=reply_to_message_id,
+        )
+
+
+async def _resume_pipeline_for_pending_assignment(
+    *,
+    session: Any,
+    firm: CaFirm,
+    chat_id: int,
+    pending_assignment_id: uuid.UUID,
+) -> None:
+    """Fire the extraction pipeline for a freshly-resolved pending assignment.
+
+    Called from the command pipeline after ``/assign`` succeeds (and from
+    the equivalent supervisor tool when natural language resolves the
+    assignment). Pulls the resolved row to read its ``file_ids`` and
+    ``message_id``, then defers to :func:`_process_document_for_client`.
+
+    The row's ``resolved_client_id`` is authoritative — the supervisor /
+    command layer just set it, so this never gets to pick a client.
+    """
+    pending_q = PendingAssignmentQuery(session=session, ca_firm_id=firm.id)
+    # We can't use ``get_open_by_id`` here because the row was just resolved.
+    # Re-query by id directly so we can read file_ids + the original message_id.
+    from sqlalchemy import select
+
+    from app.db.models.pending_assignment import PendingAssignment
+
+    stmt = pending_q._scoped_select(PendingAssignment).where(  # noqa: SLF001
+        PendingAssignment.id == pending_assignment_id
+    )
+    row = (await session.execute(stmt)).scalar_one_or_none()
+    if row is None or row.resolved_client_id is None:
+        _log.warning(
+            "pending_assignment_missing_or_unresolved",
+            pending_assignment_id=str(pending_assignment_id),
+        )
+        return
+
+    clients = ClientQuery(session=session, ca_firm_id=firm.id)
+    client = await clients.get_by_id(row.resolved_client_id)
+    if client is None:
+        await _send_user_error(
+            chat_id,
+            "I couldn't find the routed client. Please re-upload the document.",
+        )
+        return
+
+    file_ids = [str(fid) for fid in (row.file_ids or []) if fid]
+    if not file_ids:
+        _log.warning(
+            "pending_assignment_no_file_ids",
+            pending_assignment_id=str(pending_assignment_id),
+        )
+        return
+
+    # Reply-to-message threads off the ORIGINAL document, not the /assign reply.
+    await _process_document_for_client(
+        session=session,
+        firm=firm,
+        client=client,
+        file_ids=file_ids,
+        chat_id=chat_id,
+        reply_to_message_id=row.message_id,
     )
 
 
@@ -382,6 +491,16 @@ async def _run_command_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PLR
                 html_text=result.html,
                 reply_to_message_id=envelope.message_id,
             )
+            # If /assign just resolved a pending document, fire the
+            # extraction pipeline against the queued file_ids so the user
+            # gets the actual extracted summary, not just "Assigned — ...".
+            if result.success and result.pending_assignment_resolved is not None:
+                await _resume_pipeline_for_pending_assignment(
+                    session=session,
+                    firm=firm,
+                    chat_id=envelope.chat_id,
+                    pending_assignment_id=result.pending_assignment_resolved,
+                )
             return
 
         # ---- 4. Supervisor (free-form) -----------------------------------

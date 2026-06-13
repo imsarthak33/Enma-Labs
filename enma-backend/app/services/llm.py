@@ -255,6 +255,13 @@ async def call_chat(
     if extra_body:
         body.update(extra_body)
 
+    # NIM compatibility: meta/llama-3.* on NVIDIA NIM rejects responses that
+    # emit multiple tool_calls per assistant turn with HTTP 400
+    # "This model only supports single tool-calls at once". Force serial
+    # tool calling whenever the caller passes tools=[...] and didn't override.
+    if "tools" in body and "parallel_tool_calls" not in body:
+        body["parallel_tool_calls"] = False
+
     http = client or get_client()
     headers = {"Content-Type": "application/json", **_auth_header()}
 
@@ -301,6 +308,39 @@ async def call_chat(
             await asyncio.sleep(sleep_s)
             backoff = min(backoff * 2, _LLM_MAX_BACKOFF_S)
             continue
+
+        # NIM self-correction: if the request used tools and the endpoint still
+        # rejects parallel calls (parallel_tool_calls=False ignored, or the
+        # model emitted parallel calls anyway), retry once forcing
+        # tool_choice="none" so the model answers directly. Greetings and
+        # general chat naturally don't need tools; this turns an LLMError into
+        # a warm textual reply, which is what the conversational UX wants.
+        if (
+            resp.status_code == httpx.codes.BAD_REQUEST
+            and "tools" in body
+            and body.get("tool_choice") != "none"
+            and "single tool-calls" in resp.text
+        ):
+            _log.warning(
+                "llm_parallel_tools_rejected_retrying_without_tools",
+                role=role.value,
+                model=model,
+                status=resp.status_code,
+            )
+            retry_body = {**body, "tool_choice": "none"}
+            retry_body.pop("parallel_tool_calls", None)
+            try:
+                resp = await http.post(endpoint, json=retry_body, headers=headers)
+            except httpx.HTTPError as exc:
+                _log.error(
+                    "llm_request_failed",
+                    role=role.value,
+                    model=model,
+                    error=str(exc),
+                    attempt="tool_fallback",
+                )
+                sentry_sdk.capture_exception(exc)
+                raise LLMError(f"LLM request failed: {exc}") from exc
 
         if resp.status_code != httpx.codes.OK:
             _log.error(

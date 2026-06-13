@@ -227,3 +227,138 @@ class TestClientLifecycle:
         b = llm.get_client()
         assert a is b
         await llm.close_client()
+
+
+class TestParallelToolCallsCompat:
+    """Regression guard for refactor task A — NIM Llama parallel-tool-call fix.
+
+    The bug: ``meta/llama-3.3-70b-instruct`` on NVIDIA NIM rejects responses
+    that emit multiple ``tool_calls`` in one assistant turn with HTTP 400
+    ``"This model only supports single tool-calls at once!"``. That error
+    was breaking every supervisor call, including casual chat that didn't
+    need tools at all. See ``app/services/llm.py:call_chat``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_parallel_tool_calls_defaults_to_false_when_tools_present(self) -> None:
+        captured: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(json.loads(request.content.decode()))
+            return httpx.Response(httpx.codes.OK, json=_chat_response())
+
+        async with _client(handler) as ac:
+            await call_chat(
+                LLMRole.REASONING,
+                messages=[{"role": "user", "content": "hi"}],
+                extra_body={"tools": [{"type": "function", "function": {"name": "x"}}]},
+                client=ac,
+            )
+
+        assert captured[0]["parallel_tool_calls"] is False
+
+    @pytest.mark.asyncio
+    async def test_no_parallel_tool_calls_when_no_tools(self) -> None:
+        captured: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(json.loads(request.content.decode()))
+            return httpx.Response(httpx.codes.OK, json=_chat_response())
+
+        async with _client(handler) as ac:
+            await call_chat(
+                LLMRole.REASONING,
+                messages=[{"role": "user", "content": "hi"}],
+                client=ac,
+            )
+
+        assert "parallel_tool_calls" not in captured[0]
+
+    @pytest.mark.asyncio
+    async def test_caller_override_wins(self) -> None:
+        captured: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(json.loads(request.content.decode()))
+            return httpx.Response(httpx.codes.OK, json=_chat_response())
+
+        async with _client(handler) as ac:
+            await call_chat(
+                LLMRole.REASONING,
+                messages=[{"role": "user", "content": "hi"}],
+                extra_body={
+                    "tools": [{"type": "function", "function": {"name": "x"}}],
+                    "parallel_tool_calls": True,  # explicit caller intent
+                },
+                client=ac,
+            )
+
+        assert captured[0]["parallel_tool_calls"] is True
+
+    @pytest.mark.asyncio
+    async def test_400_single_tool_calls_retries_with_tool_choice_none(self) -> None:
+        """The canonical NIM 400 triggers a one-shot retry with tool_choice=none.
+
+        This is the graceful path for casual chat: the model answers as plain
+        text instead of demanding a database tool. No LLMError surfaces.
+        """
+        captured: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode())
+            captured.append(body)
+            if body.get("tool_choice") == "none":
+                return httpx.Response(
+                    httpx.codes.OK,
+                    json=_chat_response(content="Hi! How can I help today?"),
+                )
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": (
+                            "This model only supports single tool-calls at once! "
+                            "This model only supports single tool-calls at once!"
+                        ),
+                        "type": "BadRequestError",
+                        "code": 400,
+                    }
+                },
+            )
+
+        async with _client(handler) as ac:
+            resp = await call_chat(
+                LLMRole.REASONING,
+                messages=[{"role": "user", "content": "hi"}],
+                extra_body={
+                    "tools": [{"type": "function", "function": {"name": "x"}}],
+                    "tool_choice": "auto",
+                },
+                client=ac,
+            )
+
+        assert resp.content == "Hi! How can I help today?"
+        assert len(captured) == 2
+        assert captured[0]["tool_choice"] == "auto"
+        assert captured[0]["parallel_tool_calls"] is False
+        assert captured[1]["tool_choice"] == "none"
+        # parallel_tool_calls must be dropped for the retry to avoid double-fail.
+        assert "parallel_tool_calls" not in captured[1]
+
+    @pytest.mark.asyncio
+    async def test_unrelated_400_still_raises(self) -> None:
+        """Generic 400s (bad request body, invalid model) must still error out."""
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                400,
+                json={"error": {"message": "invalid model name"}},
+            )
+
+        async with _client(handler) as ac:
+            with pytest.raises(LLMError, match="HTTP 400"):
+                await call_chat(
+                    LLMRole.REASONING,
+                    messages=[{"role": "user", "content": "hi"}],
+                    extra_body={"tools": [{"type": "function", "function": {"name": "x"}}]},
+                    client=ac,
+                )
