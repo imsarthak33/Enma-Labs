@@ -185,6 +185,32 @@ def _patch_common(
         return pipeline_result or _clean_result()
 
     monkeypatch.setattr(worker_module, "run_pipeline", fake_pipeline)
+
+    # R2 — the worker now calls extract_only + finalize_document directly
+    # instead of running the entire run_pipeline at once. Patch both for
+    # tests that drive _run_document_pipeline through the new code path.
+    from app.agents.pipeline import ExtractionOutcome
+
+    async def fake_extract_only(_file_bytes: bytes) -> ExtractionOutcome:
+        if pipeline_raise is not None and isinstance(pipeline_raise, PipelineError):
+            raise pipeline_raise
+        clean = _clean_result()
+        return ExtractionOutcome(
+            document_type=clean.document_type,
+            extraction=clean.extraction,
+            verification=clean.verification,
+            stages=clean.stages,
+        )
+
+    monkeypatch.setattr(worker_module, "extract_only", fake_extract_only)
+
+    async def fake_finalize(**kwargs: Any) -> PipelineResult:
+        captures["pipeline_calls"].append(kwargs)
+        if pipeline_raise is not None and not isinstance(pipeline_raise, PipelineError):
+            raise pipeline_raise
+        return pipeline_result or _clean_result()
+
+    monkeypatch.setattr(worker_module, "finalize_document", fake_finalize)
     return captures
 
 
@@ -199,6 +225,11 @@ class _FakeFirm:
 
 class _FakeClient:
     id = uuid.uuid4()
+    trade_name = "FakeClient Pvt Ltd"
+    legal_name: str | None = None
+    gstin = "27AABCU9603R1ZN"
+    is_active = True
+    gst_tds_deductor = False
 
 
 @pytest.mark.asyncio
@@ -272,10 +303,14 @@ class _FakePendingRow:
         file_ids: list[str],
         message_id: int | None,
         resolved_client_id: uuid.UUID,
+        extraction: dict[str, Any] | None = None,
+        extraction_document_type: str | None = None,
     ) -> None:
         self.file_ids = file_ids
         self.message_id = message_id
         self.resolved_client_id = resolved_client_id
+        self.extraction = extraction
+        self.extraction_document_type = extraction_document_type
 
 
 @pytest.mark.asyncio
@@ -414,13 +449,12 @@ async def test_pipeline_error_sends_error(monkeypatch: pytest.MonkeyPatch) -> No
         pipeline_raise=PipelineError("file processing failed"),
     )
     await worker_module._run_document_pipeline(_envelope())
-    assert captures["pipeline_calls"]  # was attempted
-    # Single error message sent (no summary).
+    # R2: extract_only now runs BEFORE identity resolution. A PipelineError
+    # raised by the extraction half surfaces as a "couldn't read" warm
+    # error and the routing/persistence half never runs — so pipeline_calls
+    # (which records finalize_document calls) is empty by design.
     assert len(captures["sends"]) == 1
-    # Refactor B: pipeline errors now surface as a warm one-liner —
-    # the raw exception text never reaches the user. The underlying
-    # cause is logged + captured to Sentry by the LLM / embedding services.
-    assert "extract this document" in captures["sends"][0]["html_text"]
+    assert "read this document" in captures["sends"][0]["html_text"]
 
 
 @pytest.mark.asyncio
@@ -441,3 +475,108 @@ async def test_no_chat_id_short_circuits(monkeypatch: pytest.MonkeyPatch) -> Non
     assert captures["downloads"] == []
     assert captures["pipeline_calls"] == []
     assert captures["sends"] == []
+
+
+# ---------------------------------------------------------------------------
+# Refactor R2 — extract-first autonomous routing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_r2_pending_assignment_prompt_includes_extracted_buyer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2: the ambiguity prompt must show extracted buyer name + GSTIN.
+
+    Previously the prompt just said "Which client?" with no context.
+    R2's extract-first flow has the buyer details in hand by the time
+    we prompt, so the CA can confirm at a glance.
+    """
+    captures = _patch_common(
+        monkeypatch,
+        firm=_FakeFirm(),
+        client=_FakeClient(),
+        pending_assignment=True,
+    )
+    await worker_module._run_document_pipeline(_envelope())
+    # No pipeline persist call — the doc went to EXPLICIT_ASK.
+    assert captures["pipeline_calls"] == []
+    # One send: the informed prompt.
+    assert len(captures["sends"]) == 1
+    html = captures["sends"][0]["html_text"]
+    # The stub's _clean_result() carries buyer name 'B' and a 27... GSTIN.
+    assert "Which client" in html
+    # Extracted buyer GSTIN surfaces verbatim in the prompt body.
+    assert "27AABCU9603R1ZN" in html
+
+
+@pytest.mark.asyncio
+async def test_r2_resume_uses_cached_extraction_no_reextract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2: /assign on a pending row with cached extraction must skip OCR.
+
+    The pending_assignments.extraction column carries the extract_only
+    output. The resume helper reconstructs an ExtractionOutcome from it
+    and calls finalize_document directly — telegram.download_file is
+    NEVER invoked, and the LLM is NEVER hit a second time.
+    """
+    captures = _patch_common(monkeypatch, firm=_FakeFirm(), client=_FakeClient())
+
+    cached_extraction = {
+        "vendor": {"name": "V", "gstin": "29AAAGU0010P1Z5"},
+        "buyer": {"name": "B", "gstin": "27AABCU9603R1ZN"},
+        "totals": {"grand_total": "1180.00"},
+        "line_items": [{}],
+    }
+    fake_row = _FakePendingRow(
+        file_ids=["tg-file-cached"],
+        message_id=42,
+        resolved_client_id=uuid.uuid4(),
+        extraction=cached_extraction,
+        extraction_document_type="B2B_INVOICE",
+    )
+
+    class _FakePendingQuery:
+        def __init__(self, **_kw: Any) -> None: ...
+
+        def _scoped_select(self, _model: Any) -> Any:  # noqa: ANN401
+            class _Stmt:
+                def where(self, *_a: Any, **_kw: Any) -> _Stmt:
+                    return self
+
+            return _Stmt()
+
+    monkeypatch.setattr(worker_module, "PendingAssignmentQuery", _FakePendingQuery)
+
+    class _FakeResult:
+        def scalar_one_or_none(self) -> Any:  # noqa: ANN401
+            return fake_row
+
+    async def fake_execute(_stmt: Any) -> _FakeResult:  # noqa: ANN401
+        return _FakeResult()
+
+    @asynccontextmanager
+    async def session_with_execute():
+        s = _FakeSession()
+        s.execute = fake_execute  # type: ignore[attr-defined]
+        yield s
+
+    async with session_with_execute() as session:
+        await worker_module._resume_pipeline_for_pending_assignment(
+            session=session,
+            firm=_FakeFirm(),
+            chat_id=999,
+            pending_assignment_id=uuid.uuid4(),
+        )
+
+    # Crucial: zero downloads, zero extract_only calls. finalize_document
+    # ran exactly once with the cached extraction.
+    assert captures["downloads"] == []
+    assert len(captures["pipeline_calls"]) == 1
+    finalize_kwargs = captures["pipeline_calls"][0]
+    assert finalize_kwargs["outcome"].extraction == cached_extraction
+    assert finalize_kwargs["outcome"].document_type == "B2B_INVOICE"
+    # One summary sent, threaded onto the original document message_id.
+    assert len(captures["sends"]) == 1
+    assert captures["sends"][0]["reply_to_message_id"] == 42

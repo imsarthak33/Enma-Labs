@@ -16,7 +16,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Final, cast
+from typing import Any, Final, cast
 
 from sqlalchemy import update
 
@@ -41,8 +41,16 @@ class PendingAssignmentQuery(BaseQuery):
         candidate_client_ids: Sequence[uuid.UUID] | None = None,
         message_id: int | None = None,
         ttl_seconds: int = PENDING_ASSIGNMENT_TTL_SECONDS,
+        extraction: dict[str, Any] | None = None,
+        extraction_document_type: str | None = None,
     ) -> PendingAssignment:
-        """Insert a new pending-assignment row for this firm."""
+        """Insert a new pending-assignment row for this firm.
+
+        R2 — ``extraction`` and ``extraction_document_type`` cache the
+        :func:`app.agents.pipeline.extract_only` output so a confirmation
+        callback can call :func:`finalize_document` directly. Leave both
+        ``None`` for legacy paths that haven't extracted yet.
+        """
         now = datetime.now(UTC)
         candidate_ids: list[str] = [
             str(cid) for cid in (candidate_client_ids or ())
@@ -53,6 +61,8 @@ class PendingAssignmentQuery(BaseQuery):
             file_ids=list(file_ids),
             candidate_client_ids=candidate_ids,
             expires_at=now + timedelta(seconds=ttl_seconds),
+            extraction=extraction,
+            extraction_document_type=extraction_document_type,
         )
         return cast(PendingAssignment, await self._insert(row))
 

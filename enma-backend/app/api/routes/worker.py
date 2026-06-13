@@ -53,7 +53,13 @@ from app.agents.filing_approval import (
     finalize_approval,
     parse_approval_intent,
 )
-from app.agents.pipeline import PipelineError, run_pipeline
+from app.agents.pipeline import (
+    ExtractionOutcome,
+    PipelineError,
+    extract_only,
+    finalize_document,
+    run_pipeline,
+)
 from app.agents.supervisor import SupervisorContext, run_supervisor
 from app.api.middleware.envelope_verify import DecodedEnvelope, VerifiedEnvelopeDep
 from app.api.middleware.idempotency import IdempotencyDep, IdempotencyVerdict
@@ -82,16 +88,21 @@ _log = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
-async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PLR0911
-    """Background task for a single document envelope.
+async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PLR0911, PLR0912
+    """Background task for a single document envelope (R2 — extract-first).
 
-    Steps (Phase 6):
+    The autonomous-routing flow:
+
       1. Resolve firm by ``chat_id``.
-      2. Run the 5-stage identity cascade. If stage 5 fires, queue a
-         pending_assignment and ask the CA via Telegram.
-      3. Download the file from Telegram.
-      4. Run the extraction pipeline.
-      5. Send an HTML summary back to the user.
+      2. Download the file from Telegram.
+      3. Run ``extract_only`` — get the scout's view of the invoice
+         (buyer/vendor GSTINs, names, totals, document type).
+      4. Hand the extraction to ``resolve_identity`` which now routes
+         on extracted buyer fields first.
+      5a. If routed → call ``finalize_document`` and reply with summary.
+      5b. If ambiguous → cache the extraction on the pending_assignments
+          row (already done by the resolver) and send an informed
+          "which client?" prompt that shows the extracted buyer details.
 
     Any handled failure ends with an HTML "couldn't process" message so
     the user sees feedback even on the unhappy path.
@@ -118,24 +129,53 @@ async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PL
             )
             return
 
+        # ---- Step 2: download the file ----------------------------------
+        try:
+            file_bytes = await telegram.download_file(file_id)
+        except telegram.TelegramAPIError as exc:
+            _log.error("document_pipeline_download_failed", error=str(exc))
+            await _send_user_error(
+                envelope.chat_id,
+                "I couldn't download that file from Telegram. Could you try again?",
+            )
+            return
+
+        # ---- Step 3: extract (no client_id needed yet) ------------------
+        try:
+            extraction_outcome = await extract_only(file_bytes)
+        except PipelineError as exc:
+            _log.error("document_extract_failed", error=str(exc), file_id=file_id)
+            await _send_user_error(
+                envelope.chat_id,
+                "I couldn't read this document. Could you re-upload a clearer copy?",
+            )
+            return
+
+        # ---- Step 4: route on extracted buyer fields --------------------
+        extraction_data = extraction_outcome.extraction
+        extracted_vendor_gstin = _safe_str(extraction_data, "vendor", "gstin")
         outcome = await resolve_identity(
             session=session,
             ca_firm_id=firm.id,
             chat_id=envelope.chat_id,
             caption=caption,
             extracted_text=None,
-            extracted_vendor_gstin=None,
+            extracted_vendor_gstin=extracted_vendor_gstin,
             file_ids=[file_id],
             message_id=envelope.message_id,
+            extraction=extraction_data,
+            extraction_document_type=extraction_outcome.document_type,
         )
 
+        # ---- Step 5b: ambiguous → informed prompt -----------------------
         if not outcome.is_resolved:
             await session.commit()
-            await _send_pending_assignment_prompt(
+            await _send_informed_pending_prompt(
                 session=session,
                 ca_firm_id=firm.id,
                 chat_id=envelope.chat_id,
                 reply_to_message_id=envelope.message_id,
+                extraction=extraction_data,
             )
             return
 
@@ -150,14 +190,122 @@ async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PL
             )
             return
 
-        await _process_document_for_client(
+        # ---- Step 5a: routed → finalise without re-extracting -----------
+        await _finalize_and_summarise(
             session=session,
             firm=firm,
             client=client,
+            outcome=extraction_outcome,
             file_ids=[file_id],
             chat_id=envelope.chat_id,
             reply_to_message_id=envelope.message_id,
         )
+
+
+def _safe_str(payload: Any, *keys: str) -> str | None:
+    """Walk a nested dict by ``keys`` and return the leaf if it's a non-empty str.
+
+    Used for picking GSTIN / name fields out of the extractor JSON without
+    sprinkling ``isinstance`` checks across every call site.
+    """
+    cursor: Any = payload
+    for key in keys:
+        if not isinstance(cursor, dict):
+            return None
+        cursor = cursor.get(key)
+    if isinstance(cursor, str) and cursor.strip():
+        return cursor.strip()
+    return None
+
+
+async def _finalize_and_summarise(
+    *,
+    session: Any,
+    firm: CaFirm,
+    client: Client,
+    outcome: ExtractionOutcome,
+    file_ids: list[str],
+    chat_id: int,
+    reply_to_message_id: int | None,
+) -> None:
+    """R2 — Persist + send the HTML summary using a cached ExtractionOutcome.
+
+    Single helper shared by:
+
+    * :func:`_run_document_pipeline` (initial extract-first call).
+    * :func:`_resume_pipeline_for_pending_assignment` when the pending row
+      carries a cached extraction (``/assign`` or inline-button confirmation
+      after EXPLICIT_ASK).
+
+    No re-OCR — the extractor only ever runs once per upload.
+    """
+    try:
+        result = await finalize_document(
+            session=session,
+            ca_firm_id=firm.id,
+            client_id=client.id,
+            outcome=outcome,
+            source_file_ids=file_ids,
+        )
+    except PipelineError as exc:
+        _log.error("document_finalize_failed", error=str(exc))
+        await _send_user_error(
+            chat_id,
+            "I couldn't save this document. Our team has been notified.",
+        )
+        return
+
+    html = render_pipeline_summary(result)
+    await telegram.send_message(
+        chat_id=chat_id,
+        html_text=html,
+        reply_to_message_id=reply_to_message_id,
+    )
+
+
+async def _send_informed_pending_prompt(
+    *,
+    session: Any,
+    ca_firm_id: Any,
+    chat_id: int,
+    reply_to_message_id: int | None,
+    extraction: dict[str, Any] | None,
+) -> None:
+    """R2 — ambiguity prompt that shows the extracted buyer details.
+
+    Previously the prompt just said "Which client is this document for?"
+    with no extracted context. Now it shows the buyer's name and GSTIN
+    from the extractor so the CA can confirm at a glance instead of
+    re-reading the PDF.
+    """
+    clients = ClientQuery(session=session, ca_firm_id=ca_firm_id)
+    active = list(await clients.list_active())
+    if not active:
+        await _send_user_error(
+            chat_id,
+            "Your firm has no active clients yet. "
+            "Add a client with /add_client before uploading documents.",
+        )
+        return
+
+    buyer_name = _safe_str(extraction, "buyer", "name") or "the buyer"
+    buyer_gstin = _safe_str(extraction, "buyer", "gstin")
+    header = bold("Which client is this document for?")
+    detected = "\nI extracted an invoice for " + safe_text(buyer_name)
+    if buyer_gstin:
+        detected += " · GSTIN " + code(buyer_gstin)
+    hint = "\nReply with " + code('/assign "Client Name"') + "."
+    sample = "\n".join("• " + safe_text(c.trade_name) for c in active[:10])
+    extra = "" if len(active) <= 10 else f"\n{italic(f'+ {len(active) - 10} more')}"
+    html = header + detected + hint + "\n" + sample + extra
+    try:
+        await telegram.send_message(
+            chat_id=chat_id,
+            html_text=html,
+            reply_to_message_id=reply_to_message_id,
+        )
+    except telegram.TelegramAPIError as exc:
+        _log.error("pending_prompt_send_failed", error=str(exc))
 
 
 async def _process_document_for_client(
@@ -278,7 +426,33 @@ async def _resume_pipeline_for_pending_assignment(
         )
         return
 
-    # Reply-to-message threads off the ORIGINAL document, not the /assign reply.
+    # R2 — cached-extraction fast path. The pending row carries the
+    # extract_only output from the upload that triggered the prompt, so
+    # the /assign confirmation can finalise without re-OCR'ing.
+    if (
+        isinstance(row.extraction, dict)
+        and row.extraction
+        and isinstance(row.extraction_document_type, str)
+    ):
+        cached_outcome = ExtractionOutcome(
+            document_type=row.extraction_document_type,
+            extraction=row.extraction,
+            verification=None,
+            stages=(),
+        )
+        await _finalize_and_summarise(
+            session=session,
+            firm=firm,
+            client=client,
+            outcome=cached_outcome,
+            file_ids=file_ids,
+            chat_id=chat_id,
+            reply_to_message_id=row.message_id,
+        )
+        return
+
+    # Legacy path — pending row pre-dates R2 (no cached extraction). Fall
+    # back to the original download-extract-summary helper.
     await _process_document_for_client(
         session=session,
         firm=firm,

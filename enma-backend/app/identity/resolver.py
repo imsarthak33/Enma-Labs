@@ -46,7 +46,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import IntEnum, StrEnum
-from typing import Final
+from typing import Any, Final
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -89,6 +89,17 @@ VENDOR_HISTORY_MIN_HITS: Final[int] = 3
 """Stage 4: a vendor must have been used by the same client at least
 this many times before it wins."""
 
+BUYER_NAME_TRGM_THRESHOLD: Final[float] = 0.55
+"""R2 — minimum pg_trgm similarity between extracted buyer name and
+``clients.trade_name``/``legal_name`` to consider it a routing
+candidate."""
+
+BUYER_NAME_TRGM_HIGH_THRESHOLD: Final[float] = 0.85
+"""R2 — at or above this similarity the buyer-name match is treated as
+HIGH confidence and the cascade returns immediately. Below it (down to
+:data:`BUYER_NAME_TRGM_THRESHOLD`) the match is MEDIUM and we still
+check the remaining stages for a better signal."""
+
 # RFC 7159 (and the GSTIN spec) constrain the format to a 15-char block.
 # We allow surrounding whitespace / punctuation in user-supplied text.
 _GSTIN_FINDER: Final[re.Pattern[str]] = re.compile(
@@ -105,7 +116,10 @@ class ResolutionStage(IntEnum):
     """Which cascade stage produced the outcome.
 
     The integer value is what gets written to
-    ``identity_resolution_log.stage_reached``.
+    ``identity_resolution_log.stage_reached``. R2 added two new
+    high-priority stages (``BUYER_GSTIN`` and ``BUYER_NAME``) with
+    integer values 6 and 7 so existing analytics that count by stage_id
+    don't have their meaning shift under them.
     """
 
     SESSION = 1
@@ -113,6 +127,8 @@ class ResolutionStage(IntEnum):
     GSTIN = 3
     VENDOR = 4
     EXPLICIT_ASK = 5
+    BUYER_GSTIN = 6
+    BUYER_NAME = 7
 
 
 class ResolutionConfidence(StrEnum):
@@ -149,7 +165,7 @@ class ResolutionOutcome:
 # ---------------------------------------------------------------------------
 
 
-async def resolve_identity(
+async def resolve_identity(  # noqa: PLR0912 — linear cascade, splitting hurts readability
     *,
     session: AsyncSession,
     ca_firm_id: uuid.UUID,
@@ -160,8 +176,15 @@ async def resolve_identity(
     file_ids: list[str],
     message_id: int | None = None,
     now: datetime | None = None,
+    extraction: dict[str, Any] | None = None,
+    extraction_document_type: str | None = None,
 ) -> ResolutionOutcome:
-    """Run the 5-stage cascade and return the outcome.
+    """Run the cascade and return the outcome.
+
+    R2 inverted the cascade: the buyer fields from ``extract_only`` are
+    now the first and strongest signals. The remaining stages
+    (session/caption/GSTIN/vendor history) stay as fallbacks for
+    uploads where the extractor produced nothing useful.
 
     Parameters
     ----------
@@ -172,17 +195,74 @@ async def resolve_identity(
         Optional pre-extracted text from the document (lets the resolver
         scan for GSTINs without re-OCR'ing).
     extracted_vendor_gstin
-        The vendor GSTIN from the structured extraction, if the document
-        has already been through the extractor. Used by stage 4 only.
+        The vendor GSTIN from the structured extraction. Used only by
+        the vendor-history fallback.
+    extraction
+        R2 — the full extractor JSON (``vendor``, ``buyer``,
+        ``totals``…) as produced by :func:`app.agents.pipeline.extract_only`.
+        Stages 1 (BUYER_GSTIN) and 2 (BUYER_NAME) consume this. When
+        ``None`` the resolver falls straight to the legacy stages.
+    extraction_document_type
+        R2 — classifier output. Cached on the pending_assignments row
+        if EXPLICIT_ASK fires, so a future ``/assign`` can finalise
+        without re-OCR.
     file_ids
-        Telegram file_ids — stashed on the pending row if stage 5 fires.
+        Telegram file_ids — stashed on the pending row if EXPLICIT_ASK
+        fires.
     now
         Override clock for tests; defaults to ``datetime.now(UTC)``.
     """
     started = time.perf_counter()
     clock = now or datetime.now(UTC)
 
-    # ---- Stage 1: session context ----------------------------------------
+    buyer = (extraction or {}).get("buyer") if isinstance(extraction, dict) else None
+    buyer_gstin = (
+        str(buyer["gstin"]).strip().upper()
+        if isinstance(buyer, dict) and isinstance(buyer.get("gstin"), str) and buyer["gstin"].strip()
+        else None
+    )
+    buyer_name = (
+        str(buyer["name"]).strip()
+        if isinstance(buyer, dict) and isinstance(buyer.get("name"), str) and buyer["name"].strip()
+        else None
+    )
+
+    # ---- R2 Stage 1: BUYER GSTIN (deterministic, HIGH) -------------------
+    if buyer_gstin is not None and is_valid_gstin(buyer_gstin):
+        client_q = ClientQuery(session=session, ca_firm_id=ca_firm_id)
+        hit = await client_q.get_by_gstin(buyer_gstin)
+        if hit is not None and hit.is_active:
+            return await _emit(
+                session=session,
+                ca_firm_id=ca_firm_id,
+                stage=ResolutionStage.BUYER_GSTIN,
+                confidence=ResolutionConfidence.HIGH,
+                client_id=hit.id,
+                pending_id=None,
+                started=started,
+            )
+
+    # ---- R2 Stage 2: BUYER NAME (fuzzy, HIGH ≥ 0.85 or MEDIUM ≥ 0.55) ----
+    if buyer_name is not None:
+        buyer_match = await _resolve_from_buyer_name(
+            session=session, ca_firm_id=ca_firm_id, buyer_name=buyer_name
+        )
+        if buyer_match is not None:
+            client_id, confidence = buyer_match
+            if confidence is ResolutionConfidence.HIGH:
+                return await _emit(
+                    session=session,
+                    ca_firm_id=ca_firm_id,
+                    stage=ResolutionStage.BUYER_NAME,
+                    confidence=confidence,
+                    client_id=client_id,
+                    pending_id=None,
+                    started=started,
+                )
+            # MEDIUM: hold this candidate but keep checking the fallback
+            # stages — a deterministic session/GSTIN signal still wins.
+
+    # ---- Stage 3 (legacy): session context -------------------------------
     client_id = await _resolve_from_session(
         session=session,
         ca_firm_id=ca_firm_id,
@@ -200,7 +280,7 @@ async def resolve_identity(
             started=started,
         )
 
-    # ---- Stage 2: caption fuzzy match ------------------------------------
+    # ---- Stage 4 (legacy): caption fuzzy match ---------------------------
     if caption:
         caption_match = await _resolve_from_caption(
             session=session, ca_firm_id=ca_firm_id, caption=caption
@@ -217,7 +297,7 @@ async def resolve_identity(
                 started=started,
             )
 
-    # ---- Stage 3: GSTIN scan ---------------------------------------------
+    # ---- Stage 5 (legacy): GSTIN scan over caption+text ------------------
     gstin_match = await _resolve_from_gstin(
         session=session,
         ca_firm_id=ca_firm_id,
@@ -234,7 +314,7 @@ async def resolve_identity(
             started=started,
         )
 
-    # ---- Stage 4: vendor history -----------------------------------------
+    # ---- Stage 6 (legacy): vendor history --------------------------------
     if extracted_vendor_gstin:
         vendor_match = await _resolve_from_vendor_history(
             session=session,
@@ -252,13 +332,15 @@ async def resolve_identity(
                 started=started,
             )
 
-    # ---- Stage 5: explicit ask -------------------------------------------
+    # ---- Stage 7: EXPLICIT_ASK (now informed by the extractor) -----------
     pending_id = await _queue_pending(
         session=session,
         ca_firm_id=ca_firm_id,
         chat_id=chat_id,
         message_id=message_id,
         file_ids=file_ids,
+        extraction=extraction,
+        extraction_document_type=extraction_document_type,
     )
     return await _emit(
         session=session,
@@ -431,6 +513,60 @@ async def _resolve_from_vendor_history(
 # ---------------------------------------------------------------------------
 
 
+async def _resolve_from_buyer_name(
+    *,
+    session: AsyncSession,
+    ca_firm_id: uuid.UUID,
+    buyer_name: str,
+) -> tuple[uuid.UUID, ResolutionConfidence] | None:
+    """R2 — pg_trgm similarity between extracted buyer name and clients.
+
+    Mirrors :func:`_resolve_from_caption` but tuned for extractor output:
+
+    * Higher HIGH threshold (0.85 vs 0.80 for captions) — extractor text
+      is cleaner and we don't want a stray "Foo Corp" upload to land on
+      "FooCorp Pvt Ltd" without an explicit confirm.
+    * Returns MEDIUM down to :data:`BUYER_NAME_TRGM_THRESHOLD` so the
+      caller can still consider the candidate after running the other
+      fallback stages.
+    """
+    name = buyer_name.strip()
+    if len(name) < 3:
+        return None
+
+    sim_trade = func.similarity(Client.trade_name, name)
+    sim_legal = func.similarity(func.coalesce(Client.legal_name, ""), name)
+    similarity = func.greatest(sim_trade, sim_legal).label("similarity")
+
+    stmt = (
+        select(Client.id, similarity)
+        .where(Client.ca_firm_id == ca_firm_id)
+        .where(Client.is_active.is_(True))
+        .where(similarity >= BUYER_NAME_TRGM_THRESHOLD)
+        .order_by(similarity.desc())
+        .limit(2)
+    )
+    result = await session.execute(stmt)  # audit:allow-direct-session — ca_firm_id filtered above
+    rows = result.all()
+    if not rows:
+        return None
+
+    top_id, top_sim = rows[0]
+    if len(rows) >= 2:
+        _, runner_sim = rows[1]
+        # Tie-break: if two clients are within 0.05 similarity of each other
+        # the routing is ambiguous regardless of HIGH/MEDIUM — bail.
+        if float(top_sim) - float(runner_sim) < 0.05:
+            return None
+
+    confidence = (
+        ResolutionConfidence.HIGH
+        if float(top_sim) >= BUYER_NAME_TRGM_HIGH_THRESHOLD
+        else ResolutionConfidence.MEDIUM
+    )
+    return uuid.UUID(str(top_id)), confidence
+
+
 async def _queue_pending(
     *,
     session: AsyncSession,
@@ -438,13 +574,22 @@ async def _queue_pending(
     chat_id: int,
     message_id: int | None,
     file_ids: list[str],
+    extraction: dict[str, Any] | None = None,
+    extraction_document_type: str | None = None,
 ) -> uuid.UUID:
-    """Insert a pending_assignments row and return its id."""
+    """Insert a pending_assignments row and return its id.
+
+    R2 — ``extraction`` + ``extraction_document_type`` are cached so the
+    eventual ``/assign`` or inline-button confirmation can call
+    :func:`app.agents.pipeline.finalize_document` without re-OCR'ing.
+    """
     q = PendingAssignmentQuery(session=session, ca_firm_id=ca_firm_id)
     row = await q.create(
         chat_id=chat_id,
         file_ids=file_ids,
         message_id=message_id,
+        extraction=extraction,
+        extraction_document_type=extraction_document_type,
     )
     return row.id
 
