@@ -154,6 +154,44 @@ class ToolSpec:
 # ---------------------------------------------------------------------------
 
 
+def _coerce_int_or_none(value: object) -> int | None:
+    """Defensive int coercion for LLM-emitted tool arguments.
+
+    The supervisor LLM occasionally serialises an "absent" int argument as
+    the JSON string ``"null"`` (literal) or ``"None"`` instead of leaving
+    the field out, which used to crash ``int(value)`` with
+    ``ValueError: invalid literal for int() with base 10: 'null'`` and take
+    the whole background task with it. Treat any of the following as
+    "argument not provided":
+
+    * Python ``None``
+    * Empty string
+    * The literal strings ``"null"``, ``"none"``, ``"undefined"`` (any case)
+
+    Anything else is coerced via ``int()`` and any subsequent ``ValueError``
+    is re-raised as a :class:`ToolError` so the LLM gets a structured
+    failure it can react to instead of an unhandled crash.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        # JSON parses true/false as Python bool — don't silently coerce.
+        raise ToolError("expected an integer, got a boolean")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        if cleaned in {"", "null", "none", "undefined"}:
+            return None
+        try:
+            return int(cleaned)
+        except ValueError as exc:
+            raise ToolError(f"expected an integer, got {value!r}") from exc
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    raise ToolError(f"expected an integer, got {type(value).__name__}")
+
+
 async def _tool_query_documents(
     ctx: SupervisorContext, args: dict[str, Any]
 ) -> dict[str, Any]:
@@ -162,10 +200,10 @@ async def _tool_query_documents(
     if not client_ref:
         raise ToolError("client_id is required")
     docs_q = DocumentQuery(session=ctx.session, ca_firm_id=ctx.ca_firm_id)
-    month = args.get("filing_period_month")
-    year = args.get("filing_period_year")
-    if month and year:
-        rows = await docs_q.list_by_filing_period(year=int(year), month=int(month))
+    month = _coerce_int_or_none(args.get("filing_period_month"))
+    year = _coerce_int_or_none(args.get("filing_period_year"))
+    if month is not None and year is not None:
+        rows = await docs_q.list_by_filing_period(year=year, month=month)
         rows = [r for r in rows if str(r.client_id) == str(client_ref)]
     else:
         rows = list(await docs_q.list_by_client(client_id=client_ref))
@@ -279,7 +317,7 @@ async def _tool_create_task(
         description=args.get("description"),
         client_id=args.get("client_id"),
         due_at=due_at,
-        priority=int(args.get("priority", 0)),
+        priority=_coerce_int_or_none(args.get("priority")) or 0,
     )
     return {"id": str(task.id), "title": task.title, "status": task.status}
 
@@ -288,12 +326,10 @@ async def _tool_get_filing_summary(
     ctx: SupervisorContext, args: dict[str, Any]
 ) -> dict[str, Any]:
     """Show period totals + lock status for a given (month, year)."""
-    month = args.get("filing_period_month")
-    year = args.get("filing_period_year")
-    if not month or not year:
+    month_i = _coerce_int_or_none(args.get("filing_period_month"))
+    year_i = _coerce_int_or_none(args.get("filing_period_year"))
+    if month_i is None or year_i is None:
         raise ToolError("filing_period_month and filing_period_year are required")
-    month_i = int(month)
-    year_i = int(year)
 
     filings = FilingQuery(session=ctx.session, ca_firm_id=ctx.ca_firm_id)
     locked = await filings.is_period_locked(month=month_i, year=year_i)

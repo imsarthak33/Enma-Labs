@@ -23,6 +23,7 @@ from app.agents.supervisor import (
     SupervisorContext,
     ToolError,
     ToolSpec,
+    _coerce_int_or_none,
     run_supervisor,
 )
 from app.services.llm import ChatResponse
@@ -197,3 +198,53 @@ class TestToolSchemas:
             assert fn["name"] == spec.name
             assert isinstance(fn["description"], str)
             assert json.dumps(fn["parameters"])  # JSON-serialisable
+
+
+# ---------------------------------------------------------------------------
+# Refactor M — defensive int coercion for LLM-emitted tool arguments
+# ---------------------------------------------------------------------------
+
+
+class TestCoerceIntOrNone:
+    """Regression for the supervisor int('null') crash.
+
+    The supervisor LLM serialises an "absent" filing_period_year as the
+    literal string "null" instead of omitting the field. Previously
+    ``int("null")`` raised ValueError, crashed the background task, and
+    the user saw an indefinite "Working on it..." with no reply.
+    """
+
+    @pytest.mark.parametrize(
+        "value",
+        [None, "", "null", "NULL", "None", "none", "undefined", "  null  "],
+    )
+    def test_returns_none_for_absent_signals(self, value: object) -> None:
+        assert _coerce_int_or_none(value) is None
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (5, 5),
+            ("5", 5),
+            ("  10 ", 10),
+            (2025, 2025),
+            ("2025", 2025),
+            (3.0, 3),
+        ],
+    )
+    def test_coerces_valid_ints(self, value: object, expected: int) -> None:
+        assert _coerce_int_or_none(value) == expected
+
+    @pytest.mark.parametrize("bad", ["abc", "2025.5", "ten", "1e3"])
+    def test_invalid_strings_raise_tool_error(self, bad: str) -> None:
+        with pytest.raises(ToolError, match="expected an integer"):
+            _coerce_int_or_none(bad)
+
+    def test_bool_raises_tool_error(self) -> None:
+        # JSON parses true/false as Python bool — refuse silent coercion to 0/1.
+        with pytest.raises(ToolError, match="boolean"):
+            _coerce_int_or_none(True)
+
+    def test_non_integer_float_raises(self) -> None:
+        with pytest.raises(ToolError, match="expected an integer"):
+            _coerce_int_or_none(3.14)
