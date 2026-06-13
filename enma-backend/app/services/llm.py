@@ -348,7 +348,9 @@ def _parse_response(data: dict[str, Any], *, role: LLMRole, model: str) -> ChatR
     if not isinstance(message, dict):
         raise LLMError(f"LLM choice has no 'message': {first}")
     content = message.get("content")
-    if not isinstance(content, str):
+    if content is None:
+        content = ""
+    elif not isinstance(content, str):
         raise LLMError(f"LLM message content not a string: {content!r}")
 
     usage = data.get("usage", {}) if isinstance(data.get("usage"), dict) else {}
