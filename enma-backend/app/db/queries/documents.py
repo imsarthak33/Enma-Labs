@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import Sequence
 from typing import Any, cast
 
+from sqlalchemy import String, cast as sa_cast
+
 from app.db.models.document import Document
 from app.db.queries.base import BaseQuery
+
+# 8-hex-char prefix is what the pipeline summary shows the user as
+# "Ref:". The supervisor LLM picks that up and passes it into tools
+# expecting a UUID, so we accept any 4-32 hex-char prefix here.
+_REF_PREFIX_RE: re.Final = re.compile(r"^[0-9a-fA-F]{4,32}$")
 
 
 class DocumentQuery(BaseQuery):
@@ -28,6 +36,36 @@ class DocumentQuery(BaseQuery):
         did = document_id if isinstance(document_id, uuid.UUID) else uuid.UUID(str(document_id))
         stmt = self._scoped_select(Document).where(Document.id == did)
         return await self._fetch_one(stmt)
+
+    async def find_by_ref_prefix(self, ref: str) -> list[Document]:
+        """Resolve an 8-hex 'Ref:' prefix back to the underlying document(s).
+
+        The pipeline summary renders the document UUID truncated to its
+        first eight hex chars as the user-facing "Ref:". CAs naturally
+        quote that ref back ("invoice with ref 4b8d91e0"), and the
+        supervisor LLM forwards it into tools that expect a full UUID.
+        This helper takes the prefix and returns every document in this
+        firm whose id starts with it.
+
+        Empty list if no match. Multiple matches are possible (collisions
+        are rare but valid for very short prefixes) — the caller decides
+        what to do.
+
+        Raises:
+            ValueError: if ``ref`` is not 4-32 hex chars.
+        """
+        cleaned = ref.strip().lower()
+        if not _REF_PREFIX_RE.fullmatch(cleaned):
+            raise ValueError(
+                f"ref must be 4-32 hexadecimal characters, got {ref!r}"
+            )
+        stmt = (
+            self._scoped_select(Document)
+            .where(sa_cast(Document.id, String).ilike(f"{cleaned}%"))
+            .order_by(Document.created_at.desc())
+            .limit(5)
+        )
+        return list(await self._fetch_all(stmt))
 
     async def list_by_filing_period(self, year: int, month: int) -> Sequence[Document]:
         """Return all documents for a filing period (firm-scoped)."""

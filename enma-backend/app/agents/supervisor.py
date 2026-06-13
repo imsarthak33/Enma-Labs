@@ -154,6 +154,47 @@ class ToolSpec:
 # ---------------------------------------------------------------------------
 
 
+def _coerce_uuid_or_none(value: object) -> uuid.UUID | None:
+    """Defensive UUID coercion for LLM-emitted tool arguments.
+
+    Companion of :func:`_coerce_int_or_none`. The supervisor LLM tends to
+    serialise an "absent" UUID arg as ``"null"``/``"None"``/``""`` (same
+    as the int case), but it also sometimes passes the short user-facing
+    ref hash (e.g. ``"4b8d91e0"`` — the first eight hex chars of the
+    document UUID that the pipeline summary renders). Either path used
+    to crash ``uuid.UUID(s)`` with ``ValueError: badly formed
+    hexadecimal UUID string`` and take the background task with it.
+
+    Returns:
+        * ``None`` for None/empty/"null"/"none"/"undefined".
+        * The parsed :class:`uuid.UUID` for any valid representation.
+        * For a hex-prefix that is *not* a full UUID (e.g. an 8-char ref),
+          we raise :class:`ToolError` rather than guess — the caller has a
+          dedicated ``query_document_by_ref`` tool for that case.
+
+    Raises:
+        ToolError: when the input is non-empty but not a valid UUID.
+    """
+    if value is None:
+        return None
+    if isinstance(value, uuid.UUID):
+        return value
+    if isinstance(value, str):
+        cleaned = value.strip()
+        lowered = cleaned.lower()
+        if lowered in {"", "null", "none", "undefined"}:
+            return None
+        try:
+            return uuid.UUID(cleaned)
+        except ValueError as exc:
+            raise ToolError(
+                f"expected a UUID, got {value!r}. "
+                "If this is a short Ref hash like '4b8d91e0', "
+                "use the query_document_by_ref tool instead."
+            ) from exc
+    raise ToolError(f"expected a UUID, got {type(value).__name__}")
+
+
 def _coerce_int_or_none(value: object) -> int | None:
     """Defensive int coercion for LLM-emitted tool arguments.
 
@@ -196,17 +237,19 @@ async def _tool_query_documents(
     ctx: SupervisorContext, args: dict[str, Any]
 ) -> dict[str, Any]:
     """List documents for a client, optionally filtered by filing period."""
-    client_ref = args.get("client_id") or str(ctx.active_client_id or "")
-    if not client_ref:
+    client_uuid = _coerce_uuid_or_none(args.get("client_id"))
+    if client_uuid is None:
+        client_uuid = ctx.active_client_id
+    if client_uuid is None:
         raise ToolError("client_id is required")
     docs_q = DocumentQuery(session=ctx.session, ca_firm_id=ctx.ca_firm_id)
     month = _coerce_int_or_none(args.get("filing_period_month"))
     year = _coerce_int_or_none(args.get("filing_period_year"))
     if month is not None and year is not None:
         rows = await docs_q.list_by_filing_period(year=year, month=month)
-        rows = [r for r in rows if str(r.client_id) == str(client_ref)]
+        rows = [r for r in rows if r.client_id == client_uuid]
     else:
-        rows = list(await docs_q.list_by_client(client_id=client_ref))
+        rows = list(await docs_q.list_by_client(client_id=client_uuid))
     return {
         "count": len(rows),
         "documents": [
@@ -273,10 +316,10 @@ async def _tool_list_tasks(
 ) -> dict[str, Any]:
     """List open tasks, optionally narrowed to a client."""
     tasks_q = TaskQuery(session=ctx.session, ca_firm_id=ctx.ca_firm_id)
-    client_ref = args.get("client_id")
+    client_uuid = _coerce_uuid_or_none(args.get("client_id"))
     rows = (
-        await tasks_q.list_open(client_id=client_ref)
-        if client_ref
+        await tasks_q.list_open(client_id=client_uuid)
+        if client_uuid is not None
         else await tasks_q.list_open()
     )
     return {
@@ -315,7 +358,7 @@ async def _tool_create_task(
     task = await tasks_q.create(
         title=title.strip(),
         description=args.get("description"),
-        client_id=args.get("client_id"),
+        client_id=_coerce_uuid_or_none(args.get("client_id")),
         due_at=due_at,
         priority=_coerce_int_or_none(args.get("priority")) or 0,
     )
@@ -346,6 +389,53 @@ async def _tool_get_filing_summary(
     }
 
 
+async def _tool_query_document_by_ref(
+    ctx: SupervisorContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Look up a document by its user-facing ``Ref:`` hash prefix.
+
+    The pipeline summary renders the document UUID truncated to its
+    first eight hex chars as ``Ref:``. CAs naturally quote that back —
+    "the invoice with ref 4b8d91e0" — but our other tools expect full
+    UUIDs. Rather than make the LLM convert, expose a dedicated tool.
+
+    Returns ``{"matches": []}`` when nothing matches, a single-document
+    dict when exactly one matches, or ``{"ambiguous": True, "matches":
+    [...]}`` when multiple documents in this firm share the prefix.
+    """
+    ref = args.get("ref")
+    if not isinstance(ref, str) or not ref.strip():
+        raise ToolError("ref is required (e.g. '4b8d91e0' as shown on the summary)")
+
+    docs_q = DocumentQuery(session=ctx.session, ca_firm_id=ctx.ca_firm_id)
+    try:
+        matches = await docs_q.find_by_ref_prefix(ref)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+
+    if not matches:
+        return {"matches": []}
+
+    rendered = [
+        {
+            "id": str(d.id),
+            "ref": str(d.id)[:8],
+            "client_id": str(d.client_id) if d.client_id else None,
+            "document_type": d.document_type,
+            "filing_period_month": d.filing_period_month,
+            "filing_period_year": d.filing_period_year,
+            "processing_status": d.processing_status,
+            "created_at": d.created_at.isoformat(),
+            "tax_verdict": d.tax_verdict,
+            "extraction_data": d.extraction_data,
+        }
+        for d in matches
+    ]
+    if len(rendered) == 1:
+        return {"matches": rendered, "document": rendered[0]}
+    return {"ambiguous": True, "matches": rendered}
+
+
 # ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
@@ -371,6 +461,29 @@ TOOLS: Final[dict[str, ToolSpec]] = {
             "additionalProperties": False,
         },
         runner=_tool_query_documents,
+    ),
+    "query_document_by_ref": ToolSpec(
+        name="query_document_by_ref",
+        description=(
+            "Look up a document by its short 'Ref:' hash (the 4-32 hex char "
+            "prefix shown on every Document processed summary, e.g. "
+            "'4b8d91e0'). Returns the matching document with its full UUID, "
+            "client, totals, tax verdict, and extracted invoice data. Use "
+            "this BEFORE query_documents when the user mentions a ref-hash; "
+            "do NOT pass the ref-hash to query_documents as a client_id."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "ref": {
+                    "type": "string",
+                    "description": "Short hex ref shown on summaries (e.g. '4b8d91e0').",
+                }
+            },
+            "required": ["ref"],
+            "additionalProperties": False,
+        },
+        runner=_tool_query_document_by_ref,
     ),
     "get_client_status": ToolSpec(
         name="get_client_status",

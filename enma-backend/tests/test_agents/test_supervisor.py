@@ -24,6 +24,7 @@ from app.agents.supervisor import (
     ToolError,
     ToolSpec,
     _coerce_int_or_none,
+    _coerce_uuid_or_none,
     run_supervisor,
 )
 from app.services.llm import ChatResponse
@@ -248,3 +249,61 @@ class TestCoerceIntOrNone:
     def test_non_integer_float_raises(self) -> None:
         with pytest.raises(ToolError, match="expected an integer"):
             _coerce_int_or_none(3.14)
+
+
+# ---------------------------------------------------------------------------
+# Refactor M2 — defensive UUID coercion + query_document_by_ref tool
+# ---------------------------------------------------------------------------
+
+
+class TestCoerceUuidOrNone:
+    """Regression for the badly-formed-UUID supervisor crash.
+
+    When the LLM passes the user-facing Ref hash like '4b8d91e0' (the
+    first eight hex chars rendered on every Document processed summary)
+    into a tool expecting a full client UUID, the previous code raised
+    ``ValueError: badly formed hexadecimal UUID string`` and killed the
+    background task. Now those calls surface as ``ToolError`` and the LLM
+    is told to use ``query_document_by_ref`` instead.
+    """
+
+    @pytest.mark.parametrize(
+        "value",
+        [None, "", "null", "NULL", "None", "undefined", "  "],
+    )
+    def test_returns_none_for_absent_signals(self, value: object) -> None:
+        assert _coerce_uuid_or_none(value) is None
+
+    def test_returns_uuid_for_valid_string(self) -> None:
+        u = uuid.uuid4()
+        assert _coerce_uuid_or_none(str(u)) == u
+
+    def test_returns_uuid_for_uuid_instance(self) -> None:
+        u = uuid.uuid4()
+        assert _coerce_uuid_or_none(u) is u
+
+    def test_short_hex_prefix_raises_tool_error(self) -> None:
+        """The exact crash signature from production: 8-char ref hash."""
+        with pytest.raises(ToolError, match="query_document_by_ref"):
+            _coerce_uuid_or_none("4b8d91e0")
+
+    def test_other_garbage_raises_tool_error(self) -> None:
+        with pytest.raises(ToolError, match="expected a UUID"):
+            _coerce_uuid_or_none("not-a-uuid-at-all")
+
+    def test_non_string_type_raises_tool_error(self) -> None:
+        with pytest.raises(ToolError, match="expected a UUID"):
+            _coerce_uuid_or_none(12345)
+
+
+class TestQueryDocumentByRefRegistered:
+    """The new ref-lookup tool must be in TOOLS so the LLM can call it."""
+
+    def test_tool_is_registered(self) -> None:
+        assert "query_document_by_ref" in TOOLS
+
+    def test_tool_schema_requires_ref(self) -> None:
+        spec = TOOLS["query_document_by_ref"]
+        params = spec.parameters
+        assert params["properties"]["ref"]["type"] == "string"
+        assert params["required"] == ["ref"]
