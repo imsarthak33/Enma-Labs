@@ -1,9 +1,21 @@
-"""Structured JSON logging via structlog.
+"""Structured logging via structlog.
 
 Single entrypoint: ``configure_logging()`` is called once during FastAPI
 lifespan startup. After that, ``structlog.get_logger(__name__)`` returns
-loggers that emit JSON to stdout with consistent timestamps and contextual
-binds (request_id, ca_firm_id, etc., set later via middleware).
+loggers that share the same processor chain.
+
+Two renderers ship out of the box, selected by ``settings.log_format``:
+
+* ``console`` — :class:`structlog.dev.ConsoleRenderer` (colorless). Plain
+  text lines like ``2026-06-14 12:34:56 [info] supervisor_tool_called
+  tool=query_documents firm_id=...``. The dev-loop default.
+* ``json`` — :class:`structlog.processors.JSONRenderer`. CloudWatch and
+  Sentry parse this directly. The production default.
+
+``auto`` picks json when ``ENV=production`` and console otherwise. The
+default behaviour the team wants 95% of the time. ``LOG_FORMAT=console``
+forces console even in production for one-off debugging windows;
+``LOG_FORMAT=json`` forces JSON locally to mirror prod parsing.
 """
 
 from __future__ import annotations
@@ -14,7 +26,7 @@ import sys
 import structlog
 from structlog.types import EventDict, Processor
 
-from app.config import LogLevel, settings
+from app.config import Environment, LogFormat, LogLevel, settings
 
 
 def _add_service(_logger: object, _method: str, event_dict: EventDict) -> EventDict:
@@ -31,8 +43,26 @@ def _level_to_int(level: LogLevel) -> int:
     }[level]
 
 
+def _pick_renderer() -> Processor:
+    """Return the structlog renderer matching ``settings.log_format``.
+
+    ``auto`` picks json in production, console otherwise — what the team
+    wants by default. ``LOG_FORMAT`` is an explicit override surfaced
+    via :class:`app.config.LogFormat`.
+    """
+    fmt = settings.log_format
+    if fmt is LogFormat.JSON:
+        return structlog.processors.JSONRenderer()
+    if fmt is LogFormat.CONSOLE:
+        return structlog.dev.ConsoleRenderer(colors=False)
+    # auto
+    if settings.env is Environment.PRODUCTION:
+        return structlog.processors.JSONRenderer()
+    return structlog.dev.ConsoleRenderer(colors=False)
+
+
 def configure_logging() -> None:
-    """Idempotently install JSON logging on the root logger + structlog."""
+    """Idempotently install structlog with an env-appropriate renderer."""
 
     level = _level_to_int(settings.log_level)
 
@@ -50,7 +80,7 @@ def configure_logging() -> None:
     structlog.configure(
         processors=[
             *shared_processors,
-            structlog.processors.JSONRenderer(),
+            _pick_renderer(),
         ],
         wrapper_class=structlog.make_filtering_bound_logger(level),
         context_class=dict,

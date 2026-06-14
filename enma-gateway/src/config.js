@@ -9,6 +9,8 @@ import "dotenv/config";
 
 const VALID_ENVS = ["development", "staging", "production", "test"];
 const VALID_LEVELS = ["debug", "info", "warn", "error"];
+// First entry is the default when LOG_FORMAT is unset.
+const VALID_LOG_FORMATS = ["auto", "json", "console"];
 
 /**
  * @param {string} name
@@ -70,6 +72,7 @@ function build() {
     env,
     isProduction,
     logLevel: oneOf("LOG_LEVEL", process.env.LOG_LEVEL, VALID_LEVELS),
+    logFormat: oneOf("LOG_FORMAT", process.env.LOG_FORMAT, VALID_LOG_FORMATS),
     port: asInt("PORT", process.env.PORT, { min: 0, max: 65535, default: 3000 }),
 
     telegram: Object.freeze({

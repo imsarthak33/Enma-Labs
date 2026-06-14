@@ -36,6 +36,26 @@ class LogLevel(StrEnum):
     ERROR = "error"
 
 
+class LogFormat(StrEnum):
+    """Wire format for application logs.
+
+    ``console`` renders human-readable text via structlog.dev.ConsoleRenderer
+    — what you want when you're iterating locally and reading the agent's
+    thought process in plain text.
+
+    ``json`` emits the dense single-line JSON that CloudWatch + Sentry
+    structure-aware ingestion expect.
+
+    ``auto`` picks json in production, console everywhere else. That's
+    the default; LOG_FORMAT=console can force console even in production
+    for one-off debugging windows.
+    """
+
+    JSON = "json"
+    CONSOLE = "console"
+    AUTO = "auto"
+
+
 class Settings(BaseSettings):
     """Runtime configuration. Loaded once at process start.
 
@@ -56,6 +76,13 @@ class Settings(BaseSettings):
         description="Deployment environment.",
     )
     log_level: LogLevel = Field(default=LogLevel.INFO)
+    log_format: LogFormat = Field(
+        default=LogFormat.AUTO,
+        description=(
+            "console (dev-friendly text), json (CloudWatch/Sentry), or auto "
+            "(json in production, console otherwise)."
+        ),
+    )
     app_host: str = Field(default="0.0.0.0")  # noqa: S104 — intentional bind
     app_port: int = Field(default=8000, ge=1, le=65535)
 
@@ -341,4 +368,11 @@ def get_settings() -> Settings:
 settings: Settings = get_settings()
 
 
-__all__ = ["Environment", "LogLevel", "Settings", "get_settings", "settings"]
+__all__ = [
+    "Environment",
+    "LogFormat",
+    "LogLevel",
+    "Settings",
+    "get_settings",
+    "settings",
+]

@@ -1,14 +1,25 @@
 // =============================================================================
-// Structured JSON logger.
+// Structured logger — JSON in prod, human-readable text in dev.
 //
-// One log line = one JSON object on stdout. Levels filtered by config.logLevel.
-// `console.*` is permitted here (this is the structured-output boundary) and
-// banned everywhere else by the eslint config.
+// Levels filtered by config.logLevel. Format chosen by config.logFormat:
+//   * "json"    — single-line JSON per record (CloudWatch / Sentry parse)
+//   * "console" — dev-friendly text:
+//                 12:34:56.789 [info ] message field=value field=value
+//   * "auto"    — json when NODE_ENV=production, console otherwise
+//
+// `console.*` is permitted here (this is the structured-output boundary)
+// and banned everywhere else by the eslint config.
 // =============================================================================
 
 import { config } from "../config.js";
 
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
+
+/**
+ * Resolve "auto" to the concrete renderer name once at module load.
+ */
+const RESOLVED_FORMAT =
+  config.logFormat === "auto" ? (config.isProduction ? "json" : "console") : config.logFormat;
 
 /**
  * @param {string} level
@@ -23,8 +34,7 @@ function shouldEmit(level) {
  * @param {string} message
  * @param {Record<string, unknown> | undefined} fields
  */
-function emit(level, message, fields) {
-  if (!shouldEmit(level)) return;
+function renderJson(level, message, fields) {
   const entry = {
     ts: new Date().toISOString(),
     level,
@@ -32,9 +42,37 @@ function emit(level, message, fields) {
     msg: message,
     ...(fields || {}),
   };
+  return JSON.stringify(entry);
+}
+
+/**
+ * @param {string} level
+ * @param {string} message
+ * @param {Record<string, unknown> | undefined} fields
+ */
+function renderConsole(level, message, fields) {
+  // 12:34:56.789 [info ] message_name field=value field=value
+  const now = new Date();
+  const ts = now.toISOString().slice(11, 23); // HH:MM:SS.mmm
+  const pad = level.padEnd(5);
+  const tail = fields
+    ? Object.entries(fields)
+        .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
+        .join(" ")
+    : "";
+  return tail ? `${ts} [${pad}] ${message} ${tail}` : `${ts} [${pad}] ${message}`;
+}
+
+/**
+ * @param {string} level
+ * @param {string} message
+ * @param {Record<string, unknown> | undefined} fields
+ */
+function emit(level, message, fields) {
+  if (!shouldEmit(level)) return;
+  const line = RESOLVED_FORMAT === "json" ? renderJson(level, message, fields) : renderConsole(level, message, fields);
   // stdout for info/debug, stderr for warn/error — keeps container log
   // routers separating signal from noise.
-  const line = JSON.stringify(entry);
   if (level === "warn" || level === "error") {
     console.error(line);
   } else {
