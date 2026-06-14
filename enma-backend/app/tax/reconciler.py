@@ -6,42 +6,36 @@ The extractor LLM is good at reading text off an invoice (vendor name,
 GSTIN, line item description, the printed numbers in each column). It is
 *bad* at picking which printed number is the taxable amount, which is
 the total tax, and which is the grand total. It is also bad at
-multiplying ``quantity * unit_price`` reliably across many cells.
+multiplying ``quantity * unit_price`` reliably across many cells and
+at allocating tax to the right bucket (CGST + SGST vs IGST).
 
-Production saw the failure pattern twice on real SUDHA invoices:
+Production saw two distinct failure modes:
 
-  invoice prints:                LLM extracted (wrong):
-    Taxable Amount  ₹ 9,285.71     taxable_value = "464.29"   ← tax col
-    CGST @2.5%      ₹   232.14     cgst_amount   = "232.14"   ← right
-    SGST @2.5%      ₹   232.14     sgst_amount   = "232.14"   ← right
-    Total Amount    ₹ 9,750.00     grand_total   = "9750"     ← right
+1. **Hallucinated math on single-rate invoices.**  Taxable read as the
+   tax column (₹464.29 instead of ₹9,285.71). Fixed in v1.
 
-Then the verifier (which IS deterministic Python math) saw
-``taxable_value = 464.29`` and ``cgst_rate = 2.5`` and dutifully
-flagged ``cgst should be 11.61`` — garbage in, garbage out.
+2. **Mixed-rate invoices: v1 of the reconciler trusted ONE rate.**
+   An invoice with both 5% and 18% line items has two CGST labels
+   in the totals block ("CGST @2.5%", "CGST @9%"). v1 picked the
+   last one and applied it to the entire taxable, inflating CGST
+   by 5×. It also accepted both CGST+SGST AND IGST rates on the
+   same line when the LLM hallucinated → impossible ``tax_coexistence``.
 
-The fix — implemented here — is to make math a Python concern with the
-LLM providing only:
+v2 (this module) does math the way Indian GST actually works:
 
-* **The labelled raw cells** the invoice prints (qty, unit_price, the
-  TAX column value, the AMOUNT column value).
-* **The OBSERVED totals block** as a list of ``(label, amount)`` pairs
-  copied verbatim from the bottom of the invoice.
-
-This module then:
-
-1. Derives ``taxable`` per line from ``line_amount - tax_amount`` when
-   both are extracted (most precise), falling back to
-   ``quantity * unit_price``.
-2. Sums line-item taxables to a canonical ``line_items_taxable``.
-3. Parses observed-totals labels with a small regex set
-   (``CGST\\s*@?\\s*(\\d+\\.?\\d*)\\s*%`` etc.) to learn the rates and
-   the printed CGST / SGST / IGST / Grand totals.
-4. Computes canonical ``cgst_amount = canonical_taxable * cgst_rate``
-   etc. using :mod:`decimal` only — no floats.
-5. Cross-checks observed labels against computed numbers and emits a
-   ``ReconciliationIssue`` for any mismatch >₹1 — that's the discrepancy
-   the CA needs to see.
+* **Per line**, derive ``taxable`` from ``line_amount - tax_amount``
+  (precise) or fall back to ``quantity * unit_price``.
+* **Per line**, derive the *single* line tax rate (``5%``, ``18%`` …)
+  from ``tax_amount / taxable`` if both are known, else from a
+  ``tax_label`` string, else from the LLM-emitted rate columns.
+* **Per invoice**, detect ``intra_state`` from the first two characters
+  of vendor and buyer GSTINs (which encode the state). Mismatch →
+  IGST; match → CGST + SGST split half-and-half.
+* **Aggregate** by summing per-line CGST / SGST / IGST. Totals carry
+  the natural multi-rate breakdown out the other side; the summary
+  surfaces it as ``CGST 1,174.49 (713.81 @ 2.5% + 460.68 @ 9%)``.
+* **Cross-check** by *summing* all CGST labels in the observed totals
+  block (multiple slices) and comparing to computed total CGST.
 
 The output ``ReconciledInvoice`` is the *new* source of truth for the
 verifier, the tax engine, and the pipeline summary. The LLM's
@@ -52,6 +46,7 @@ is never the basis of downstream computation.
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Final
@@ -70,11 +65,9 @@ __all__ = [
 # values. 1 paisa per line, ~1 rupee across the whole invoice. Anything
 # beyond this is a real arithmetic disagreement worth surfacing.
 _TOLERANCE_PAISA: Final[Decimal] = Decimal("1.00")
-_TOLERANCE_LINE: Final[Decimal] = Decimal("0.10")
 
 # Regex set for parsing the totals-section labels we see in practice.
-# Labels are matched case-insensitively. Whitespace around the @ is
-# permitted because OCR'd text varies. The capture group is the rate.
+# Labels are matched case-insensitively. The capture group is the rate.
 _RATE_RE: Final[re.Pattern[str]] = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 _LABEL_TAXABLE: Final[re.Pattern[str]] = re.compile(
     r"^(?:taxable\s+(?:amount|value)|sub\s*total|net\s+(?:amount|value)|"
@@ -89,6 +82,11 @@ _LABEL_GRAND: Final[re.Pattern[str]] = re.compile(
     re.IGNORECASE,
 )
 
+# A GSTIN's first two characters are the state code (``10`` = Bihar,
+# ``27`` = Maharashtra, etc.). Intra-state when vendor and buyer share
+# the prefix; inter-state otherwise.
+_GSTIN_STATE_LEN: Final[int] = 2
+
 
 # ---------------------------------------------------------------------------
 # Output types
@@ -97,30 +95,30 @@ _LABEL_GRAND: Final[re.Pattern[str]] = re.compile(
 
 @dataclass(frozen=True)
 class ReconciliationIssue:
-    """One disagreement between observed (invoice) and computed (Python)."""
-
     code: str
     message: str
 
 
 @dataclass(frozen=True)
 class ReconciledLineItem:
-    """Per-line canonical numbers derived by Python, never by the LLM."""
-
     description: str | None
     hsn_sac: str | None
     quantity: Decimal | None
     unit_price: Decimal | None
     taxable: Decimal
-    tax_total: Decimal
+    tax_rate: Decimal           # total tax % on this line (e.g. 5, 18)
+    cgst_amount: Decimal
+    sgst_amount: Decimal
+    igst_amount: Decimal
 
 
 @dataclass(frozen=True)
 class ReconciledInvoice:
-    """The canonical, downstream-of-truth totals for one invoice."""
-
     line_items: tuple[ReconciledLineItem, ...]
     taxable: Decimal
+    # Aggregate buckets — sums of the per-line amounts above. The
+    # *_rate fields are the WEIGHTED-MAJORITY rate where one applies,
+    # or ZERO when no single rate dominates (multi-rate invoice).
     cgst_rate: Decimal
     cgst_amount: Decimal
     sgst_rate: Decimal
@@ -128,10 +126,15 @@ class ReconciledInvoice:
     igst_rate: Decimal
     igst_amount: Decimal
     grand_total: Decimal
+    # Per-rate breakdown (``{rate -> (cgst_share, sgst_share, igst_share)}``)
+    # so the summary can render "CGST 1,174.49 (713.81 @ 2.5% + 460.68 @ 9%)".
+    rate_breakdown: tuple[tuple[Decimal, Decimal, Decimal, Decimal], ...] = field(
+        default_factory=tuple
+    )
+    intra_state: bool = True
     discrepancies: tuple[ReconciliationIssue, ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, Any]:
-        """JSON-safe dump used for persistence + summary rendering."""
         return {
             "line_items": [
                 {
@@ -140,7 +143,10 @@ class ReconciledInvoice:
                     "quantity": str(li.quantity) if li.quantity is not None else None,
                     "unit_price": str(li.unit_price) if li.unit_price is not None else None,
                     "taxable": str(li.taxable),
-                    "tax_total": str(li.tax_total),
+                    "tax_rate": str(li.tax_rate),
+                    "cgst_amount": str(li.cgst_amount),
+                    "sgst_amount": str(li.sgst_amount),
+                    "igst_amount": str(li.igst_amount),
                 }
                 for li in self.line_items
             ],
@@ -152,6 +158,16 @@ class ReconciledInvoice:
             "igst_rate": str(self.igst_rate),
             "igst_amount": str(self.igst_amount),
             "grand_total": str(self.grand_total),
+            "intra_state": self.intra_state,
+            "rate_breakdown": [
+                {
+                    "rate": str(rate),
+                    "cgst": str(cgst),
+                    "sgst": str(sgst),
+                    "igst": str(igst),
+                }
+                for rate, cgst, sgst, igst in self.rate_breakdown
+            ],
             "discrepancies": [
                 {"code": d.code, "message": d.message} for d in self.discrepancies
             ],
@@ -159,7 +175,7 @@ class ReconciledInvoice:
 
 
 # ---------------------------------------------------------------------------
-# Money parsing — accept None and bad input quietly (reconciler tolerates)
+# Parsing helpers
 # ---------------------------------------------------------------------------
 
 
@@ -183,28 +199,97 @@ def _parse_rate(text: object) -> Decimal | None:
         return None
     try:
         return Decimal(match.group(1))
-    except Exception:  # pragma: no cover — Decimal is forgiving
+    except Exception:  # pragma: no cover
         return None
 
 
-# ---------------------------------------------------------------------------
-# Line-item reconciliation
-# ---------------------------------------------------------------------------
+def _str_or_none(value: object) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if value is None:
+        return None
+    return str(value)
 
 
-def _reconcile_line(item: dict[str, Any]) -> ReconciledLineItem | None:
-    """Derive canonical (taxable, tax_total) for a single line.
+def _state_code(gstin: object) -> str | None:
+    """GSTIN's first two characters are the state code."""
+    if not isinstance(gstin, str):
+        return None
+    clean = gstin.strip().upper()
+    if len(clean) < _GSTIN_STATE_LEN:
+        return None
+    prefix = clean[:_GSTIN_STATE_LEN]
+    if not prefix.isdigit():
+        return None
+    return prefix
 
-    Precedence for ``taxable``:
-      1. ``line_amount - tax_amount`` (most precise — both are printed
-         on the invoice, no division).
-      2. ``quantity * unit_price`` (loses precision when unit_price was
-         rounded by the invoice template, e.g. ₹61.9 instead of
-         ₹61.9047619...).
-      3. The LLM's ``taxable_value`` is a last resort and only when
-         neither (1) nor (2) is derivable — the field is known to
-         hallucinate.
+
+def _detect_intra_state(extraction: dict[str, Any]) -> bool:
+    """True iff vendor and buyer carry the same state code. Defaults True.
+
+    When either GSTIN is missing or unreadable we fall back to intra-state —
+    that's the more common case for the CA firms we serve, and the
+    reconciler's discrepancy checks will catch a wrong allocation against
+    the observed labels.
     """
+    vendor_gstin = (extraction.get("vendor") or {}).get("gstin")
+    buyer_gstin = (extraction.get("buyer") or {}).get("gstin")
+    vs = _state_code(vendor_gstin)
+    bs = _state_code(buyer_gstin)
+    if vs is None or bs is None:
+        return True
+    return vs == bs
+
+
+# ---------------------------------------------------------------------------
+# Per-line tax rate derivation
+# ---------------------------------------------------------------------------
+
+
+def _derive_line_rate(
+    item: dict[str, Any], taxable: Decimal, tax_amount: Decimal | None
+) -> Decimal:
+    """Derive the TOTAL tax rate on a single line.
+
+    Precedence:
+      1. ``tax_amount / taxable * 100`` rounded to the nearest 0.5
+         (so 17.99% snaps to 18, 4.97% snaps to 5). This is the most
+         reliable signal because both inputs are read straight off
+         the printed cells.
+      2. The numeric rate in a ``tax_label`` string (e.g. ``"5%"``,
+         ``"(18%)"`` — what the invoice prints under the tax column).
+      3. Sum of the LLM-emitted ``cgst_rate + sgst_rate`` (intra-state
+         convention: each is half of total).
+      4. The LLM-emitted ``igst_rate`` (inter-state, single bucket).
+
+    Returns ZERO when no rate can be inferred — the line is then
+    treated as exempt/zero-rated.
+    """
+    if taxable > ZERO and tax_amount is not None and tax_amount >= ZERO:
+        raw = tax_amount / taxable * Decimal(100)
+        # Snap to the nearest 0.5% — handles 17.99 → 18, 5.001 → 5.
+        snapped = (raw * Decimal(2)).quantize(Decimal("1")) / Decimal(2)
+        if snapped >= ZERO:
+            return snapped
+
+    label_rate = _parse_rate(item.get("tax_label"))
+    if label_rate is not None:
+        return label_rate
+
+    cgst = _safe_money(item.get("cgst_rate")) or ZERO
+    sgst = _safe_money(item.get("sgst_rate")) or ZERO
+    if cgst > ZERO or sgst > ZERO:
+        return cgst + sgst
+
+    igst = _safe_money(item.get("igst_rate"))
+    if igst is not None and igst > ZERO:
+        return igst
+
+    return ZERO
+
+
+def _reconcile_line(item: dict[str, Any], *, intra_state: bool) -> ReconciledLineItem | None:
+    """Derive canonical numbers for a single line, given the state mode."""
     if not isinstance(item, dict):
         return None
     qty = _safe_money(item.get("quantity"))
@@ -218,24 +303,27 @@ def _reconcile_line(item: dict[str, Any]) -> ReconciledLineItem | None:
     elif qty is not None and unit_price is not None:
         taxable = qty * unit_price
     else:
-        # Last resort: trust the LLM. Tagged for the discrepancy report
-        # upstream — if we ever rely on this, the caller flags it.
         fallback = _safe_money(item.get("taxable_value"))
         if fallback is not None:
             taxable = fallback
 
-    if taxable is None:
+    if taxable is None or taxable < ZERO:
         return None
 
-    tax_total: Decimal = ZERO
-    if tax_amount is not None:
-        tax_total = tax_amount
+    rate = _derive_line_rate(item, taxable, tax_amount)
+    # Allocate the line's tax according to state mode. We compute the
+    # *amount* from canonical_taxable × rate rather than trusting the
+    # LLM's per-tax-bucket figures (which is exactly where v1 went
+    # wrong on mixed-rate invoices).
+    if intra_state:
+        half_rate = rate / Decimal(2)
+        cgst_amount = quantize_money(taxable * half_rate / Decimal(100))
+        sgst_amount = quantize_money(taxable * half_rate / Decimal(100))
+        igst_amount = ZERO
     else:
-        # Derive from rates if available — this is the LLM's last gift to us.
-        for rate_key in ("cgst_rate", "sgst_rate", "igst_rate"):
-            rate = _safe_money(item.get(rate_key))
-            if rate is not None and rate > ZERO:
-                tax_total += quantize_money(taxable * rate / Decimal(100))
+        cgst_amount = ZERO
+        sgst_amount = ZERO
+        igst_amount = quantize_money(taxable * rate / Decimal(100))
 
     return ReconciledLineItem(
         description=_str_or_none(item.get("description")),
@@ -243,44 +331,35 @@ def _reconcile_line(item: dict[str, Any]) -> ReconciledLineItem | None:
         quantity=qty,
         unit_price=unit_price,
         taxable=quantize_money(taxable),
-        tax_total=quantize_money(tax_total),
+        tax_rate=rate,
+        cgst_amount=cgst_amount,
+        sgst_amount=sgst_amount,
+        igst_amount=igst_amount,
     )
 
 
-def _str_or_none(value: object) -> str | None:
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    if value is None:
-        return None
-    return str(value)
-
-
 # ---------------------------------------------------------------------------
-# Observed-totals parsing
+# Observed totals parsing — now aware that CGST/SGST/IGST can repeat
 # ---------------------------------------------------------------------------
 
 
 @dataclass
-class _ObservedTotals:
-    """Parsed (label, amount) pairs from the invoice's totals section."""
-
+class _ObservedSums:
     taxable: Decimal | None = None
-    cgst: tuple[Decimal, Decimal] | None = None  # (rate, amount)
-    sgst: tuple[Decimal, Decimal] | None = None
-    igst: tuple[Decimal, Decimal] | None = None
+    cgst_total: Decimal | None = None
+    sgst_total: Decimal | None = None
+    igst_total: Decimal | None = None
     grand: Decimal | None = None
 
 
-def _parse_observed_totals(observed: object) -> _ObservedTotals:
-    """Walk a list of ``{label, amount}`` dicts and extract the canonical fields.
+def _parse_observed_totals(observed: object) -> _ObservedSums:
+    """Walk the labelled totals block, SUMMING tax rows by bucket.
 
-    Accepts the LLM-friendly shape:
-        [{"label": "CGST @2.5%", "amount": "232.14"}, ...]
-
-    Any item that doesn't match a known label is ignored — we don't try
-    to interpret unknown labels.
+    A mixed-rate invoice prints multiple CGST rows (``"CGST @2.5%"``
+    and ``"CGST @9%"``); both belong to the same bucket and must be
+    added. Same for SGST and IGST.
     """
-    parsed = _ObservedTotals()
+    parsed = _ObservedSums()
     if not isinstance(observed, list):
         return parsed
     for entry in observed:
@@ -290,17 +369,16 @@ def _parse_observed_totals(observed: object) -> _ObservedTotals:
         amount = _safe_money(entry.get("amount"))
         if not isinstance(label, str) or amount is None:
             continue
-        clean_label = label.strip()
-        rate = _parse_rate(clean_label)
-        if _LABEL_TAXABLE.match(clean_label):
+        clean = label.strip()
+        if _LABEL_TAXABLE.match(clean):
             parsed.taxable = amount
-        elif _LABEL_CGST.match(clean_label):
-            parsed.cgst = (rate or ZERO, amount)
-        elif _LABEL_SGST.match(clean_label):
-            parsed.sgst = (rate or ZERO, amount)
-        elif _LABEL_IGST.match(clean_label):
-            parsed.igst = (rate or ZERO, amount)
-        elif _LABEL_GRAND.match(clean_label):
+        elif _LABEL_CGST.match(clean):
+            parsed.cgst_total = (parsed.cgst_total or ZERO) + amount
+        elif _LABEL_SGST.match(clean):
+            parsed.sgst_total = (parsed.sgst_total or ZERO) + amount
+        elif _LABEL_IGST.match(clean):
+            parsed.igst_total = (parsed.igst_total or ZERO) + amount
+        elif _LABEL_GRAND.match(clean):
             parsed.grand = amount
     return parsed
 
@@ -310,51 +388,45 @@ def _parse_observed_totals(observed: object) -> _ObservedTotals:
 # ---------------------------------------------------------------------------
 
 
-def reconcile_extraction(extraction: dict[str, Any]) -> ReconciledInvoice:  # noqa: PLR0912
+def reconcile_extraction(extraction: dict[str, Any]) -> ReconciledInvoice:  # noqa: PLR0912, PLR0915
     """Compute canonical totals from an extraction. NEVER trust LLM math.
 
-    Inputs taken seriously:
-
-    * ``line_items[].quantity`` and ``unit_price`` (raw OCR — cleanly read)
-    * ``line_items[].tax_amount`` and ``line_amount`` (raw OCR — printed)
-    * ``line_items[].(c|s|i)gst_rate`` (rate, not amount — extracted cleanly)
-    * ``observed_totals`` if present (the labelled totals block, NEW schema)
-
-    Inputs IGNORED (these are the hallucination hotspots):
-
-    * ``line_items[].taxable_value`` — only used as a last-resort fallback
-    * ``line_items[].(c|s|i)gst_amount`` — recomputed from rate + canonical taxable
-    * ``totals.*`` — never trusted; ``observed_totals`` is the new path
-
-    Decimal math throughout; output values are 2-dp quantised.
+    See module docstring for the architectural rationale.
     """
     items_raw = extraction.get("line_items") or []
     if not isinstance(items_raw, list):
         items_raw = []
+
+    intra_state = _detect_intra_state(extraction)
+
     line_items: list[ReconciledLineItem] = []
     for raw in items_raw:
-        rec = _reconcile_line(raw)
+        rec = _reconcile_line(raw, intra_state=intra_state)
         if rec is not None:
             line_items.append(rec)
 
     line_items_taxable = (
         sum_money([li.taxable for li in line_items]) if line_items else ZERO
     )
-    line_items_tax_total = (
-        sum_money([li.tax_total for li in line_items]) if line_items else ZERO
+    line_items_cgst = (
+        sum_money([li.cgst_amount for li in line_items]) if line_items else ZERO
+    )
+    line_items_sgst = (
+        sum_money([li.sgst_amount for li in line_items]) if line_items else ZERO
+    )
+    line_items_igst = (
+        sum_money([li.igst_amount for li in line_items]) if line_items else ZERO
     )
 
     observed = _parse_observed_totals(extraction.get("observed_totals"))
     discrepancies: list[ReconciliationIssue] = []
 
-    # Pick canonical taxable. Prefer line-item sum when it agrees with the
-    # observed label within tolerance; otherwise trust line items and flag.
+    # Canonical taxable: prefer observed when it matches line items
+    # within tolerance (it carries the invoice's native precision);
+    # otherwise trust line items and flag.
     canonical_taxable = line_items_taxable
     if observed.taxable is not None:
         if abs(observed.taxable - line_items_taxable) > _TOLERANCE_PAISA:
-            # The observed-label number disagrees with the line-item sum.
-            # Default to the line-item sum (math from raw cells is more
-            # reliable than the LLM identifying the right row), but flag.
             discrepancies.append(
                 ReconciliationIssue(
                     code="taxable_mismatch",
@@ -365,63 +437,30 @@ def reconcile_extraction(extraction: dict[str, Any]) -> ReconciledInvoice:  # no
                 )
             )
         else:
-            # Observed agrees — prefer it (it carries the invoice's
-            # native precision, not the qty*unit_price rounding loss).
             canonical_taxable = observed.taxable
 
-    # Tax rates: prefer observed labels (they carry "@2.5%"). Fall back to
-    # the first non-zero per-line rate the LLM emitted.
-    cgst_rate, cgst_obs_amount = observed.cgst or (None, None)
-    sgst_rate, sgst_obs_amount = observed.sgst or (None, None)
-    igst_rate, igst_obs_amount = observed.igst or (None, None)
-    if cgst_rate is None:
-        cgst_rate = _first_rate(items_raw, "cgst_rate")
-    if sgst_rate is None:
-        sgst_rate = _first_rate(items_raw, "sgst_rate")
-    if igst_rate is None:
-        igst_rate = _first_rate(items_raw, "igst_rate")
-    cgst_rate = cgst_rate or ZERO
-    sgst_rate = sgst_rate or ZERO
-    igst_rate = igst_rate or ZERO
-
-    # Compute canonical taxes from canonical taxable and parsed rates.
-    cgst_amount = quantize_money(canonical_taxable * cgst_rate / Decimal(100))
-    sgst_amount = quantize_money(canonical_taxable * sgst_rate / Decimal(100))
-    igst_amount = quantize_money(canonical_taxable * igst_rate / Decimal(100))
-
-    # If the observed CGST/SGST/IGST amounts differ from computed by more
-    # than tolerance, flag — that's a real arithmetic mismatch on the PDF.
-    for label, observed_amt, computed_amt in (
-        ("CGST", cgst_obs_amount, cgst_amount),
-        ("SGST", sgst_obs_amount, sgst_amount),
-        ("IGST", igst_obs_amount, igst_amount),
+    # Cross-check the observed CGST / SGST / IGST sums (over all rate slices)
+    # against the line-item per-bucket sums.
+    for bucket, observed_total, computed_total in (
+        ("CGST", observed.cgst_total, line_items_cgst),
+        ("SGST", observed.sgst_total, line_items_sgst),
+        ("IGST", observed.igst_total, line_items_igst),
     ):
-        if observed_amt is not None and abs(observed_amt - computed_amt) > _TOLERANCE_PAISA:
+        if observed_total is None:
+            continue
+        if abs(observed_total - computed_total) > _TOLERANCE_PAISA:
             discrepancies.append(
                 ReconciliationIssue(
-                    code=f"{label.lower()}_mismatch",
+                    code=f"{bucket.lower()}_mismatch",
                     message=(
-                        f"Invoice shows {label} {observed_amt}, "
-                        f"computed {computed_amt} from taxable * rate."
+                        f"Invoice shows total {bucket} {observed_total}, "
+                        f"computed {computed_total} from line items."
                     ),
                 )
             )
 
-    # Cross-check line-item tax_total against computed total tax.
-    computed_total_tax = cgst_amount + sgst_amount + igst_amount
-    if line_items and abs(line_items_tax_total - computed_total_tax) > _TOLERANCE_PAISA:
-        discrepancies.append(
-            ReconciliationIssue(
-                code="line_tax_sum_mismatch",
-                message=(
-                    f"Sum of line tax_amounts {line_items_tax_total} differs "
-                    f"from computed total tax {computed_total_tax}."
-                ),
-            )
-        )
-
     canonical_grand = quantize_money(
-        canonical_taxable + cgst_amount + sgst_amount + igst_amount
+        canonical_taxable + line_items_cgst + line_items_sgst + line_items_igst
     )
     if observed.grand is not None and abs(observed.grand - canonical_grand) > _TOLERANCE_PAISA:
         discrepancies.append(
@@ -434,24 +473,44 @@ def reconcile_extraction(extraction: dict[str, Any]) -> ReconciledInvoice:  # no
             )
         )
 
+    # Group per-line amounts by tax rate so the summary can render
+    # "CGST 1,174.49 (713.81 @ 2.5% + 460.68 @ 9%)".
+    by_rate: dict[Decimal, tuple[Decimal, Decimal, Decimal]] = defaultdict(
+        lambda: (ZERO, ZERO, ZERO)
+    )
+    for li in line_items:
+        cgst, sgst, igst = by_rate[li.tax_rate]
+        by_rate[li.tax_rate] = (
+            cgst + li.cgst_amount,
+            sgst + li.sgst_amount,
+            igst + li.igst_amount,
+        )
+    rate_breakdown = tuple(
+        (rate, *amounts) for rate, amounts in sorted(by_rate.items())
+    )
+
+    # Pick an aggregate "rate" only when ONE rate dominates the entire
+    # invoice — otherwise leave it as ZERO so the summary defers to the
+    # breakdown.  This is intentionally cautious because the verifier's
+    # legacy per-line ``rate × taxable ≈ amount`` check would mis-fire
+    # on a mixed-rate invoice if we surfaced a single rate here.
+    if len(by_rate) == 1:
+        single_rate = next(iter(by_rate))
+        aggregate_rate = single_rate
+    else:
+        aggregate_rate = ZERO
+
     return ReconciledInvoice(
         line_items=tuple(line_items),
         taxable=quantize_money(canonical_taxable),
-        cgst_rate=cgst_rate,
-        cgst_amount=cgst_amount,
-        sgst_rate=sgst_rate,
-        sgst_amount=sgst_amount,
-        igst_rate=igst_rate,
-        igst_amount=igst_amount,
+        cgst_rate=aggregate_rate / Decimal(2) if intra_state else ZERO,
+        cgst_amount=quantize_money(line_items_cgst),
+        sgst_rate=aggregate_rate / Decimal(2) if intra_state else ZERO,
+        sgst_amount=quantize_money(line_items_sgst),
+        igst_rate=ZERO if intra_state else aggregate_rate,
+        igst_amount=quantize_money(line_items_igst),
         grand_total=canonical_grand,
+        rate_breakdown=rate_breakdown,
+        intra_state=intra_state,
         discrepancies=tuple(discrepancies),
     )
-
-
-def _first_rate(items: list[Any], key: str) -> Decimal | None:
-    for item in items:
-        if isinstance(item, dict):
-            r = _safe_money(item.get(key))
-            if r is not None and r > ZERO:
-                return r
-    return None

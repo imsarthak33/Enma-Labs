@@ -59,7 +59,6 @@ from app.services.file_processor import (
     rasterize_pdf_page,
 )
 from app.tax.reconciler import reconcile_extraction
-from app.utils.decimal_utils import quantize_money
 from app.tax.itc import PeriodContext
 from app.utils.date_utils import FilingPeriod, now_ist, parse_iso_date
 
@@ -283,9 +282,12 @@ async def extract_only(file_bytes: bytes) -> ExtractionOutcome:
                 "total_igst": str(reconciled.igst_amount),
                 "grand_total": str(reconciled.grand_total),
             }
-            # Per-line math: overwrite the hallucinated *_amount fields
-            # with values derived from canonical taxable × rate. Rates the
-            # LLM read straight off the column header are preserved.
+            # Per-line math: overwrite EVERY mutable tax field with the
+            # reconciler's canonical values. Rates too — the LLM can
+            # hallucinate igst_rate>0 on an intra-state line, which used
+            # to make the verifier fire ``tax_coexistence`` even after
+            # the *_amount fields had been zeroed. Writing the rates in
+            # the same pass kills that whole class of false positives.
             for idx, rec_line in enumerate(reconciled.line_items):
                 if not (
                     isinstance(extraction_data.get("line_items"), list)
@@ -295,15 +297,22 @@ async def extract_only(file_bytes: bytes) -> ExtractionOutcome:
                     continue
                 target = extraction_data["line_items"][idx]
                 target["taxable_value"] = str(rec_line.taxable)
-                target["cgst_amount"] = str(
-                    quantize_money(rec_line.taxable * reconciled.cgst_rate / Decimal(100))
-                )
-                target["sgst_amount"] = str(
-                    quantize_money(rec_line.taxable * reconciled.sgst_rate / Decimal(100))
-                )
-                target["igst_amount"] = str(
-                    quantize_money(rec_line.taxable * reconciled.igst_rate / Decimal(100))
-                )
+                # For intra-state lines, CGST + SGST each carry half the
+                # line's total tax rate. For inter-state lines, the whole
+                # rate sits in IGST. ``rec_line.tax_rate`` is the line's
+                # total rate; the reconciler already split the amounts.
+                if reconciled.intra_state:
+                    half = rec_line.tax_rate / Decimal(2)
+                    target["cgst_rate"] = str(half)
+                    target["sgst_rate"] = str(half)
+                    target["igst_rate"] = "0"
+                else:
+                    target["cgst_rate"] = "0"
+                    target["sgst_rate"] = "0"
+                    target["igst_rate"] = str(rec_line.tax_rate)
+                target["cgst_amount"] = str(rec_line.cgst_amount)
+                target["sgst_amount"] = str(rec_line.sgst_amount)
+                target["igst_amount"] = str(rec_line.igst_amount)
             extraction_data["reconciliation"] = reconciled.to_dict()
             stages.append(
                 PipelineStageOutcome(
