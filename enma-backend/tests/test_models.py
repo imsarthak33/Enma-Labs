@@ -40,6 +40,7 @@ class TestModelRegistration:
         "idempotency_log",
         "identity_resolution_log",
         "client_notifications",
+        "tally_export_runs",
     }
 
     def test_all_tables_registered(self) -> None:
@@ -50,8 +51,8 @@ class TestModelRegistration:
         ), f"Missing tables: {self.EXPECTED_TABLES - registered}"
 
     def test_table_count(self) -> None:
-        """12 tables after Phase 6 adds ``pending_assignments``."""
-        assert len(Base.metadata.tables) == 12
+        """13 tables after W3 adds ``tally_export_runs``."""
+        assert len(Base.metadata.tables) == 13
 
 
 class TestCaFirmModel:

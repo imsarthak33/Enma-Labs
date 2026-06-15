@@ -33,27 +33,28 @@ Safety
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from typing import Any, Final, cast
 
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.context_injector import format_rules_for_prompt, load_rules_for_engine
 from app.db.queries.clients import ClientQuery
 from app.db.queries.documents import DocumentQuery
 from app.db.queries.filings import FilingQuery
 from app.db.queries.rules import RuleQuery
+from app.db.queries.tally_exports import TallyExportQuery
 from app.db.queries.tasks import TaskQuery
 from app.logging_setup import get_logger
 from app.prompts.master_prompt import build_supervisor_prompt
-from app.tax.directives import RuleDirective
-from app.tax.gstin_validator import is_valid_gstin
+from app.services import telegram as telegram_service
 from app.services.llm import (
     ChatMessage,
     ChatResponse,
@@ -61,6 +62,11 @@ from app.services.llm import (
     LLMRole,
     call_chat,
 )
+from app.services.tally import TallyInvoice, compose_tally_envelope
+from app.tax.directives import RuleDirective
+from app.tax.gstin_validator import is_valid_gstin
+from app.tax.reconciler import reconcile_extraction
+from app.utils.decimal_utils import parse_money
 
 __all__ = [
     "MAX_TOOL_ITERATIONS",
@@ -679,6 +685,203 @@ _ = RuleDirective
 
 
 # ---------------------------------------------------------------------------
+# W3 — Tally export.
+#
+# Composes a Tally Prime ENVELOPE XML for an (already-approved) filing
+# period and delivers it as a Telegram document to the CA. Audit row
+# written to ``tally_export_runs``. No email — Telegram-only delivery
+# in W3; SES is W4a once we own a verified sending domain.
+# ---------------------------------------------------------------------------
+
+
+_GRAND_TOTAL_LABELS: Final[frozenset[str]] = frozenset(
+    {"grand total", "total amount", "invoice total", "total invoice value"}
+)
+_EXPORTABLE_DOCUMENT_STATUSES: Final[frozenset[str]] = frozenset({"completed", "approved"})
+_MAX_FILENAME_SLUG_LEN: Final[int] = 40
+
+
+def _extract_invoice_grand_total(extraction: dict[str, Any]) -> Decimal | None:
+    """Pull the printed grand total from the extraction's observed totals.
+
+    Used by the Tally composer to emit a ``Rounded Off`` ledger entry
+    when canonical math undershoots the invoice's printed total by a
+    paisa or two. Returns ``None`` when the extraction doesn't carry a
+    recognisable grand-total label — the composer then trusts the
+    reconciler's canonical sum verbatim.
+    """
+    observed = extraction.get("observed_totals")
+    if isinstance(observed, list):
+        for entry in observed:
+            if not isinstance(entry, dict):
+                continue
+            raw_label = entry.get("label")
+            if not isinstance(raw_label, str):
+                continue
+            if raw_label.strip().lower() in _GRAND_TOTAL_LABELS:
+                try:
+                    return parse_money(entry.get("amount"))
+                except (TypeError, ValueError):
+                    return None
+    totals = extraction.get("totals")
+    if isinstance(totals, dict):
+        try:
+            return parse_money(totals.get("grand_total"))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _parse_invoice_date(raw: object) -> date | None:
+    """Accept ``YYYY-MM-DD`` (and longer ISO timestamps) from the extraction."""
+    if isinstance(raw, str) and len(raw) >= 10:
+        try:
+            return date.fromisoformat(raw[:10])
+        except ValueError:
+            return None
+    return None
+
+
+def _filename_slug(name: str) -> str:
+    """Filesystem-safe slug from a trade name (no spaces, ASCII-friendly)."""
+    cleaned = "".join(c if c.isalnum() else "_" for c in name).strip("_")
+    return (cleaned or "client")[:_MAX_FILENAME_SLUG_LEN]
+
+
+async def _tool_export_to_tally(
+    ctx: SupervisorContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Compose a Tally Prime XML for (client, month, year) and send it.
+
+    Acceptance criteria (W3):
+      * Filing period MUST be locked (approved). Open periods refuse with
+        an actionable error so the supervisor can tell the CA to approve
+        the filing first.
+      * Only documents with ``processing_status`` in
+        ``{completed, approved}`` are included — pending/flagged/failed
+        documents are skipped (and counted in the response).
+      * Each invoice's canonical math is recomputed via
+        :func:`reconcile_extraction` so the export reflects the latest
+        reconciler; the LLM's totals are never trusted.
+      * One immutable audit row written to ``tally_export_runs``.
+      * Delivered as a Telegram document; no email in W3.
+    """
+    month = _coerce_int_or_none(args.get("month"))
+    year = _coerce_int_or_none(args.get("year"))
+    if month is None or year is None:
+        raise ToolError("month and year are required (e.g. month=7, year=2025)")
+    if not (1 <= month <= 12):
+        raise ToolError("month must be between 1 and 12")
+
+    client = await _resolve_client_from_args(ctx, args)
+
+    filings = FilingQuery(session=ctx.session, ca_firm_id=ctx.ca_firm_id)
+    if not await filings.is_period_locked(month=month, year=year):
+        raise ToolError(
+            f"Filing for {month:02d}/{year} has not been approved yet. "
+            "Run ENMA APPROVE FILING for this period first, then export."
+        )
+
+    docs_q = DocumentQuery(session=ctx.session, ca_firm_id=ctx.ca_firm_id)
+    period_docs = await docs_q.list_by_filing_period(year=year, month=month)
+    client_docs = [d for d in period_docs if d.client_id == client.id]
+    eligible = [
+        d for d in client_docs
+        if (d.processing_status or "").lower() in _EXPORTABLE_DOCUMENT_STATUSES
+    ]
+    skipped = len(client_docs) - len(eligible)
+    if not eligible:
+        return {
+            "exported": False,
+            "reason": "no_eligible_documents",
+            "client": client.trade_name,
+            "month": month,
+            "year": year,
+            "documents_in_period": len(client_docs),
+            "documents_skipped": skipped,
+        }
+
+    invoices: list[TallyInvoice] = []
+    for doc in eligible:
+        extraction = doc.extraction_data or {}
+        reconciled = reconcile_extraction(extraction)
+        vendor_raw = (extraction.get("vendor") or {}).get("name")
+        vendor_name = str(vendor_raw).strip() if vendor_raw else "Unknown Vendor"
+        invoice_number = str(extraction.get("invoice_number") or str(doc.id)[:8])
+        inv_date = _parse_invoice_date(extraction.get("invoice_date"))
+        if inv_date is None:
+            inv_date = doc.created_at.date()
+        invoices.append(
+            TallyInvoice(
+                vendor_name=vendor_name,
+                invoice_number=invoice_number,
+                invoice_date=inv_date,
+                reconciled=reconciled,
+                invoice_grand_total=_extract_invoice_grand_total(extraction),
+            )
+        )
+
+    xml_bytes = compose_tally_envelope(
+        company_name=client.trade_name,
+        invoices=invoices,
+    )
+    file_sha256 = hashlib.sha256(xml_bytes).hexdigest()
+
+    filename = f"{_filename_slug(client.trade_name)}_{year:04d}-{month:02d}_tally.xml"
+    caption = (
+        f"<b>Tally export</b>\n"
+        f"Client: {_xml_escape_for_telegram(client.trade_name)}\n"
+        f"Period: {month:02d}/{year}\n"
+        f"Vouchers: {len(invoices)}"
+    )
+    await telegram_service.send_document(
+        chat_id=ctx.chat_id,
+        file_bytes=xml_bytes,
+        filename=filename,
+        caption_html=caption,
+    )
+
+    exports_q = TallyExportQuery(session=ctx.session, ca_firm_id=ctx.ca_firm_id)
+    await exports_q.create(
+        client_id=client.id,
+        filing_month=month,
+        filing_year=year,
+        voucher_count=len(invoices),
+        file_sha256=file_sha256,
+        exported_by_chat_id=ctx.chat_id,
+    )
+    await ctx.session.commit()
+
+    _log.info(
+        "tally_export_completed",
+        ca_firm_id=str(ctx.ca_firm_id),
+        client_id=str(client.id),
+        month=month,
+        year=year,
+        voucher_count=len(invoices),
+        file_sha256=file_sha256,
+    )
+
+    return {
+        "exported": True,
+        "client": client.trade_name,
+        "month": month,
+        "year": year,
+        "voucher_count": len(invoices),
+        "documents_skipped": skipped,
+        "file_sha256": file_sha256,
+        "filename": filename,
+    }
+
+
+def _xml_escape_for_telegram(text: str) -> str:
+    """Same as Telegram HTML escape — keep imports localised."""
+    return (
+        text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
@@ -893,6 +1096,33 @@ TOOLS: Final[dict[str, ToolSpec]] = {
             "additionalProperties": False,
         },
         runner=_tool_add_firm_rule,
+    ),
+    "export_to_tally": ToolSpec(
+        name="export_to_tally",
+        description=(
+            "Compose a Tally Prime ENVELOPE XML for one client's filing "
+            "period and deliver it to the CA as a Telegram document. Use "
+            "when the CA says 'export July 2025 for CLEIND', 'send me the "
+            "Tally file for client X for last month', 'push June filings "
+            "to Tally for ABC Corp'. The filing period MUST already be "
+            "approved (run ENMA APPROVE FILING first); the tool returns "
+            "an actionable error otherwise. Pass client_id OR client_name "
+            "plus month (1-12) and year (e.g. 2025). The audit row in "
+            "tally_export_runs is written automatically. Surface the "
+            "voucher_count and file_sha256 in your reply."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "client_id": {"type": "string"},
+                "client_name": {"type": "string"},
+                "month": {"type": "integer", "minimum": 1, "maximum": 12},
+                "year": {"type": "integer", "minimum": 2020, "maximum": 2100},
+            },
+            "required": ["month", "year"],
+            "additionalProperties": False,
+        },
+        runner=_tool_export_to_tally,
     ),
 }
 

@@ -17,6 +17,7 @@ from app.db.models.infrastructure import (
 )
 from app.db.models.pending_assignment import PendingAssignment
 from app.db.models.rule import CaFirmRule
+from app.db.models.tally_export_run import TallyExportRun
 from app.db.models.task import Task
 
 __all__ = [
@@ -31,5 +32,6 @@ __all__ = [
     "IdempotencyLog",
     "IdentityResolutionLog",
     "PendingAssignment",
+    "TallyExportRun",
     "Task",
 ]
