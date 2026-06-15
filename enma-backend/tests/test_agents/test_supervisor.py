@@ -26,6 +26,7 @@ from app.agents.supervisor import (
     ToolSpec,
     _coerce_int_or_none,
     _coerce_uuid_or_none,
+    _looks_like_json,
     _tool_result_carries_error,
     run_supervisor,
 )
@@ -282,6 +283,95 @@ class TestToolResultCarriesError:
     def test_ignores_json_non_object(self) -> None:
         assert _tool_result_carries_error("[1, 2, 3]") is False
         assert _tool_result_carries_error("42") is False
+
+
+class TestLooksLikeJson:
+    """Guard against the LLM-parroting-tool-JSON pattern."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '{"found": true, "client": {"trade_name": "ABC"}}',
+            '  {"error": "x"}  ',
+            "[1, 2, 3]",
+            '{"a": 1}',
+        ],
+    )
+    def test_detects_json(self, text: str) -> None:
+        assert _looks_like_json(text) is True
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "",
+            "   ",
+            "ABC Corp is on file — 3 open tasks.",
+            "{not json}",
+            "✅ Done.",
+            "I can't export June 2026 yet.",
+            "Filing for 06/2026 has not been approved yet.",
+        ],
+    )
+    def test_ignores_natural_text(self, text: str) -> None:
+        assert _looks_like_json(text) is False
+
+
+class TestJsonParrotRewrite:
+    """Regression for the 'hi enma' production incident: LLM emitted
+    get_client_status result verbatim as its assistant content. The
+    supervisor must catch JSON and re-prompt for a natural-text reply.
+    """
+
+    @pytest.mark.asyncio
+    async def test_llm_json_reply_gets_rewritten(self, _no_rules: Any) -> None:
+        ctx = SupervisorContext(
+            session=AsyncMock(), ca_firm_id=uuid.uuid4(), chat_id=42
+        )
+        tool_call = {
+            "id": "call_p",
+            "type": "function",
+            "function": {"name": "get_client_status", "arguments": "{}"},
+        }
+        first = _chat_response(tool_calls=[tool_call])
+        # The LLM parrots the tool result as its content (the bug we're fixing).
+        leaked = _chat_response(content='{"found": true, "client": {"trade_name": "ABC"}}')
+        # The defensive rewrite call returns the natural-English version.
+        rewritten = _chat_response(content="ABC Corp is on file — 0 open tasks.")
+        seq = [first, leaked, rewritten]
+
+        async def _next_response(*_a: Any, **_kw: Any) -> ChatResponse:
+            return seq.pop(0)
+
+        async def _runner(_ctx: SupervisorContext, _args: dict[str, Any]) -> dict[str, Any]:
+            return {"found": True, "client": {"trade_name": "ABC"}, "open_task_count": 0}
+
+        swapped = _swap_runner("get_client_status", _runner)
+        with (
+            patch.dict(TOOLS, {"get_client_status": swapped}, clear=False),
+            patch("app.agents.supervisor.call_chat", new=_next_response),
+        ):
+            reply = await run_supervisor(ctx=ctx, user_text="status of ABC?")
+        assert reply.text == "ABC Corp is on file — 0 open tasks."
+        # Sanity: the response is not the JSON.
+        assert "trade_name" not in reply.text
+        assert not reply.text.startswith("{")
+
+    @pytest.mark.asyncio
+    async def test_rewrite_also_json_falls_back(self, _no_rules: Any) -> None:
+        """If the rewrite ALSO emits JSON, surface the canned fallback."""
+        ctx = SupervisorContext(
+            session=AsyncMock(), ca_firm_id=uuid.uuid4(), chat_id=42
+        )
+        leaked = _chat_response(content='{"x": 1}')
+        still_leaked = _chat_response(content='{"y": 2}')
+        seq = [leaked, still_leaked]
+
+        async def _next_response(*_a: Any, **_kw: Any) -> ChatResponse:
+            return seq.pop(0)
+
+        with patch("app.agents.supervisor.call_chat", new=_next_response):
+            reply = await run_supervisor(ctx=ctx, user_text="hi")
+        assert reply.text == _LOOP_EXHAUSTED_FALLBACK
 
 
 class TestToolSchemas:

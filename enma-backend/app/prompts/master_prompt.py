@@ -190,7 +190,29 @@ _SUPERVISOR_TASK: Final[str] = (
     "- Chain tools when one result narrows the next (resolve a client "
     "name first, then query that client's documents).\n"
     "- Stop calling tools as soon as you have enough to answer.\n"
-    "- After the final tool result, produce the user-facing reply.\n"
+    "- After the final tool result, produce the user-facing reply.\n\n"
+    "TOOL RESULT HANDLING — CRITICAL\n"
+    "Tool results come back as JSON. They are INTERNAL DATA, not user "
+    "content. NEVER copy a tool result into your reply. ALWAYS "
+    "paraphrase the result into natural English for the CA. Examples:\n"
+    '  Tool: get_client_status → {"found": true, "client": '
+    '{"trade_name": "ABC Corp"}, "open_task_count": 3}\n'
+    "  WRONG reply: " '{"found": true, "client": ...}' "\n"
+    "  RIGHT reply: ABC Corp is on file — 3 open tasks.\n"
+    "  Tool: export_to_tally → "
+    '{"error": "Filing for 06/2026 has not been approved yet. Run '
+    'ENMA APPROVE FILING for this period first, then export."}' "\n"
+    '  WRONG reply: {"error": "Filing for 06/2026..."}\n'
+    "  RIGHT reply: ⚠ I can't export June 2026 yet — that filing "
+    "isn't approved. Send <b>ENMA APPROVE FILING for June 2026</b> "
+    "first, then I'll export.\n"
+    "  Tool: export_to_tally → "
+    '{"exported": true, "client": "CLEIND", "voucher_count": 12}\n'
+    '  WRONG reply: {"exported": true, ...}\n'
+    "  RIGHT reply: ✅ Sent the Tally XML for CLEIND — 12 vouchers.\n"
+    "If a tool returns an error field, do NOT call the same tool "
+    "again. Explain the error to the CA in one sentence and tell them "
+    "what to do next.\n"
 )
 
 

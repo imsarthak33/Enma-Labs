@@ -1213,6 +1213,71 @@ def _tool_result_carries_error(result_json: str) -> bool:
     return isinstance(parsed, dict) and "error" in parsed
 
 
+def _looks_like_json(text: str) -> bool:
+    """Heuristic: candidate user-facing reply is a raw JSON blob.
+
+    In production we observed ``meta/llama-3.3-70b-instruct`` parroting
+    tool-result JSON verbatim as its assistant content. The user-facing
+    reply should never start with ``{`` or ``[``; if it does and parses
+    cleanly, it's the parroting pattern.
+    """
+    stripped = text.strip()
+    if not stripped or stripped[0] not in {"{", "["}:
+        return False
+    try:
+        json.loads(stripped)
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
+_HUMANIZE_DIRECTIVE: Final[str] = (
+    "Your previous reply was raw JSON data, not natural language. The CA "
+    "must NEVER see JSON. Rewrite your reply as ONE short natural-English "
+    "sentence summarising what the tool found, or what went wrong and what "
+    "the CA should do next. Light HTML (<b>, <i>, <code>) and one status "
+    "emoji (✅ ⚠ ❌ 📊) at the head of the line are allowed. No JSON. "
+    "No code fences. No braces."
+)
+
+
+async def _humanize_if_json(
+    *,
+    messages: list[ChatMessage],
+    candidate: str,
+    tools: list[dict[str, Any]],
+) -> tuple[str, int, int]:
+    """Defensive guard: re-prompt the LLM if it parroted tool JSON.
+
+    Returns ``(final_text, extra_input_tokens, extra_output_tokens)``.
+    ``extra_*`` are 0 when the candidate already looks human-readable.
+    On any failure of the rewrite call, falls back to a canned message —
+    we never surface raw JSON to the user.
+    """
+    if not _looks_like_json(candidate):
+        return candidate, 0, 0
+
+    _log.warning("supervisor_json_parrot_detected", candidate_prefix=candidate[:120])
+    rewrite_messages: list[ChatMessage] = [*messages, {
+        "role": "system",
+        "content": _HUMANIZE_DIRECTIVE,
+    }]
+    try:
+        rewrite = await call_chat(
+            LLMRole.REASONING,
+            rewrite_messages,
+            temperature=0.0,
+            extra_body={"tools": tools, "tool_choice": "none"},
+        )
+    except LLMError:
+        return _LOOP_EXHAUSTED_FALLBACK, 0, 0
+
+    rewritten = (rewrite.content or "").strip()
+    if not rewritten or _looks_like_json(rewritten):
+        return _LOOP_EXHAUSTED_FALLBACK, rewrite.input_tokens, rewrite.output_tokens
+    return rewritten, rewrite.input_tokens, rewrite.output_tokens
+
+
 async def run_supervisor(
     *,
     ctx: SupervisorContext,
@@ -1273,6 +1338,11 @@ async def run_supervisor(
 
         if not tool_calls:
             text = (message.get("content") or response.content or "").strip()
+            text, rwi, rwo = await _humanize_if_json(
+                messages=messages, candidate=text, tools=tools,
+            )
+            total_input += rwi
+            total_output += rwo
             return SupervisorReply(
                 text=text or _LOOP_EXHAUSTED_FALLBACK,
                 tool_calls_made=tool_calls_made,
@@ -1338,6 +1408,12 @@ async def run_supervisor(
         text = (final_response.content or "").strip()
     except LLMError:
         text = ""
+
+    text, rwi, rwo = await _humanize_if_json(
+        messages=messages, candidate=text, tools=tools,
+    )
+    total_input += rwi
+    total_output += rwo
 
     return SupervisorReply(
         text=text or _LOOP_EXHAUSTED_FALLBACK,
