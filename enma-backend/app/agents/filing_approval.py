@@ -84,8 +84,17 @@ _MONTHS: Final[tuple[str, ...]] = (
     "December",
 )
 
+# Relaxed in W3-h3 so CAs can write the phrase naturally. We still
+# refuse anything that doesn't carry the full "ENMA APPROVE FILING"
+# keyword + a recognised month + a 4-digit year — so a typo'd
+# "approve filling" still won't lock a period. What we now allow:
+#   * an optional "for" / "of" between FILING and the month
+#   * case-insensitive month spelling ("June" or "june")
+#   * the keyword and "for"/"of" particles in either case
 APPROVAL_REGEX: Final[re.Pattern[str]] = re.compile(
-    r"^ENMA APPROVE FILING (" + "|".join(_MONTHS) + r") (\d{4})$"
+    r"^ENMA APPROVE FILING(?:\s+(?:for|of))?\s+"
+    r"(" + "|".join(_MONTHS) + r")\s+(\d{4})$",
+    re.IGNORECASE,
 )
 
 
@@ -148,8 +157,8 @@ class ApprovalResult:
 
 
 def _month_number(month_name: str) -> int:
-    """Convert the English month name (capitalised) to its 1-12 index."""
-    return _MONTHS.index(month_name) + 1
+    """Convert the English month name (any case) to its 1-12 index."""
+    return _MONTHS.index(month_name.strip().title()) + 1
 
 
 async def parse_approval_intent(

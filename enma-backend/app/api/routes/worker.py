@@ -41,17 +41,17 @@ from app.agents.commands import (
     is_slash_command,
     parse_command,
 )
-from app.agents.onboarding import (
-    handle_onboarding_reply,
-    handle_start,
-    is_in_onboarding,
-)
 from app.agents.filing_approval import (
     APPROVAL_REGEX,
     FilingPeriodAlreadyLocked,
     InvalidApprovalString,
     finalize_approval,
     parse_approval_intent,
+)
+from app.agents.onboarding import (
+    handle_onboarding_reply,
+    handle_start,
+    is_in_onboarding,
 )
 from app.agents.pipeline import (
     ExtractionOutcome,
@@ -92,7 +92,7 @@ _log = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
-async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PLR0911, PLR0912
+async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PLR0911
     """Background task for a single document envelope (R2 — extract-first).
 
     The autonomous-routing flow:
@@ -183,7 +183,7 @@ async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PL
             )
             return
 
-        assert outcome.client_id is not None  # noqa: S101 — narrowed by is_resolved
+        assert outcome.client_id is not None  # — narrowed by is_resolved
 
         clients = ClientQuery(session=session, ca_firm_id=firm.id)
         client = await clients.get_by_id(outcome.client_id)
@@ -510,11 +510,10 @@ async def _resume_pipeline_for_pending_assignment(
     pending_q = PendingAssignmentQuery(session=session, ca_firm_id=firm.id)
     # We can't use ``get_open_by_id`` here because the row was just resolved.
     # Re-query by id directly so we can read file_ids + the original message_id.
-    from sqlalchemy import select
 
     from app.db.models.pending_assignment import PendingAssignment
 
-    stmt = pending_q._scoped_select(PendingAssignment).where(  # noqa: SLF001
+    stmt = pending_q._scoped_select(PendingAssignment).where(
         PendingAssignment.id == pending_assignment_id
     )
     row = (await session.execute(stmt)).scalar_one_or_none()
@@ -677,7 +676,7 @@ _CONFIRM_REGEX: re.Pattern[str] = re.compile(
 )
 
 
-async def _run_command_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PLR0911
+async def _run_command_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PLR0911, PLR0912
     """Background task for a single command (text) envelope.
 
     Order of precedence:
@@ -1029,29 +1028,39 @@ _MONTH_NAMES: tuple[str, ...] = (
 # ---------------------------------------------------------------------------
 
 
+# Only document/voice ACKs are worth showing — those pipelines run for
+# 5-30s. Command and callback envelopes return within ~2s; an ACK plus
+# the real reply just clutters the chat. Drop the ACK for those kinds.
 _ACK_TEXT: dict[str, str] = {
     "document": "Processing your document…",
     "document_batch": "Processing your document batch…",
-    "command": "Working on it…",
     "voice": "Transcribing your voice note…",
-    "callback": "Got it.",
 }
 
 
-def _ack_html(kind: str) -> str:
-    text = _ACK_TEXT.get(kind, "Working on it…")
+def _ack_html(kind: str) -> str | None:
+    text = _ACK_TEXT.get(kind)
+    if text is None:
+        return None
     # All outbound text goes through the HTML helpers — no string interpolation.
     return italic(text)
 
 
 async def _send_ack(envelope: DecodedEnvelope) -> None:
-    """Best-effort ACK. Re-raises on failure so the route returns 502."""
+    """Best-effort ACK. Re-raises on failure so the route returns 502.
+
+    Quiet for fast envelope kinds (``command``, ``callback``) — see
+    :data:`_ACK_TEXT` for the kinds we still ACK.
+    """
     if envelope.chat_id is None:
         # Nothing to ACK to — common for cron-spawned envelopes.
         return
+    html = _ack_html(envelope.kind)
+    if html is None:
+        return
     await telegram.send_message(
         chat_id=envelope.chat_id,
-        html_text=_ack_html(envelope.kind),
+        html_text=html,
         reply_to_message_id=envelope.message_id,
     )
 

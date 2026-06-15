@@ -55,6 +55,7 @@ from app.db.queries.tasks import TaskQuery
 from app.logging_setup import get_logger
 from app.prompts.master_prompt import build_supervisor_prompt
 from app.services import telegram as telegram_service
+from app.services.export import generate_client_ledger_csv
 from app.services.llm import (
     ChatMessage,
     ChatResponse,
@@ -882,6 +883,95 @@ def _xml_escape_for_telegram(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# W3-h4 — Client ledger CSV export.
+#
+# Ported in from the KARO PITCH prototype. A CSV of every completed
+# document for one client (optionally narrowed to a filing period),
+# delivered as a Telegram attachment. utf-8-sig encoded so ₹ renders
+# in Excel. The composer lives in app/services/export.py — this tool
+# is the supervisor surface.
+# ---------------------------------------------------------------------------
+
+
+async def _tool_export_client_ledger(
+    ctx: SupervisorContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Compose a client-ledger CSV and deliver it as a Telegram document.
+
+    ``month`` and ``year`` are optional but must arrive together: passing
+    only one is a ToolError. Omitting both produces an all-time ledger
+    for the client (every completed document).
+    """
+    month = _coerce_int_or_none(args.get("month"))
+    year = _coerce_int_or_none(args.get("year"))
+    if (month is None) != (year is None):
+        raise ToolError("provide BOTH month and year, or neither for all-time")
+    if month is not None and not (1 <= month <= 12):
+        raise ToolError("month must be between 1 and 12")
+
+    client = await _resolve_client_from_args(ctx, args)
+
+    try:
+        csv_bytes = await generate_client_ledger_csv(
+            session=ctx.session,
+            ca_firm_id=ctx.ca_firm_id,
+            client_id=client.id,
+            month=month,
+            year=year,
+        )
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+
+    # csv_bytes always has at least the BOM + header + summary row;
+    # detect the "no eligible documents" case by counting body rows.
+    # Cheapest: compare to the empty-period byte length we know is
+    # produced — but more robust: decode and split.
+    decoded = csv_bytes.decode("utf-8-sig")
+    body_rows = decoded.count("\n") - 2  # header + summary excluded
+    if body_rows <= 0:
+        return {
+            "exported": False,
+            "reason": "no_eligible_documents",
+            "client": client.trade_name,
+            "month": month,
+            "year": year,
+        }
+
+    period_str = f"{year:04d}-{month:02d}" if month is not None and year is not None else "all-time"
+    filename = f"{_filename_slug(client.trade_name)}_{period_str}_ledger.csv"
+    caption = (
+        f"<b>Client ledger</b>\n"
+        f"Client: {_xml_escape_for_telegram(client.trade_name)}\n"
+        f"Period: {period_str}\n"
+        f"Rows: {body_rows}"
+    )
+    await telegram_service.send_document(
+        chat_id=ctx.chat_id,
+        file_bytes=csv_bytes,
+        filename=filename,
+        caption_html=caption,
+    )
+
+    _log.info(
+        "client_ledger_export_completed",
+        ca_firm_id=str(ctx.ca_firm_id),
+        client_id=str(client.id),
+        month=month,
+        year=year,
+        row_count=body_rows,
+    )
+
+    return {
+        "exported": True,
+        "client": client.trade_name,
+        "month": month,
+        "year": year,
+        "row_count": body_rows,
+        "filename": filename,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
@@ -1123,6 +1213,32 @@ TOOLS: Final[dict[str, ToolSpec]] = {
             "additionalProperties": False,
         },
         runner=_tool_export_to_tally,
+    ),
+    "export_client_ledger": ToolSpec(
+        name="export_client_ledger",
+        description=(
+            "Compose a CSV ledger for a client and deliver it to the CA "
+            "as a Telegram attachment (utf-8-sig so ₹ renders in Excel). "
+            "Use when the CA asks for 'the ledger for ABC Corp', 'send "
+            "me CLEIND's invoices for July', 'export the client ledger'. "
+            "Pass client_id OR client_name. month and year are OPTIONAL "
+            "but must arrive together — omit both for an all-time "
+            "ledger covering every completed document for that client. "
+            "Distinct from export_to_tally: this is the human-readable "
+            "spreadsheet view; export_to_tally is the Tally Prime XML "
+            "import file. Surface the row_count in your reply."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "client_id": {"type": "string"},
+                "client_name": {"type": "string"},
+                "month": {"type": "integer", "minimum": 1, "maximum": 12},
+                "year": {"type": "integer", "minimum": 2020, "maximum": 2100},
+            },
+            "additionalProperties": False,
+        },
+        runner=_tool_export_client_ledger,
     ),
 }
 

@@ -20,12 +20,25 @@ from app.agents.filing_approval import (
 
 
 class TestApprovalRegex:
+    """Approval regex was relaxed in W3-h3 so CAs can write the phrase
+    naturally. The keyword 'ENMA APPROVE FILING' is still required (so a
+    typo'd 'approve filling' won't lock anything), but case + the
+    'for'/'of' particles + reasonable whitespace are now tolerated."""
+
     @pytest.mark.parametrize(
         "text",
         [
             "ENMA APPROVE FILING January 2026",
             "ENMA APPROVE FILING March 2026",
             "ENMA APPROVE FILING December 2099",
+            # W3-h3 — natural phrasings.
+            "ENMA APPROVE FILING for June 2026",
+            "ENMA APPROVE FILING of June 2026",
+            # W3-h3 — case-insensitive on keyword and month.
+            "enma approve filing March 2026",
+            "ENMA approve FILING March 2026",
+            "ENMA APPROVE FILING march 2026",
+            "enma approve filing for june 2026",
         ],
     )
     def test_valid_match(self, text: str) -> None:
@@ -34,24 +47,20 @@ class TestApprovalRegex:
     @pytest.mark.parametrize(
         "text",
         [
-            # Wrong case.
-            "enma approve filing March 2026",
-            "ENMA approve FILING March 2026",
-            # Wrong month casing.
-            "ENMA APPROVE FILING march 2026",
             # Missing year.
             "ENMA APPROVE FILING March",
-            # Extra space.
-            "ENMA APPROVE FILING  March 2026",
-            # Lowercase year letters / non-4-digit.
+            # Non-4-digit year.
             "ENMA APPROVE FILING March 26",
-            # Wrong verb.
+            # Wrong verb — typo'd "filing" must still be rejected.
             "ENMA APPROVED FILING March 2026",
+            "ENMA APPROVE FILLING March 2026",
             # Surrounding text.
             "please ENMA APPROVE FILING March 2026",
             "ENMA APPROVE FILING March 2026 please",
             # Invented month.
             "ENMA APPROVE FILING Smarch 2026",
+            # Wrong connective particle.
+            "ENMA APPROVE FILING in March 2026",
         ],
     )
     def test_invalid(self, text: str) -> None:
