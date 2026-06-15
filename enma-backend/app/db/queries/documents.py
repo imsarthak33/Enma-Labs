@@ -7,7 +7,8 @@ import uuid
 from collections.abc import Sequence
 from typing import Any, cast
 
-from sqlalchemy import String, cast as sa_cast
+from sqlalchemy import String
+from sqlalchemy import cast as sa_cast
 
 from app.db.models.document import Document
 from app.db.queries.base import BaseQuery
@@ -88,19 +89,33 @@ class DocumentQuery(BaseQuery):
         verification_result: dict[str, Any] | None = None,
         filing_period_month: int | None = None,
         filing_period_year: int | None = None,
+        processing_status: str | None = None,
+        processing_time_ms: int | None = None,
     ) -> Document:
-        """Insert a new document for this firm."""
+        """Insert a new document for this firm.
+
+        ``processing_status`` defaults to ``"pending"`` via the model's
+        server-side default. Pipeline writers should pass ``"completed"``
+        once verdict + verification have succeeded, otherwise the row
+        sits in ``pending`` forever and silently disappears from every
+        export and filing query that requires a terminal status.
+        """
         cid = client_id if isinstance(client_id, uuid.UUID) else uuid.UUID(str(client_id))
-        doc = Document(
-            client_id=cid,
-            document_type=document_type,
-            source_file_ids=source_file_ids,
-            extraction_data=extraction_data,
-            tax_verdict=tax_verdict,
-            verification_result=verification_result,
-            filing_period_month=filing_period_month,
-            filing_period_year=filing_period_year,
-        )
+        kwargs: dict[str, Any] = {
+            "client_id": cid,
+            "document_type": document_type,
+            "source_file_ids": source_file_ids,
+            "extraction_data": extraction_data,
+            "tax_verdict": tax_verdict,
+            "verification_result": verification_result,
+            "filing_period_month": filing_period_month,
+            "filing_period_year": filing_period_year,
+        }
+        if processing_status is not None:
+            kwargs["processing_status"] = processing_status
+        if processing_time_ms is not None:
+            kwargs["processing_time_ms"] = processing_time_ms
+        doc = Document(**kwargs)
         return cast(Document, await self._insert(doc))
 
     async def update_status(

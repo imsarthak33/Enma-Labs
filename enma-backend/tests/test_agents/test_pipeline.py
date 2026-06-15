@@ -403,7 +403,7 @@ async def test_dirty_extraction_records_verification_issues(
     # reaches the CA — they see canonical numbers instead.
     assert "cgst_math_mismatch" not in codes
     # Reconciler did its job: the persisted extraction now carries
-    # canonical totals computed from rate × taxable.
+    # canonical totals computed from rate * taxable.
     assert result.extraction is not None
     canonical_cgst = result.extraction["totals"]["total_cgst"]
     # 100 * 9% = 9.00 — the correct number, not the hallucinated 100.
@@ -471,6 +471,50 @@ async def test_finalize_document_persists_and_carries_stages(
         assert s in stage_names, f"missing stage {s}"
     statuses = {s.stage: s.status for s in result.stages}
     assert statuses[PipelineStage.PERSISTENCE] is PipelineStageStatus.OK
+
+
+@pytest.mark.asyncio
+async def test_finalize_document_persists_terminal_status_and_filing_period(
+    monkeypatch: pytest.MonkeyPatch,
+    db_session: Any,
+) -> None:
+    """W3-h6 regression: after verdict succeeds, the row MUST land with
+    ``processing_status='completed'`` and ``filing_period_month/year``
+    derived from the invoice date.
+
+    Production prior to this fix saw every processed document sit in
+    ``pending`` with NULL filing_period — invisible to exports and the
+    filing-approval snapshot. Root cause: ``finalize_document`` called
+    ``DocumentQuery.create`` without ``processing_status`` (so the DB
+    default ``'pending'`` won) and passed the *input* filing_period
+    instead of the ``derived_*`` values computed from the invoice date.
+    """
+    from app.db.models.document import Document
+    from sqlalchemy import select
+
+    session, firm_id, client_id = db_session
+    _classify_stub(monkeypatch)
+    _extract_stub(monkeypatch)  # extract stub emits invoice_date=2026-04-01
+    _no_firm_rules(monkeypatch)
+
+    outcome = await extract_only(_PNG_BYTES)
+    result = await finalize_document(
+        session=session,
+        ca_firm_id=firm_id,
+        client_id=client_id,
+        outcome=outcome,
+        source_file_ids=["tg-file-1"],
+    )
+    assert result.document_id is not None
+
+    row = (
+        await session.execute(
+            select(Document).where(Document.id == result.document_id)
+        )
+    ).scalar_one()
+    assert row.processing_status == "completed"
+    assert row.filing_period_month == 4
+    assert row.filing_period_year == 2026
 
 
 @pytest.mark.asyncio

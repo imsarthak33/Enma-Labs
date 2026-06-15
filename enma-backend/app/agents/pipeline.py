@@ -58,8 +58,8 @@ from app.services.file_processor import (
     is_image,
     rasterize_pdf_page,
 )
-from app.tax.reconciler import reconcile_extraction
 from app.tax.itc import PeriodContext
+from app.tax.reconciler import reconcile_extraction
 from app.utils.date_utils import FilingPeriod, now_ist, parse_iso_date
 
 _log = get_logger(__name__)
@@ -160,7 +160,7 @@ def _now_ms() -> int:
 # ---------------------------------------------------------------------------
 
 
-async def extract_only(file_bytes: bytes) -> ExtractionOutcome:
+async def extract_only(file_bytes: bytes) -> ExtractionOutcome:  # noqa: PLR0912, PLR0915 — linear stage orchestrator
     """Run the client-independent half of the pipeline (R1 split).
 
     file_processing → classification → extraction → verification.
@@ -369,7 +369,7 @@ async def extract_only(file_bytes: bytes) -> ExtractionOutcome:
     )
 
 
-async def finalize_document(  # noqa: PLR0912, PLR0915 — linear orchestrator
+async def finalize_document(  # — linear orchestrator
     *,
     session: AsyncSession,
     ca_firm_id: uuid.UUID,
@@ -487,6 +487,13 @@ async def finalize_document(  # noqa: PLR0912, PLR0915 — linear orchestrator
             )
 
     # ---- Stage 6: persistence --------------------------------------------
+    # Persist the terminal state: status = "completed" when the verdict
+    # ran, "failed" otherwise. Filing period uses the derived month/year
+    # (parsed from the invoice date) when the caller didn't supply one,
+    # so downstream exports + filing approvals see the doc against the
+    # right period. Pre-fix, both fields landed as NULL/pending and the
+    # docs silently disappeared from every period-scoped query.
+    persisted_status = "completed" if verdict is not None else "failed"
     t0 = _now_ms()
     document_id: uuid.UUID | None = None
     queries = DocumentQuery(session=session, ca_firm_id=ca_firm_id)
@@ -498,8 +505,9 @@ async def finalize_document(  # noqa: PLR0912, PLR0915 — linear orchestrator
             extraction_data=extraction_data or {},
             tax_verdict=verdict.to_jsonb() if verdict is not None else None,
             verification_result=(verification.to_dict() if verification is not None else None),
-            filing_period_month=filing_period_month,
-            filing_period_year=filing_period_year,
+            filing_period_month=derived_month,
+            filing_period_year=derived_year,
+            processing_status=persisted_status,
         )
         await session.commit()
         document_id = doc.id
