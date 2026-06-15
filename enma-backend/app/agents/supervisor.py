@@ -121,6 +121,8 @@ class SupervisorContext:
     ca_firm_id: uuid.UUID
     chat_id: int
     active_client_id: uuid.UUID | None = None
+    firm_name: str | None = None
+    ca_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -904,6 +906,47 @@ def _xml_escape_for_telegram(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Firm introspection tool.
+#
+# The LLM needs a way to answer "what is my firm name?" / "who am I?"
+# without hallucinating. The firm identity is injected into the system
+# prompt preamble, but this tool also exists so the LLM can fetch
+# richer details (email, phone, plan, client count) on explicit ask.
+# ---------------------------------------------------------------------------
+
+
+async def _tool_get_firm_info(
+    ctx: SupervisorContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Return the CA firm's own profile and summary stats.
+
+    Answers "what is my firm name", "who am I", "show me my firm
+    details", etc. The firm row is already tenant-scoped by
+    ``ca_firm_id`` — no additional auth needed.
+    """
+    from app.db.queries.firms import get_firm_by_id
+
+    firm = await get_firm_by_id(ctx.session, ctx.ca_firm_id)
+    if firm is None:
+        return {"error": "firm not found"}
+
+    clients_q = ClientQuery(session=ctx.session, ca_firm_id=ctx.ca_firm_id)
+    active_clients = list(await clients_q.list_active())
+
+    return {
+        "firm_name": firm.firm_name,
+        "ca_name": firm.ca_name,
+        "email": firm.email,
+        "phone": firm.phone,
+        "subscription_plan": firm.subscription_plan,
+        "is_active": firm.is_active,
+        "onboarding_completed": firm.onboarding_completed,
+        "active_client_count": len(active_clients),
+        "created_at": firm.created_at.isoformat() if firm.created_at else None,
+    }
+
+
+# ---------------------------------------------------------------------------
 # W3-h7 — approve_filing supervisor tool.
 #
 # The strict regex `ENMA APPROVE FILING [for|of] Month YYYY` is the
@@ -1075,6 +1118,21 @@ async def _tool_export_client_ledger(
 
 
 TOOLS: Final[dict[str, ToolSpec]] = {
+    "get_firm_info": ToolSpec(
+        name="get_firm_info",
+        description=(
+            "Return the CA firm's own profile and summary stats. Use when "
+            "the CA asks 'what is my firm name', 'who am I', 'show me my "
+            "firm details', 'what plan am I on'. Returns firm_name, "
+            "ca_name, email, phone, subscription_plan, active_client_count."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+        runner=_tool_get_firm_info,
+    ),
     "query_documents": ToolSpec(
         name="query_documents",
         description=(
@@ -1405,7 +1463,7 @@ def _extract_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 async def _build_system_prompt(ctx: SupervisorContext, user_text: str) -> str:
-    """Render the system prompt with firm-rule context injected."""
+    """Render the system prompt with firm identity + rules injected."""
     rules = await load_rules_for_engine(
         session=ctx.session,
         ca_firm_id=ctx.ca_firm_id,
@@ -1413,11 +1471,15 @@ async def _build_system_prompt(ctx: SupervisorContext, user_text: str) -> str:
         query_text=user_text,
         limit=3,
     )
-    if not rules:
-        return build_supervisor_prompt()
-    rule_texts = {r.rule_id: "" for r in rules}
-    block = format_rules_for_prompt(rules, rule_texts=rule_texts)
-    return build_supervisor_prompt(firm_rules_block=block)
+    rule_block: str | None = None
+    if rules:
+        rule_texts = {r.rule_id: "" for r in rules}
+        rule_block = format_rules_for_prompt(rules, rule_texts=rule_texts)
+    return build_supervisor_prompt(
+        firm_name=ctx.firm_name,
+        ca_name=ctx.ca_name,
+        firm_rules_block=rule_block,
+    )
 
 
 async def _execute_tool(

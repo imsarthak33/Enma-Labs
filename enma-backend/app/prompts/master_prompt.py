@@ -226,8 +226,18 @@ _SUPERVISOR_OUTPUT: Final[str] = (
 )
 
 
-def build_supervisor_prompt(*, firm_rules_block: str | None = None) -> str:
+def build_supervisor_prompt(
+    *,
+    firm_name: str | None = None,
+    ca_name: str | None = None,
+    firm_rules_block: str | None = None,
+) -> str:
     """System message for the supervisor agent.
+
+    ``firm_name`` and ``ca_name`` are injected as a FIRM IDENTITY block
+    so the LLM can answer "what is my firm name?" without hallucinating
+    or calling a tool. Both are optional — the supervisor still works
+    when identity is unavailable (legacy callers, tests).
 
     ``firm_rules_block`` is the rendered output of
     :func:`app.agents.context_injector.format_rules_for_prompt` for the
@@ -240,6 +250,17 @@ def build_supervisor_prompt(*, firm_rules_block: str | None = None) -> str:
         _SUPERVISOR_TASK,
         _SUPERVISOR_OUTPUT,
     ]
+    # Firm identity — always present when the caller supplies it so the
+    # LLM can answer "who am I?" / "what firm is this?" immediately.
+    if firm_name:
+        identity_lines = [f"FIRM IDENTITY\nFirm name: {firm_name}"]
+        if ca_name:
+            identity_lines.append(f"CA / principal: {ca_name}")
+        identity_lines.append(
+            "You are acting on behalf of this firm. When the user asks "
+            "about their firm name or who they are, use the details above."
+        )
+        parts.append("\n".join(identity_lines))
     if firm_rules_block:
         parts.append("CONTEXT — FIRM-SPECIFIC RULES\n" + firm_rules_block)
     return "\n\n".join(parts)

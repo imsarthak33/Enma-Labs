@@ -830,7 +830,7 @@ async def _run_command_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PLR
         # ---- 4. Supervisor (free-form) -----------------------------------
         await _handle_supervisor(
             session=session,
-            ca_firm_id=firm.id,
+            firm=firm,
             chat_id=envelope.chat_id,
             reply_to=envelope.message_id,
             message_id=envelope.message_id,
@@ -948,13 +948,14 @@ async def _handle_approval_confirm(
 async def _handle_supervisor(
     *,
     session: Any,
-    ca_firm_id: Any,
+    firm: CaFirm,
     chat_id: int,
     reply_to: int | None,
     message_id: int | None,
     text: str,
 ) -> None:
     """Run the supervisor agent and reply with its answer."""
+    ca_firm_id = firm.id
     convs = ConversationQuery(session=session, ca_firm_id=ca_firm_id)
     active_client_id = await convs.get_last_client_id(chat_id=chat_id)
 
@@ -983,6 +984,8 @@ async def _handle_supervisor(
         ca_firm_id=ca_firm_id,
         chat_id=chat_id,
         active_client_id=active_client_id,
+        firm_name=firm.firm_name,
+        ca_name=firm.ca_name,
     )
     try:
         reply = await run_supervisor(ctx=ctx, user_text=text, history=history)
