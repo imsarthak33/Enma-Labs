@@ -78,6 +78,55 @@ class DocumentQuery(BaseQuery):
         )
         return await self._fetch_all(stmt)
 
+    async def find_by_content_hash(
+        self, *, client_id: uuid.UUID | str, content_hash: str
+    ) -> Document | None:
+        """W3-h7: lookup an existing document by its natural-key hash.
+
+        Used by ``finalize_document`` to skip re-processing when the CA
+        re-uploads the same real-world invoice (same vendor + invoice
+        number + invoice date). Returns the existing row if any; the
+        caller then short-circuits the persistence step.
+        """
+        if not content_hash:
+            return None
+        cid = client_id if isinstance(client_id, uuid.UUID) else uuid.UUID(str(client_id))
+        stmt = (
+            self._scoped_select(Document)
+            .where(Document.client_id == cid)
+            .where(Document.content_hash == content_hash)
+            .order_by(Document.created_at.desc())
+            .limit(1)
+        )
+        return await self._fetch_one(stmt)
+
+    async def find_by_invoice_number(
+        self,
+        *,
+        invoice_number: str,
+        client_id: uuid.UUID | str | None = None,
+    ) -> list[Document]:
+        """Look up documents by the invoice number printed on the page.
+
+        ``find_by_ref_prefix`` takes the short UUID hex shown on the
+        pipeline summary, but CAs naturally quote the *human* invoice
+        number ("share me invoice 91"). This helper searches the
+        JSONB ``extraction_data->>'invoice_number'`` field. Optionally
+        scopes to one client; otherwise returns matches across every
+        client in this firm.
+        """
+        cleaned = invoice_number.strip()
+        if not cleaned:
+            return []
+        stmt = self._scoped_select(Document).where(
+            Document.extraction_data["invoice_number"].astext == cleaned
+        )
+        if client_id is not None:
+            cid = client_id if isinstance(client_id, uuid.UUID) else uuid.UUID(str(client_id))
+            stmt = stmt.where(Document.client_id == cid)
+        stmt = stmt.order_by(Document.created_at.desc()).limit(10)
+        return list(await self._fetch_all(stmt))
+
     async def create(
         self,
         *,
@@ -91,6 +140,7 @@ class DocumentQuery(BaseQuery):
         filing_period_year: int | None = None,
         processing_status: str | None = None,
         processing_time_ms: int | None = None,
+        content_hash: str | None = None,
     ) -> Document:
         """Insert a new document for this firm.
 
@@ -115,6 +165,8 @@ class DocumentQuery(BaseQuery):
             kwargs["processing_status"] = processing_status
         if processing_time_ms is not None:
             kwargs["processing_time_ms"] = processing_time_ms
+        if content_hash is not None:
+            kwargs["content_hash"] = content_hash
         doc = Document(**kwargs)
         return cast(Document, await self._insert(doc))
 

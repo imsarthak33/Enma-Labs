@@ -404,26 +404,47 @@ async def _tool_get_filing_summary(
 async def _tool_query_document_by_ref(
     ctx: SupervisorContext, args: dict[str, Any]
 ) -> dict[str, Any]:
-    """Look up a document by its user-facing ``Ref:`` hash prefix.
+    """Look up a document by its user-facing ``Ref:`` hash OR invoice number.
 
     The pipeline summary renders the document UUID truncated to its
-    first eight hex chars as ``Ref:``. CAs naturally quote that back —
-    "the invoice with ref 4b8d91e0" — but our other tools expect full
-    UUIDs. Rather than make the LLM convert, expose a dedicated tool.
+    first eight hex chars as ``Ref:`` — CAs quote that back ("the
+    invoice with ref 4b8d91e0"). But CAs ALSO quote the *human*
+    invoice number printed on the page ("share me invoice 91"). The
+    tool now handles both:
+
+      * If ``ref`` parses as 4-32 hex chars → UUID prefix lookup.
+      * Otherwise → invoice-number lookup against
+        ``extraction_data->>'invoice_number'``. ``client_name`` can
+        narrow the search to one client when given.
 
     Returns ``{"matches": []}`` when nothing matches, a single-document
     dict when exactly one matches, or ``{"ambiguous": True, "matches":
-    [...]}`` when multiple documents in this firm share the prefix.
+    [...]}`` when multiple documents share the lookup key.
     """
     ref = args.get("ref")
     if not isinstance(ref, str) or not ref.strip():
-        raise ToolError("ref is required (e.g. '4b8d91e0' as shown on the summary)")
+        raise ToolError("ref is required (e.g. '4b8d91e0' or '91' as shown on the summary)")
 
     docs_q = DocumentQuery(session=ctx.session, ca_firm_id=ctx.ca_firm_id)
+    # First try the hex-prefix path; if the input isn't valid hex, fall
+    # through to the human invoice-number path. ``find_by_ref_prefix``
+    # raises ValueError on non-hex inputs — we treat that as a signal
+    # to try invoice-number lookup, not a hard failure.
     try:
         matches = await docs_q.find_by_ref_prefix(ref)
-    except ValueError as exc:
-        raise ToolError(str(exc)) from exc
+    except ValueError:
+        client_filter: uuid.UUID | None = None
+        client_name = args.get("client_name")
+        if isinstance(client_name, str) and client_name.strip():
+            clients_q = ClientQuery(session=ctx.session, ca_firm_id=ctx.ca_firm_id)
+            ranked = await clients_q.search_by_name_ranked(
+                client_name, min_similarity=0.55, limit=1
+            )
+            if ranked:
+                client_filter = ranked[0][0].id
+        matches = await docs_q.find_by_invoice_number(
+            invoice_number=ref, client_id=client_filter
+        )
 
     if not matches:
         return {"matches": []}
@@ -883,6 +904,83 @@ def _xml_escape_for_telegram(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# W3-h7 — approve_filing supervisor tool.
+#
+# The strict regex `ENMA APPROVE FILING [for|of] Month YYYY` is the
+# canonical entry point and stays the safest path. But CAs naturally
+# write "ENMA APPROVE FILING for August 2025 of CLEIND" — the regex
+# rejects the trailing client name, the message falls through to the
+# supervisor, and pre-h7 the LLM hallucinated a tool name. This tool
+# gives the LLM a clean way to trigger the same approval flow no
+# matter how the CA phrased it. The client name is gracefully ignored
+# (approvals are firm-wide; ADR-005 rev 2).
+# ---------------------------------------------------------------------------
+
+
+_MONTH_NAMES_TITLE: Final[tuple[str, ...]] = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+
+
+async def _tool_approve_filing(
+    ctx: SupervisorContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Start the two-step approval flow for a (month, year) filing.
+
+    Synthesises the canonical ``ENMA APPROVE FILING Month YYYY`` text
+    and feeds it to :func:`parse_approval_intent`. Returns the
+    snapshot summary + the ``ENMA CONFIRM FILING <hash>`` string the
+    CA must reply with to finalise. The actual write is gated by the
+    confirm step in :mod:`app.api.routes.worker`, exactly like the
+    direct-typed flow — so this tool is no less safe than the regex
+    path. Client names are ignored: approvals are firm-wide.
+    """
+    from app.agents.filing_approval import (
+        FilingPeriodAlreadyLocked,
+        InvalidApprovalString,
+        parse_approval_intent,
+    )
+
+    month = _coerce_int_or_none(args.get("month"))
+    year = _coerce_int_or_none(args.get("year"))
+    if month is None or year is None:
+        raise ToolError("month and year are required (e.g. month=8, year=2025)")
+    if not (1 <= month <= 12):
+        raise ToolError("month must be between 1 and 12")
+
+    month_name = _MONTH_NAMES_TITLE[month - 1]
+    synthesised = f"ENMA APPROVE FILING {month_name} {year}"
+    try:
+        intent = await parse_approval_intent(
+            session=ctx.session,
+            ca_firm_id=ctx.ca_firm_id,
+            text=synthesised,
+        )
+    except InvalidApprovalString as exc:
+        raise ToolError(f"could not parse the approval: {exc}") from exc
+    except FilingPeriodAlreadyLocked as exc:
+        return {
+            "approved": False,
+            "reason": "already_locked",
+            "month": exc.month,
+            "year": exc.year,
+        }
+
+    confirm_text = f"ENMA CONFIRM FILING {intent.snapshot_hash[:8]}"
+    return {
+        "ready_to_confirm": True,
+        "month": intent.month,
+        "year": intent.year,
+        "period_label": intent.snapshot.get("period_label"),
+        "document_count": intent.document_count,
+        "total_taxable_value": str(intent.total_taxable_value),
+        "total_tax": str(intent.total_tax),
+        "confirm_with": confirm_text,
+    }
+
+
+# ---------------------------------------------------------------------------
 # W3-h4 — Client ledger CSV export.
 #
 # Ported in from the KARO PITCH prototype. A CSV of every completed
@@ -1000,20 +1098,34 @@ TOOLS: Final[dict[str, ToolSpec]] = {
     "query_document_by_ref": ToolSpec(
         name="query_document_by_ref",
         description=(
-            "Look up a document by its short 'Ref:' hash (the 4-32 hex char "
-            "prefix shown on every Document processed summary, e.g. "
-            "'4b8d91e0'). Returns the matching document with its full UUID, "
-            "client, totals, tax verdict, and extracted invoice data. Use "
-            "this BEFORE query_documents when the user mentions a ref-hash; "
-            "do NOT pass the ref-hash to query_documents as a client_id."
+            "Look up a document by its short 'Ref:' hex hash OR by the "
+            "human invoice number printed on the page. Returns the "
+            "matching document with its full UUID, client, totals, tax "
+            "verdict, and extracted invoice data. Pass 'ref' as either: "
+            "(a) the 4-32 hex char prefix shown on a 'Document processed' "
+            "summary (e.g. '4b8d91e0'), OR (b) the invoice number quoted "
+            "by the CA (e.g. '91', 'INV-2025-077'). When the user names "
+            "a client too ('show me invoice 91 of CLEIND'), pass that as "
+            "client_name to narrow the search. Use this BEFORE "
+            "query_documents whenever the user mentions a specific "
+            "invoice."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "ref": {
                     "type": "string",
-                    "description": "Short hex ref shown on summaries (e.g. '4b8d91e0').",
-                }
+                    "description": (
+                        "Short hex ref ('4b8d91e0') or invoice number "
+                        "('91'). The tool auto-detects which."
+                    ),
+                },
+                "client_name": {
+                    "type": "string",
+                    "description": (
+                        "Optional client to narrow an invoice-number lookup."
+                    ),
+                },
             },
             "required": ["ref"],
             "additionalProperties": False,
@@ -1239,6 +1351,31 @@ TOOLS: Final[dict[str, ToolSpec]] = {
             "additionalProperties": False,
         },
         runner=_tool_export_client_ledger,
+    ),
+    "approve_filing": ToolSpec(
+        name="approve_filing",
+        description=(
+            "Start the two-step filing approval for a (month, year). Use "
+            "when the CA says 'approve filing for August 2025', 'lock "
+            "the July filing', 'ENMA APPROVE FILING for June 2026 of "
+            "CLEIND' (client name is ignored — approvals are firm-wide). "
+            "Returns a snapshot summary (document_count, totals) plus "
+            "the 'ENMA CONFIRM FILING <hash>' string the CA must reply "
+            "with to actually lock the period. Surface that confirm "
+            "string verbatim in <code> tags so it's one-tap copyable. "
+            "DO NOT finalise the approval yourself — only the CA's "
+            "explicit confirm reply may lock the period."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "month": {"type": "integer", "minimum": 1, "maximum": 12},
+                "year": {"type": "integer", "minimum": 2020, "maximum": 2100},
+            },
+            "required": ["month", "year"],
+            "additionalProperties": False,
+        },
+        runner=_tool_approve_filing,
     ),
 }
 

@@ -91,6 +91,16 @@ class Document(Base):
         server_default=text("'pending'"),
         comment="pending | processing | completed | failed",
     )
+    content_hash: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        comment=(
+            "SHA-256 of (vendor_gstin, invoice_number, invoice_date). "
+            "Used to detect re-uploads of the same real-world invoice "
+            "and skip re-processing. NULL when any natural-key field is "
+            "missing on the extraction (very rare)."
+        ),
+    )
     processing_time_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

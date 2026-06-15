@@ -33,6 +33,7 @@ The pipeline writes one row to ``documents`` via
 
 from __future__ import annotations
 
+import hashlib
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -153,6 +154,31 @@ class PipelineError(RuntimeError):
 
 def _now_ms() -> int:
     return int(time.monotonic() * 1000)
+
+
+def _compute_content_hash(extraction: dict[str, Any]) -> str:
+    """SHA-256 of an invoice's natural key — used to detect re-uploads.
+
+    The natural key is ``(vendor_gstin, invoice_number, invoice_date)``:
+    two real-world invoices with the same three fields are the same
+    invoice, regardless of which photo or PDF rendered it. Returns the
+    empty string when any field is missing — in which case the caller
+    treats the document as un-dedupable and lets it through.
+    """
+    vendor = extraction.get("vendor")
+    vendor_gstin = (vendor.get("gstin") if isinstance(vendor, dict) else None) or ""
+    invoice_number = extraction.get("invoice_number") or ""
+    invoice_date = extraction.get("invoice_date") or ""
+
+    vendor_gstin = str(vendor_gstin).strip().upper()
+    invoice_number = str(invoice_number).strip().upper()
+    invoice_date = str(invoice_date).strip()
+
+    if not vendor_gstin or not invoice_number or not invoice_date:
+        return ""
+
+    payload = f"{vendor_gstin}|{invoice_number}|{invoice_date}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +395,7 @@ async def extract_only(file_bytes: bytes) -> ExtractionOutcome:  # noqa: PLR0912
     )
 
 
-async def finalize_document(  # — linear orchestrator
+async def finalize_document(  # noqa: PLR0915 — linear orchestrator
     *,
     session: AsyncSession,
     ca_firm_id: uuid.UUID,
@@ -494,9 +520,45 @@ async def finalize_document(  # — linear orchestrator
     # right period. Pre-fix, both fields landed as NULL/pending and the
     # docs silently disappeared from every period-scoped query.
     persisted_status = "completed" if verdict is not None else "failed"
+    queries = DocumentQuery(session=session, ca_firm_id=ca_firm_id)
+
+    # ---- Dedup check (W3-h7) --------------------------------------------
+    # Same vendor + invoice number + invoice date = same invoice. If a
+    # row already exists for this firm + client, surface the existing
+    # document_id and skip persistence so the ledger and filing
+    # snapshot don't accumulate three rows for the same real-world
+    # invoice. Empty hash = "natural key incomplete" → let the row
+    # through (very rare: only if extraction failed to read the date).
+    content_hash = _compute_content_hash(extraction_data or {})
+    if content_hash:
+        existing = await queries.find_by_content_hash(
+            client_id=client_id, content_hash=content_hash
+        )
+        if existing is not None:
+            _log.info(
+                "pipeline_dedup_hit",
+                existing_id=str(existing.id),
+                content_hash=content_hash,
+            )
+            stages.append(
+                PipelineStageOutcome(
+                    stage=PipelineStage.PERSISTENCE,
+                    status=PipelineStageStatus.SKIPPED,
+                    duration_ms=0,
+                    error=f"duplicate of {existing.id}",
+                )
+            )
+            return PipelineResult(
+                document_id=existing.id,
+                document_type=classification_type,
+                extraction=extraction_data,
+                verification=verification,
+                tax_verdict=verdict,
+                stages=tuple(stages),
+            )
+
     t0 = _now_ms()
     document_id: uuid.UUID | None = None
-    queries = DocumentQuery(session=session, ca_firm_id=ca_firm_id)
     try:
         doc = await queries.create(
             client_id=client_id,
@@ -508,6 +570,7 @@ async def finalize_document(  # — linear orchestrator
             filing_period_month=derived_month,
             filing_period_year=derived_year,
             processing_status=persisted_status,
+            content_hash=content_hash or None,
         )
         await session.commit()
         document_id = doc.id

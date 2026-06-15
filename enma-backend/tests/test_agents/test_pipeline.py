@@ -82,7 +82,8 @@ async def db_session():
                 "tax_verdict TEXT, verification_result TEXT, "
                 "filing_period_month INTEGER, filing_period_year INTEGER, "
                 "processing_status TEXT DEFAULT 'pending', "
-                "processing_time_ms INTEGER, created_at TEXT, updated_at TEXT)"
+                "processing_time_ms INTEGER, content_hash TEXT, "
+                "created_at TEXT, updated_at TEXT)"
             )
         )
         await conn.execute(
@@ -471,6 +472,60 @@ async def test_finalize_document_persists_and_carries_stages(
         assert s in stage_names, f"missing stage {s}"
     statuses = {s.stage: s.status for s in result.stages}
     assert statuses[PipelineStage.PERSISTENCE] is PipelineStageStatus.OK
+
+
+@pytest.mark.asyncio
+async def test_finalize_document_dedupes_same_invoice(
+    monkeypatch: pytest.MonkeyPatch,
+    db_session: Any,
+) -> None:
+    """W3-h7 regression: the same (vendor, invoice_number, invoice_date)
+    must only persist ONCE — even if the CA re-uploads. Production
+    accumulated 3 rows for invoice 127 before the dedup invariant
+    landed, polluting the ledger and the filing-approval snapshot.
+
+    Asserts: two finalize calls on the same extraction → identical
+    document_id returned + only ONE row in the table.
+    """
+    from app.db.models.document import Document
+    from sqlalchemy import select
+
+    session, firm_id, client_id = db_session
+    _classify_stub(monkeypatch)
+    _extract_stub(monkeypatch)
+    _no_firm_rules(monkeypatch)
+
+    outcome_a = await extract_only(_PNG_BYTES)
+    first = await finalize_document(
+        session=session,
+        ca_firm_id=firm_id,
+        client_id=client_id,
+        outcome=outcome_a,
+        source_file_ids=["tg-file-1"],
+    )
+    outcome_b = await extract_only(_PNG_BYTES)
+    second = await finalize_document(
+        session=session,
+        ca_firm_id=firm_id,
+        client_id=client_id,
+        outcome=outcome_b,
+        source_file_ids=["tg-file-2"],
+    )
+
+    assert first.document_id is not None
+    assert second.document_id == first.document_id
+
+    rows = (
+        await session.execute(select(Document))
+    ).scalars().all()
+    assert len(rows) == 1, "dedup must prevent a second row for the same invoice"
+
+    # The duplicate run's persistence stage must be SKIPPED, not OK.
+    second_persistence = next(
+        s for s in second.stages if s.stage == PipelineStage.PERSISTENCE
+    )
+    assert second_persistence.status is PipelineStageStatus.SKIPPED
+    assert "duplicate" in (second_persistence.error or "")
 
 
 @pytest.mark.asyncio
