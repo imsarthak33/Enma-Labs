@@ -218,7 +218,7 @@ def build_pdf_content(pdf_bytes: bytes) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-async def call_chat(
+async def call_chat(  # noqa: PLR0915 — tight retry + branch logic, refactoring would obscure the path
     role: LLMRole,
     messages: list[ChatMessage],
     *,
@@ -275,10 +275,13 @@ async def call_chat(
                 role=role.value,
                 model=model,
                 error=str(exc),
+                error_type=type(exc).__name__,
                 attempt=attempt,
             )
             sentry_sdk.capture_exception(exc)
-            raise LLMError(f"LLM request failed: {exc}") from exc
+            raise LLMError(
+                f"LLM request failed ({type(exc).__name__}): {exc}"
+            ) from exc
 
         if resp.status_code in _RETRYABLE_STATUSES:
             if attempt >= LLM_MAX_RETRIES:
@@ -337,10 +340,13 @@ async def call_chat(
                     role=role.value,
                     model=model,
                     error=str(exc),
+                    error_type=type(exc).__name__,
                     attempt="tool_fallback",
                 )
                 sentry_sdk.capture_exception(exc)
-                raise LLMError(f"LLM request failed: {exc}") from exc
+                raise LLMError(
+                    f"LLM request failed ({type(exc).__name__}): {exc}"
+                ) from exc
 
         if resp.status_code != httpx.codes.OK:
             _log.error(

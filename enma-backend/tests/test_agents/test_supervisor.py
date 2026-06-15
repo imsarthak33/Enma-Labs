@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from app.agents.supervisor import (
+    _LOOP_EXHAUSTED_FALLBACK,
     MAX_TOOL_ITERATIONS,
     TOOLS,
     SupervisorContext,
@@ -25,6 +26,7 @@ from app.agents.supervisor import (
     ToolSpec,
     _coerce_int_or_none,
     _coerce_uuid_or_none,
+    _tool_result_carries_error,
     run_supervisor,
 )
 from app.services.llm import ChatResponse
@@ -181,6 +183,105 @@ class TestRunSupervisor:
         ):
             reply = await run_supervisor(ctx=ctx, user_text="tasks?")
         assert "OK ignoring the failure" in reply.text
+
+    @pytest.mark.asyncio
+    async def test_tool_error_forces_text_choice_on_next_call(
+        self, _no_rules: Any
+    ) -> None:
+        """When a tool returns ``error``, the next call must use tool_choice=none.
+
+        Regression for the production loop where ``export_to_tally`` was
+        re-invoked six times on an unapproved filing because the LLM
+        thought it could 'fix' the error. After the fix, iteration 2
+        must be invoked with tool_choice='none' so the model has to
+        produce a text reply.
+        """
+        ctx = SupervisorContext(
+            session=AsyncMock(), ca_firm_id=uuid.uuid4(), chat_id=42
+        )
+        tool_call = {
+            "id": "call_e",
+            "type": "function",
+            "function": {"name": "list_tasks", "arguments": "{}"},
+        }
+        first = _chat_response(tool_calls=[tool_call])
+        second = _chat_response(content="Sorry, that did not work.")
+        seq = [first, second]
+        observed_choices: list[str] = []
+
+        async def _next_response(*_a: Any, **kw: Any) -> ChatResponse:
+            extra = kw.get("extra_body") or {}
+            observed_choices.append(str(extra.get("tool_choice")))
+            return seq.pop(0)
+
+        async def _runner(_ctx: SupervisorContext, _args: dict[str, Any]) -> dict[str, Any]:
+            raise ToolError("filing not approved")
+
+        swapped = _swap_runner("list_tasks", _runner)
+        with (
+            patch.dict(TOOLS, {"list_tasks": swapped}, clear=False),
+            patch("app.agents.supervisor.call_chat", new=_next_response),
+        ):
+            reply = await run_supervisor(ctx=ctx, user_text="tasks?")
+        assert observed_choices == ["auto", "none"]
+        assert reply.text == "Sorry, that did not work."
+
+    @pytest.mark.asyncio
+    async def test_iteration_cap_never_leaks_tool_json(self, _no_rules: Any) -> None:
+        """If the budget exhausts, the user reply MUST NOT be raw tool JSON.
+
+        Regression for the 'hi enma' incident: the model looped six
+        times on export_to_tally, then the old supervisor fell through
+        with messages[-1].content == '{"error": "Filing for 06/2026 ..."}'
+        and showed that raw JSON to the user. After the fix, the final
+        text-only call returns empty (mock still returns a tool_call
+        response), and we fall back to _LOOP_EXHAUSTED_FALLBACK.
+        """
+        ctx = SupervisorContext(
+            session=AsyncMock(), ca_firm_id=uuid.uuid4(), chat_id=42
+        )
+        looping = _chat_response(
+            tool_calls=[
+                {
+                    "id": "call_loop",
+                    "type": "function",
+                    "function": {"name": "list_tasks", "arguments": "{}"},
+                }
+            ]
+        )
+
+        async def _runner(_ctx: SupervisorContext, _args: dict[str, Any]) -> dict[str, Any]:
+            raise ToolError("Filing for 06/2026 has not been approved yet")
+
+        swapped = _swap_runner("list_tasks", _runner)
+        with (
+            patch.dict(TOOLS, {"list_tasks": swapped}, clear=False),
+            patch(
+                "app.agents.supervisor.call_chat",
+                new=AsyncMock(return_value=looping),
+            ),
+        ):
+            reply = await run_supervisor(ctx=ctx, user_text="show tasks")
+        assert "Filing for 06/2026" not in reply.text
+        assert "error" not in reply.text.lower() or reply.text == _LOOP_EXHAUSTED_FALLBACK
+        assert reply.text == _LOOP_EXHAUSTED_FALLBACK
+
+
+class TestToolResultCarriesError:
+    """Helper that detects ``{"error": ...}`` tool results."""
+
+    def test_detects_error_key(self) -> None:
+        assert _tool_result_carries_error('{"error": "boom"}') is True
+
+    def test_ignores_success_result(self) -> None:
+        assert _tool_result_carries_error('{"exported": true, "count": 3}') is False
+
+    def test_ignores_non_json(self) -> None:
+        assert _tool_result_carries_error("not json at all") is False
+
+    def test_ignores_json_non_object(self) -> None:
+        assert _tool_result_carries_error("[1, 2, 3]") is False
+        assert _tool_result_carries_error("42") is False
 
 
 class TestToolSchemas:

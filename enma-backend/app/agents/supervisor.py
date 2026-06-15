@@ -1192,6 +1192,27 @@ async def _execute_tool(
 # ---------------------------------------------------------------------------
 
 
+_LOOP_EXHAUSTED_FALLBACK: Final[str] = (
+    "I ran into trouble finishing that. Could you rephrase it?"
+)
+
+
+def _tool_result_carries_error(result_json: str) -> bool:
+    """True iff a tool result string parses to an object with an ``error`` key.
+
+    ToolError handling in :func:`_execute_tool` always emits
+    ``{"error": "..."}``, and several read-side tools also surface
+    structured ``error`` fields. After we see one, the LLM must produce
+    a text reply on the next round — otherwise it tends to re-call the
+    same tool and burn the iteration budget.
+    """
+    try:
+        parsed = json.loads(result_json)
+    except (ValueError, TypeError):
+        return False
+    return isinstance(parsed, dict) and "error" in parsed
+
+
 async def run_supervisor(
     *,
     ctx: SupervisorContext,
@@ -1203,6 +1224,19 @@ async def run_supervisor(
     ``history`` is a list of prior chat-completions messages (already in
     the OpenAI shape) the caller wants to pre-load — typically the
     bounded conversation window from :class:`ConversationQuery`.
+
+    Loop-termination guarantees
+    ---------------------------
+    * If any tool in iteration *N* returns ``{"error": ...}``, iteration
+      *N+1* forces ``tool_choice="none"`` so the LLM must produce a text
+      reply about the error rather than re-calling the failing tool.
+      This cuts the worst-case "LLM keeps re-trying export_to_tally on
+      an unapproved filing" loop from six iterations to two.
+    * If the budget exhausts anyway, we do ONE final ``tool_choice="none"``
+      call to coax a text reply, never the raw tool JSON. If that final
+      call also raises, we surface ``_LOOP_EXHAUSTED_FALLBACK`` —
+      ``messages[-1].content`` (a tool result JSON blob) is never sent
+      to the user.
     """
     system_prompt = await _build_system_prompt(ctx, user_text)
     messages: list[ChatMessage] = [{"role": "system", "content": system_prompt}]
@@ -1214,14 +1248,18 @@ async def run_supervisor(
     total_output = 0
     tool_calls_made = 0
     tools = _openai_tools()
+    # When the previous iteration produced a tool error, force the next
+    # call to text-reply rather than retry the failing tool.
+    force_text_next = False
 
     for _iteration in range(MAX_TOOL_ITERATIONS):
+        tool_choice: str = "none" if force_text_next else "auto"
         try:
             response: ChatResponse = await call_chat(
                 LLMRole.REASONING,
                 messages,
                 temperature=0.0,
-                extra_body={"tools": tools, "tool_choice": "auto"},
+                extra_body={"tools": tools, "tool_choice": tool_choice},
             )
         except LLMError:
             raise
@@ -1236,7 +1274,7 @@ async def run_supervisor(
         if not tool_calls:
             text = (message.get("content") or response.content or "").strip()
             return SupervisorReply(
-                text=text,
+                text=text or _LOOP_EXHAUSTED_FALLBACK,
                 tool_calls_made=tool_calls_made,
                 input_tokens=total_input,
                 output_tokens=total_output,
@@ -1252,6 +1290,7 @@ async def run_supervisor(
             }
         )
 
+        force_text_next = False
         for call in tool_calls:
             tool_calls_made += 1
             call_id = cast(str, call.get("id", ""))
@@ -1260,11 +1299,14 @@ async def run_supervisor(
             name = cast(str, fn.get("name", ""))
             raw_args = cast(str, fn.get("arguments", "") or "")
             result_json = await _execute_tool(ctx, name, raw_args)
+            had_error = _tool_result_carries_error(result_json)
+            force_text_next = force_text_next or had_error
             _log.info(
                 "supervisor_tool_called",
                 tool=name,
                 ca_firm_id=str(ctx.ca_firm_id),
                 chat_id=ctx.chat_id,
+                tool_result_error=had_error,
             )
             messages.append(
                 {
@@ -1275,10 +1317,30 @@ async def run_supervisor(
                 }
             )
 
-    # We exhausted the loop budget — return the last assistant content.
-    final_text = messages[-1].get("content") if isinstance(messages[-1].get("content"), str) else ""
+    # Budget exhausted. One last text-only attempt so the user gets a
+    # human-readable summary of whatever the tools surfaced — and
+    # NEVER the raw tool-result JSON.
+    _log.warning(
+        "supervisor_loop_budget_exhausted",
+        ca_firm_id=str(ctx.ca_firm_id),
+        chat_id=ctx.chat_id,
+        tool_calls_made=tool_calls_made,
+    )
+    try:
+        final_response: ChatResponse = await call_chat(
+            LLMRole.REASONING,
+            messages,
+            temperature=0.0,
+            extra_body={"tools": tools, "tool_choice": "none"},
+        )
+        total_input += final_response.input_tokens
+        total_output += final_response.output_tokens
+        text = (final_response.content or "").strip()
+    except LLMError:
+        text = ""
+
     return SupervisorReply(
-        text=str(final_text or "I could not finish that request — please try a narrower question."),
+        text=text or _LOOP_EXHAUSTED_FALLBACK,
         tool_calls_made=tool_calls_made,
         input_tokens=total_input,
         output_tokens=total_output,
