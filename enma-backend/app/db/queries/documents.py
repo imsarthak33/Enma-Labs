@@ -103,6 +103,26 @@ class DocumentQuery(BaseQuery):
         )
         return cast(Document, await self._insert(doc))
 
+    async def update_status(
+        self,
+        document_id: uuid.UUID | str,
+        *,
+        processing_status: str,
+    ) -> Document | None:
+        """W2.D — flip processing_status for one document (firm-scoped).
+
+        Used by the supervisor's ``mark_document`` tool when a CA says
+        "mark doc 1ca3f4e0 as approved" / "flag doc abc as needs-review".
+        Status strings are not validated here; the API surface accepts
+        any short string the supervisor passes, but the document model
+        itself constrains the column to a VARCHAR.
+        """
+        return await self._update(
+            Document,
+            document_id,
+            processing_status=processing_status,
+        )
+
     async def update_verdict(
         self,
         document_id: uuid.UUID | str,

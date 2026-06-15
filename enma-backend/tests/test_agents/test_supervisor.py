@@ -307,3 +307,132 @@ class TestQueryDocumentByRefRegistered:
         params = spec.parameters
         assert params["properties"]["ref"]["type"] == "string"
         assert params["required"] == ["ref"]
+
+
+# ---------------------------------------------------------------------------
+# W2.D — mutating tool registry surface
+# ---------------------------------------------------------------------------
+
+
+class TestMutatingToolsRegistered:
+    """All four W2.D mutating tools must be in TOOLS with the right shape."""
+
+    def test_add_client_registered(self) -> None:
+        spec = TOOLS["add_client"]
+        assert spec.parameters["required"] == ["trade_name"]
+        assert "trade_name" in spec.parameters["properties"]
+        assert "gstin" in spec.parameters["properties"]
+        # Description has to teach the LLM the intent triggers, not just
+        # name the action.
+        assert "Add ABC" in spec.description or "add" in spec.description.lower()
+
+    def test_update_client_registered(self) -> None:
+        spec = TOOLS["update_client"]
+        # Either client_id or client_name is needed but neither is in
+        # `required` — the runner enforces "at least one" via ToolError.
+        props = spec.parameters["properties"]
+        assert "client_id" in props
+        assert "client_name" in props
+        assert "gstin" in props
+
+    def test_mark_document_registered(self) -> None:
+        spec = TOOLS["mark_document"]
+        assert set(spec.parameters["required"]) == {"ref", "status"}
+        assert spec.parameters["properties"]["ref"]["type"] == "string"
+
+    def test_add_firm_rule_registered(self) -> None:
+        spec = TOOLS["add_firm_rule"]
+        assert spec.parameters["required"] == ["rule_text"]
+        # client_id and client_name are optional — firm-wide is the default.
+        assert "client_id" in spec.parameters["properties"]
+        assert "client_name" in spec.parameters["properties"]
+
+
+class TestMutatingToolRunners:
+    """Smoke each runner with a mocked DB query layer to confirm it
+    plumbs args through correctly."""
+
+    @pytest.mark.asyncio
+    async def test_add_client_happy_path(self) -> None:
+        from app.agents import supervisor as sup
+
+        fake_created = type(
+            "FakeClient",
+            (),
+            {"id": uuid.uuid4(), "trade_name": "ABC Corp", "gstin": None},
+        )()
+
+        class _FakeClientQuery:
+            def __init__(self, **_kw: Any) -> None: ...
+
+            async def create(self, **_kw: Any) -> Any:
+                return fake_created
+
+        session = AsyncMock()
+        ctx = SupervisorContext(
+            session=session, ca_firm_id=uuid.uuid4(), chat_id=1
+        )
+        with patch.object(sup, "ClientQuery", _FakeClientQuery):
+            result = await sup._tool_add_client(ctx, {"trade_name": "ABC Corp"})
+        assert result["trade_name"] == "ABC Corp"
+        assert result["created"] is True
+        session.commit.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_add_client_rejects_bad_gstin(self) -> None:
+        from app.agents import supervisor as sup
+
+        ctx = SupervisorContext(
+            session=AsyncMock(), ca_firm_id=uuid.uuid4(), chat_id=1
+        )
+        with pytest.raises(ToolError, match="GSTIN"):
+            await sup._tool_add_client(
+                ctx, {"trade_name": "ABC Corp", "gstin": "not-a-gstin"}
+            )
+
+    @pytest.mark.asyncio
+    async def test_mark_document_no_match_returns_matched_false(self) -> None:
+        from app.agents import supervisor as sup
+
+        class _FakeDocQuery:
+            def __init__(self, **_kw: Any) -> None: ...
+
+            async def find_by_ref_prefix(self, _ref: str) -> list[Any]:
+                return []
+
+        ctx = SupervisorContext(
+            session=AsyncMock(), ca_firm_id=uuid.uuid4(), chat_id=1
+        )
+        with patch.object(sup, "DocumentQuery", _FakeDocQuery):
+            result = await sup._tool_mark_document(
+                ctx, {"ref": "deadbeef", "status": "approved"}
+            )
+        assert result == {"matched": False, "ref": "deadbeef"}
+
+    @pytest.mark.asyncio
+    async def test_add_firm_rule_firm_wide(self) -> None:
+        from app.agents import supervisor as sup
+
+        fake_rule = type(
+            "FakeRule",
+            (),
+            {"id": uuid.uuid4(), "rule_text": "5% slab for all CLEIND invoices"},
+        )()
+
+        class _FakeRuleQuery:
+            def __init__(self, **_kw: Any) -> None: ...
+
+            async def insert_rule(self, **_kw: Any) -> Any:
+                return fake_rule
+
+        session = AsyncMock()
+        ctx = SupervisorContext(
+            session=session, ca_firm_id=uuid.uuid4(), chat_id=1
+        )
+        with patch.object(sup, "RuleQuery", _FakeRuleQuery):
+            result = await sup._tool_add_firm_rule(
+                ctx, {"rule_text": "5% slab for all CLEIND invoices"}
+            )
+        assert result["stored"] is True
+        assert result["scope"] == "firm"
+        assert result["client_id"] is None

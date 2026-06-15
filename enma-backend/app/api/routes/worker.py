@@ -785,37 +785,48 @@ async def _run_command_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PLR
             return
 
         # ---- 3. Slash command --------------------------------------------
+        # W2.E — slash commands are a POWER-USER SHORTCUT, not a gate.
+        # Unknown /verb falls through to the supervisor as plain text so
+        # the LLM can do something sensible (often: answer in natural
+        # language, or fire a mutating tool that matches the intent).
+        # Known verbs still dispatch directly — they remain the fastest
+        # path for users who know them.
         if is_slash_command(text):
             parsed = parse_command(text)
             if parsed is None:
-                await _send_user_error(
-                    envelope.chat_id,
-                    "Unknown command. Try /list_clients or /status.",
-                )
-                return
-            result = await dispatch_command(
-                session=session,
-                ca_firm_id=firm.id,
-                chat_id=envelope.chat_id,
-                command=parsed,
-            )
-            await session.commit()
-            await telegram.send_message(
-                chat_id=envelope.chat_id,
-                html_text=result.html,
-                reply_to_message_id=envelope.message_id,
-            )
-            # If /assign just resolved a pending document, fire the
-            # extraction pipeline against the queued file_ids so the user
-            # gets the actual extracted summary, not just "Assigned — ...".
-            if result.success and result.pending_assignment_resolved is not None:
-                await _resume_pipeline_for_pending_assignment(
-                    session=session,
-                    firm=firm,
+                _log.info(
+                    "unknown_slash_falls_through_to_supervisor",
                     chat_id=envelope.chat_id,
-                    pending_assignment_id=result.pending_assignment_resolved,
+                    text_preview=text[:64],
                 )
-            return
+                # Deliberately not ``return`` — fall through to the
+                # supervisor (step 4) so it can interpret the unknown
+                # /verb in natural language.
+            else:
+                result = await dispatch_command(
+                    session=session,
+                    ca_firm_id=firm.id,
+                    chat_id=envelope.chat_id,
+                    command=parsed,
+                )
+                await session.commit()
+                await telegram.send_message(
+                    chat_id=envelope.chat_id,
+                    html_text=result.html,
+                    reply_to_message_id=envelope.message_id,
+                )
+                # If /assign just resolved a pending document, fire the
+                # extraction pipeline against the queued file_ids so the
+                # user gets the actual extracted summary, not just
+                # "Assigned — ...".
+                if result.success and result.pending_assignment_resolved is not None:
+                    await _resume_pipeline_for_pending_assignment(
+                        session=session,
+                        firm=firm,
+                        chat_id=envelope.chat_id,
+                        pending_assignment_id=result.pending_assignment_resolved,
+                    )
+                return
 
         # ---- 4. Supervisor (free-form) -----------------------------------
         await _handle_supervisor(

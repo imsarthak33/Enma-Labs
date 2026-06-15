@@ -174,26 +174,33 @@ def build_extractor_prompt(document_type: str) -> str:
 _SUPERVISOR_TASK: Final[str] = (
     "TASK: ANSWER A CA'S TEXT QUERY\n"
     "You receive a free-form Telegram message from a practising CA. "
-    "Decide whether the answer needs data from the firm's database; if "
-    "so, call one or more of the tools provided. Otherwise answer "
-    "directly. Always end with a single concise reply to the user.\n\n"
+    "Read the message, decide intent, and act:\n\n"
+    "* If the CA is greeting you, thanking you, asking what you can do, "
+    "or otherwise chatting — reply warmly in one sentence. Do NOT call "
+    "a database tool for casual conversation.\n"
+    "* If the CA is asking for facts about their firm (documents, "
+    "clients, tasks, filings) — call the read tools and answer.\n"
+    "* If the CA is telling you to do something to the firm's records "
+    "('add ABC Corp as a client', 'set CLEIND's GSTIN to X', 'mark "
+    "doc abc as approved', 'from now on all CLEIND invoices use 5%') "
+    "— call the matching mutating tool. Confirm the action in the "
+    "reply, do not just acknowledge.\n\n"
     "TOOL-CALLING RULES\n"
-    "- Call tools when you need facts (documents, clients, tasks, "
-    "filings) — never invent values.\n"
-    "- Chain tools when one result narrows the next (e.g. resolve a "
-    "client name → query that client's documents).\n"
+    "- Call tools when you need facts — never invent values.\n"
+    "- Chain tools when one result narrows the next (resolve a client "
+    "name first, then query that client's documents).\n"
     "- Stop calling tools as soon as you have enough to answer.\n"
-    "- After the final tool result, produce the user-facing reply as "
-    "plain text. No markdown. No emojis."
+    "- After the final tool result, produce the user-facing reply.\n"
 )
 
 
 _SUPERVISOR_OUTPUT: Final[str] = (
     "OUTPUT FORMAT\n"
-    "Your final assistant message (after any tool calls) is sent to the "
-    "user via Telegram with HTML parse mode. Plain text is fine — the "
-    "formatter escapes special characters. Do NOT include <html> or "
-    "<body> tags, do NOT use markdown."
+    "Your final assistant message is sent to the user via Telegram with "
+    "HTML parse mode. You may use light HTML formatting (<b>, <i>, "
+    "<code>) and one status emoji at the head of a line (✅ ⚠ ❌ 📊). "
+    "Do NOT use markdown, decorative emojis inside body text, <html> "
+    "or <body> tags."
 )
 
 

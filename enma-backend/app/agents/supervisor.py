@@ -42,13 +42,18 @@ from typing import Any, Final, cast
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sqlalchemy.exc import IntegrityError
+
 from app.agents.context_injector import format_rules_for_prompt, load_rules_for_engine
 from app.db.queries.clients import ClientQuery
 from app.db.queries.documents import DocumentQuery
 from app.db.queries.filings import FilingQuery
+from app.db.queries.rules import RuleQuery
 from app.db.queries.tasks import TaskQuery
 from app.logging_setup import get_logger
 from app.prompts.master_prompt import build_supervisor_prompt
+from app.tax.directives import RuleDirective
+from app.tax.gstin_validator import is_valid_gstin
 from app.services.llm import (
     ChatMessage,
     ChatResponse,
@@ -437,6 +442,243 @@ async def _tool_query_document_by_ref(
 
 
 # ---------------------------------------------------------------------------
+# W2.D — mutating tools.
+#
+# Each tool writes to the firm-scoped database via the BaseQuery layer
+# (tenant isolation by construction). The supervisor calls one of these
+# when the CA *tells* Enma to do something — "Add ABC Corp",
+# "Set CLEIND's GSTIN to ...", "Mark doc 1ca3f4e0 as approved",
+# "From now on all CLEIND invoices use 5% slab".
+#
+# Every mutating tool returns a structured confirmation that the
+# supervisor folds into a one-line user-facing reply ("✅ Added ABC Corp").
+# ---------------------------------------------------------------------------
+
+
+async def _resolve_client_from_args(
+    ctx: SupervisorContext, args: dict[str, Any]
+) -> Any:
+    """Shared helper: resolve a client from a UUID OR a fuzzy name arg.
+
+    Returns the :class:`Client` row, or raises :class:`ToolError` with
+    enough detail for the LLM to ask for clarification. Mutating tools
+    always need a deterministic target; "I think you meant X" is the
+    CA's call, not ours.
+    """
+    raw_id = args.get("client_id")
+    raw_name = args.get("client_name")
+    if not raw_id and not raw_name:
+        raise ToolError("client_id or client_name is required")
+    clients = ClientQuery(session=ctx.session, ca_firm_id=ctx.ca_firm_id)
+    if raw_id:
+        cid = _coerce_uuid_or_none(raw_id)
+        if cid is None and _looks_like_uuid(str(raw_id)):
+            cid = uuid.UUID(str(raw_id))
+        if cid is not None:
+            hit = await clients.get_by_id(cid)
+            if hit is not None:
+                return hit
+    if raw_name:
+        matches = await clients.search_by_name(str(raw_name))
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ToolError(
+                "name matched "
+                f"{len(matches)} clients ({', '.join(c.trade_name for c in matches[:3])}); "
+                "ask the CA to pick"
+            )
+    raise ToolError(f"no client matches {raw_id or raw_name!r}")
+
+
+async def _tool_add_client(
+    ctx: SupervisorContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Create a new client for the firm. W2.D core mutating tool.
+
+    Trade name is required; GSTIN and legal name are optional. GSTIN is
+    validated against the Indian checksum so a typo from natural-language
+    parsing ("GSTIN 27ABCDE1234F1Z6") is caught before insert. Duplicate
+    GSTIN within the firm raises :class:`ToolError` so the LLM can
+    surface it as a friendly conflict message.
+    """
+    trade_name = args.get("trade_name")
+    if not isinstance(trade_name, str) or not trade_name.strip():
+        raise ToolError("trade_name is required")
+    gstin = args.get("gstin")
+    if isinstance(gstin, str) and gstin.strip():
+        gstin = gstin.strip().upper()
+        if not is_valid_gstin(gstin):
+            raise ToolError(f"GSTIN {gstin!r} failed format/checksum validation")
+    else:
+        gstin = None
+    legal_name = args.get("legal_name")
+    legal_name = (
+        legal_name.strip() if isinstance(legal_name, str) and legal_name.strip() else None
+    )
+    clients = ClientQuery(session=ctx.session, ca_firm_id=ctx.ca_firm_id)
+    try:
+        client = await clients.create(
+            trade_name=trade_name.strip(),
+            gstin=gstin,
+            legal_name=legal_name,
+        )
+    except IntegrityError as exc:
+        await ctx.session.rollback()
+        raise ToolError(
+            "A client with that GSTIN already exists for this firm."
+        ) from exc
+    await ctx.session.commit()
+    return {
+        "id": str(client.id),
+        "trade_name": client.trade_name,
+        "gstin": client.gstin,
+        "created": True,
+    }
+
+
+async def _tool_update_client(
+    ctx: SupervisorContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Edit an existing client's fields. W2.D core mutating tool.
+
+    Accepts ``client_id`` OR ``client_name`` to pick the target; updates
+    any of ``trade_name``, ``legal_name``, ``gstin`` (GSTIN re-validated).
+    Other fields are accepted opaquely so the LLM can write addresses,
+    contact emails, etc. without a schema bump per field.
+    """
+    target = await _resolve_client_from_args(ctx, args)
+    updates: dict[str, Any] = {}
+    for key in (
+        "trade_name",
+        "legal_name",
+        "address",
+        "contact_email",
+        "contact_phone",
+        "pan",
+        "state_code",
+    ):
+        val = args.get(key)
+        if isinstance(val, str) and val.strip():
+            updates[key] = val.strip()
+    if "gstin" in args:
+        gstin = args.get("gstin")
+        if isinstance(gstin, str) and gstin.strip():
+            gstin = gstin.strip().upper()
+            if not is_valid_gstin(gstin):
+                raise ToolError(f"GSTIN {gstin!r} failed format/checksum validation")
+            updates["gstin"] = gstin
+    if not updates:
+        raise ToolError("no editable fields provided")
+    clients = ClientQuery(session=ctx.session, ca_firm_id=ctx.ca_firm_id)
+    updated = await clients.update(target.id, **updates)
+    if updated is None:
+        raise ToolError("update failed — client may have been deleted")
+    await ctx.session.commit()
+    return {
+        "id": str(updated.id),
+        "trade_name": updated.trade_name,
+        "gstin": updated.gstin,
+        "updated_fields": sorted(updates.keys()),
+    }
+
+
+async def _tool_mark_document(
+    ctx: SupervisorContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Flip a document's processing_status. W2.D core mutating tool.
+
+    Accepts a short 8-char ``ref`` hash (what the summary prints) and a
+    target ``status``. Uses the same ref-prefix lookup the read-side
+    ``query_document_by_ref`` tool uses, so the LLM can quote the user's
+    "doc 1ca3f4e0" verbatim. Returns ``ambiguous=true`` with candidates
+    when the prefix matches more than one document.
+    """
+    ref = args.get("ref")
+    status = args.get("status")
+    if not isinstance(ref, str) or not ref.strip():
+        raise ToolError("ref is required (e.g. '1ca3f4e0' as shown on the summary)")
+    if not isinstance(status, str) or not status.strip():
+        raise ToolError("status is required (e.g. 'approved', 'flagged', 'needs_review')")
+    docs_q = DocumentQuery(session=ctx.session, ca_firm_id=ctx.ca_firm_id)
+    try:
+        matches = await docs_q.find_by_ref_prefix(ref)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    if not matches:
+        return {"matched": False, "ref": ref}
+    if len(matches) > 1:
+        return {
+            "ambiguous": True,
+            "matches": [{"id": str(d.id), "ref": str(d.id)[:8]} for d in matches],
+        }
+    doc = matches[0]
+    updated = await docs_q.update_status(doc.id, processing_status=status.strip())
+    if updated is None:
+        raise ToolError("update failed — document may have been deleted")
+    await ctx.session.commit()
+    return {
+        "id": str(updated.id),
+        "ref": str(updated.id)[:8],
+        "processing_status": updated.processing_status,
+        "updated": True,
+    }
+
+
+async def _tool_add_firm_rule(
+    ctx: SupervisorContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Persist a free-form firm rule for future retrieval. W2.D core tool.
+
+    The rule_text is embedded (pgvector) and surfaced via the same
+    context_injector the tax engine already consults. Rules are scoped
+    firm-wide by default; pass ``client_name`` or ``client_id`` to bind
+    the rule to one client. Source is always ``manual_entry`` for rules
+    typed by the CA in natural language — the supervisor never tags
+    a rule as ``human_correction`` (that requires a specific document
+    being corrected, which is a different flow).
+
+    Note: this first cut stores rule_text + scope only. A future
+    iteration will let the LLM emit a typed RuleDirective when the
+    instruction maps cleanly to one of the engine's DirectiveAction
+    enum values — that's what makes the rule *deterministic* at engine
+    time. For now the engine still consults rule_text via pgvector
+    retrieval, which is the existing behaviour.
+    """
+    rule_text = args.get("rule_text")
+    if not isinstance(rule_text, str) or not rule_text.strip():
+        raise ToolError("rule_text is required")
+
+    client_uuid: uuid.UUID | None = None
+    if args.get("client_id") or args.get("client_name"):
+        target = await _resolve_client_from_args(ctx, args)
+        client_uuid = target.id
+
+    rules_q = RuleQuery(session=ctx.session, ca_firm_id=ctx.ca_firm_id)
+    rule = await rules_q.insert_rule(
+        rule_text=rule_text.strip(),
+        directive=None,
+        source="manual_entry",
+        rule_type="preference",
+        client_id=client_uuid,
+    )
+    await ctx.session.commit()
+    return {
+        "id": str(rule.id),
+        "rule_text": rule.rule_text,
+        "scope": "client" if client_uuid else "firm",
+        "client_id": str(client_uuid) if client_uuid else None,
+        "stored": True,
+    }
+
+
+# Silence ruff: RuleDirective is imported for type stability of the
+# future "typed_directive" expansion of _tool_add_firm_rule. Keep the
+# import; ruff allows it via __all__ surface.
+_ = RuleDirective
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
@@ -554,6 +796,103 @@ TOOLS: Final[dict[str, ToolSpec]] = {
             "additionalProperties": False,
         },
         runner=_tool_get_filing_summary,
+    ),
+    # W2.D — mutating tools.
+    "add_client": ToolSpec(
+        name="add_client",
+        description=(
+            "Create a new client for the firm. Call this when the CA says "
+            "'Add ABC Corp', 'register XYZ Pvt Ltd', 'new client X with "
+            "GSTIN ...'. trade_name is required. gstin is validated via "
+            "Indian checksum if provided. Duplicate GSTIN in the firm is "
+            "an error (return it to the CA verbatim)."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "trade_name": {"type": "string"},
+                "gstin": {"type": "string"},
+                "legal_name": {"type": "string"},
+            },
+            "required": ["trade_name"],
+            "additionalProperties": False,
+        },
+        runner=_tool_add_client,
+    ),
+    "update_client": ToolSpec(
+        name="update_client",
+        description=(
+            "Edit an existing client's profile. Use when the CA says "
+            "'Set CLEIND's GSTIN to ...', 'update X's address', 'rename "
+            "Y to Z'. Pass client_id OR client_name to pick the target. "
+            "Any of trade_name/legal_name/gstin/address/contact_email/"
+            "contact_phone/pan/state_code may be supplied; only the ones "
+            "you pass are updated."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "client_id": {"type": "string"},
+                "client_name": {"type": "string"},
+                "trade_name": {"type": "string"},
+                "legal_name": {"type": "string"},
+                "gstin": {"type": "string"},
+                "address": {"type": "string"},
+                "contact_email": {"type": "string"},
+                "contact_phone": {"type": "string"},
+                "pan": {"type": "string"},
+                "state_code": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+        runner=_tool_update_client,
+    ),
+    "mark_document": ToolSpec(
+        name="mark_document",
+        description=(
+            "Flip a document's processing_status. Use when the CA says "
+            "'mark doc 1ca3f4e0 as approved', 'flag this one for review', "
+            "'set X to filed'. Pass the short 'ref' hash (4-32 hex chars) "
+            "shown on every Document-processed summary, plus the new "
+            "status string. Status is free-form (e.g. 'approved', "
+            "'flagged', 'needs_review', 'filed')."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "ref": {
+                    "type": "string",
+                    "description": "Short hex ref shown on summaries (e.g. '1ca3f4e0').",
+                },
+                "status": {"type": "string"},
+            },
+            "required": ["ref", "status"],
+            "additionalProperties": False,
+        },
+        runner=_tool_mark_document,
+    ),
+    "add_firm_rule": ToolSpec(
+        name="add_firm_rule",
+        description=(
+            "Persist a firm-level rule the CA wants Enma to remember and "
+            "apply on future documents. Use when the CA says 'from now on "
+            "all CLEIND invoices are 5% slab', 'always treat vendor X as "
+            "RCM', 'mark hotel bills under 7500 as eligible'. Provide "
+            "rule_text verbatim — Enma re-reads it via vector retrieval "
+            "at engine time. Pass client_id or client_name to scope the "
+            "rule to one client; omit both for a firm-wide rule."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "rule_text": {"type": "string"},
+                "client_id": {"type": "string"},
+                "client_name": {"type": "string"},
+            },
+            "required": ["rule_text"],
+            "additionalProperties": False,
+        },
+        runner=_tool_add_firm_rule,
     ),
 }
 
