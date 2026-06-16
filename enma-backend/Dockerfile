@@ -6,10 +6,17 @@
 #   * prod  → wheel-built, non-root user, gunicorn+uvicorn worker
 # =============================================================================
 
+# Pull the python base from ECR Public, not Docker Hub. Docker Hub's
+# unauthenticated rate limit is 100 pulls per 6h per IP and CodeBuild's
+# shared egress in ap-south-1 blows through that on busy days (see
+# deploy bbdb7c60 hitting HTTP 429). ECR Public mirrors the Docker
+# Library images byte-for-byte and has no rate limit when pulled from
+# AWS infrastructure.
 ARG PYTHON_VERSION=3.12-slim-bookworm
+ARG PYTHON_REGISTRY=public.ecr.aws/docker/library
 
 # ---------- base -------------------------------------------------------------
-FROM python:${PYTHON_VERSION} AS base
+FROM ${PYTHON_REGISTRY}/python:${PYTHON_VERSION} AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
