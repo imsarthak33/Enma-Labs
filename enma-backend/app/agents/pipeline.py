@@ -404,6 +404,7 @@ async def finalize_document(  # noqa: PLR0915 — linear orchestrator
     filing_period_month: int | None = None,
     filing_period_year: int | None = None,
     source_file_ids: list[str] | None = None,
+    source_file_hash: str | None = None,
 ) -> PipelineResult:
     """Finalise an already-extracted document against a resolved client.
 
@@ -571,6 +572,7 @@ async def finalize_document(  # noqa: PLR0915 — linear orchestrator
             filing_period_year=derived_year,
             processing_status=persisted_status,
             content_hash=content_hash or None,
+            source_file_hash=source_file_hash,
         )
         await session.commit()
         document_id = doc.id

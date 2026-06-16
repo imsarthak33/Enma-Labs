@@ -78,6 +78,27 @@ class DocumentQuery(BaseQuery):
         )
         return await self._fetch_all(stmt)
 
+    async def find_by_source_file_hash(
+        self, *, source_file_hash: str
+    ) -> Document | None:
+        """W3.5-d: lookup an existing document by SHA-256 of raw file bytes.
+
+        Used by the worker route BEFORE the LLM pipeline runs, so a
+        byte-identical re-upload short-circuits without paying for
+        layout + extraction LLM calls. Scope is firm-only (no
+        client_id): the same bytes are the same file regardless of
+        which client the CA ultimately picks.
+        """
+        if not source_file_hash:
+            return None
+        stmt = (
+            self._scoped_select(Document)
+            .where(Document.source_file_hash == source_file_hash)
+            .order_by(Document.created_at.desc())
+            .limit(1)
+        )
+        return await self._fetch_one(stmt)
+
     async def find_by_content_hash(
         self, *, client_id: uuid.UUID | str, content_hash: str
     ) -> Document | None:
@@ -141,6 +162,7 @@ class DocumentQuery(BaseQuery):
         processing_status: str | None = None,
         processing_time_ms: int | None = None,
         content_hash: str | None = None,
+        source_file_hash: str | None = None,
     ) -> Document:
         """Insert a new document for this firm.
 
@@ -167,6 +189,8 @@ class DocumentQuery(BaseQuery):
             kwargs["processing_time_ms"] = processing_time_ms
         if content_hash is not None:
             kwargs["content_hash"] = content_hash
+        if source_file_hash is not None:
+            kwargs["source_file_hash"] = source_file_hash
         doc = Document(**kwargs)
         return cast(Document, await self._insert(doc))
 

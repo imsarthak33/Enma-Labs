@@ -29,6 +29,7 @@ parts of the codebase.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import uuid
 from typing import Any
@@ -67,6 +68,7 @@ from app.db.models.client import Client
 from app.db.models.firm import CaFirm
 from app.db.queries.clients import ClientQuery
 from app.db.queries.conversations import RECENT_WINDOW_TURNS, ConversationQuery
+from app.db.queries.documents import DocumentQuery
 from app.db.queries.firms import find_firm_by_admin_chat_id
 from app.db.queries.pending_assignments import PendingAssignmentQuery
 from app.db.session import get_sessionmaker
@@ -144,6 +146,32 @@ async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PL
             )
             return
 
+        # ---- Step 2b: early dedup (W3.5-d) ------------------------------
+        # SHA-256 the raw bytes and check the DB BEFORE we spend money on
+        # the layout + extraction LLM calls. Hash matches mean the CA
+        # uploaded the same file before; render a dedup banner and stop.
+        source_file_hash = hashlib.sha256(file_bytes).hexdigest()
+        docs_q = DocumentQuery(session=session, ca_firm_id=firm.id)
+        existing_dup = await docs_q.find_by_source_file_hash(
+            source_file_hash=source_file_hash
+        )
+        if existing_dup is not None:
+            _log.info(
+                "document_early_dedup_hit",
+                existing_id=str(existing_dup.id),
+                source_file_hash=source_file_hash,
+            )
+            await telegram.send_message(
+                chat_id=envelope.chat_id,
+                html_text=(
+                    f"<i>Re-upload detected.</i> Already in your ledger as "
+                    f"<code>{str(existing_dup.id)[:8]}</code> — nothing new "
+                    f"processed. (Saved one extraction.)"
+                ),
+                reply_to_message_id=envelope.message_id,
+            )
+            return
+
         # ---- Step 3: extract (no client_id needed yet) ------------------
         try:
             extraction_outcome = await extract_only(file_bytes)
@@ -203,6 +231,7 @@ async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PL
             file_ids=[file_id],
             chat_id=envelope.chat_id,
             reply_to_message_id=envelope.message_id,
+            source_file_hash=source_file_hash,
         )
 
 
@@ -231,6 +260,7 @@ async def _finalize_and_summarise(
     file_ids: list[str],
     chat_id: int,
     reply_to_message_id: int | None,
+    source_file_hash: str | None = None,
 ) -> None:
     """R2 — Persist + send the HTML summary using a cached ExtractionOutcome.
 
@@ -250,6 +280,7 @@ async def _finalize_and_summarise(
             client_id=client.id,
             outcome=outcome,
             source_file_ids=file_ids,
+            source_file_hash=source_file_hash,
         )
     except PipelineError as exc:
         _log.error("document_finalize_failed", error=str(exc))

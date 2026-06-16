@@ -101,6 +101,15 @@ class Document(Base):
             "missing on the extraction (very rare)."
         ),
     )
+    source_file_hash: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        comment=(
+            "SHA-256 of the raw file bytes. Set at download time so the "
+            "worker can short-circuit the pipeline on a re-upload before "
+            "calling the classification + extraction LLMs."
+        ),
+    )
     processing_time_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

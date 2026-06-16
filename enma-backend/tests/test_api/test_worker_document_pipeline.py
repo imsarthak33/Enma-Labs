@@ -166,6 +166,21 @@ def _patch_common(
     monkeypatch.setattr(worker_module, "ClientQuery", _FakeClientQuery)
     monkeypatch.setattr(worker_module, "get_sessionmaker", _fake_sessionmaker)
 
+    class _FakeDocumentQuery:
+        """W3.5-d: early-dedup check defaults to MISS in tests so the
+        existing pipeline path runs. Individual tests can override by
+        monkeypatching find_by_source_file_hash on the instance.
+        """
+
+        def __init__(self, **_kw: Any) -> None: ...
+
+        async def find_by_source_file_hash(
+            self, *, source_file_hash: str
+        ) -> Any:
+            return None
+
+    monkeypatch.setattr(worker_module, "DocumentQuery", _FakeDocumentQuery)
+
     async def fake_download(_file_id: str) -> bytes:
         captures["downloads"].append(_file_id)
         return download_bytes
@@ -333,7 +348,7 @@ async def test_resume_after_assign_fires_pipeline(monkeypatch: pytest.MonkeyPatc
     class _FakePendingQuery:
         def __init__(self, **_kw: Any) -> None: ...
 
-        def _scoped_select(self, _model: Any) -> Any:  # noqa: ANN401
+        def _scoped_select(self, _model: Any) -> Any:
             class _Stmt:
                 def where(self, *_a: Any, **_kw: Any) -> _Stmt:
                     return self
@@ -344,10 +359,10 @@ async def test_resume_after_assign_fires_pipeline(monkeypatch: pytest.MonkeyPatc
 
     # Patch the AsyncSession.execute call to return our fake row.
     class _FakeResult:
-        def scalar_one_or_none(self) -> Any:  # noqa: ANN401
+        def scalar_one_or_none(self) -> Any:
             return fake_row
 
-    async def fake_execute(_stmt: Any) -> _FakeResult:  # noqa: ANN401
+    async def fake_execute(_stmt: Any) -> _FakeResult:
         return _FakeResult()
 
     # The session is a _FakeSession instance; attach execute() to it.
@@ -397,7 +412,7 @@ async def test_resume_with_missing_row_logs_and_returns(monkeypatch: pytest.Monk
     class _FakePendingQuery:
         def __init__(self, **_kw: Any) -> None: ...
 
-        def _scoped_select(self, _model: Any) -> Any:  # noqa: ANN401
+        def _scoped_select(self, _model: Any) -> Any:
             class _Stmt:
                 def where(self, *_a: Any, **_kw: Any) -> _Stmt:
                     return self
@@ -407,10 +422,10 @@ async def test_resume_with_missing_row_logs_and_returns(monkeypatch: pytest.Monk
     monkeypatch.setattr(worker_module, "PendingAssignmentQuery", _FakePendingQuery)
 
     class _FakeResult:
-        def scalar_one_or_none(self) -> Any:  # noqa: ANN401
+        def scalar_one_or_none(self) -> Any:
             return None
 
-    async def fake_execute(_stmt: Any) -> _FakeResult:  # noqa: ANN401
+    async def fake_execute(_stmt: Any) -> _FakeResult:
         return _FakeResult()
 
     session = _FakeSession()
@@ -545,7 +560,7 @@ async def test_r2_resume_uses_cached_extraction_no_reextract(
     class _FakePendingQuery:
         def __init__(self, **_kw: Any) -> None: ...
 
-        def _scoped_select(self, _model: Any) -> Any:  # noqa: ANN401
+        def _scoped_select(self, _model: Any) -> Any:
             class _Stmt:
                 def where(self, *_a: Any, **_kw: Any) -> _Stmt:
                     return self
@@ -555,10 +570,10 @@ async def test_r2_resume_uses_cached_extraction_no_reextract(
     monkeypatch.setattr(worker_module, "PendingAssignmentQuery", _FakePendingQuery)
 
     class _FakeResult:
-        def scalar_one_or_none(self) -> Any:  # noqa: ANN401
+        def scalar_one_or_none(self) -> Any:
             return fake_row
 
-    async def fake_execute(_stmt: Any) -> _FakeResult:  # noqa: ANN401
+    async def fake_execute(_stmt: Any) -> _FakeResult:
         return _FakeResult()
 
     @asynccontextmanager
@@ -585,3 +600,38 @@ async def test_r2_resume_uses_cached_extraction_no_reextract(
     # One summary sent, threaded onto the original document message_id.
     assert len(captures["sends"]) == 1
     assert captures["sends"][0]["reply_to_message_id"] == 42
+
+
+@pytest.mark.asyncio
+async def test_early_dedup_skips_pipeline_and_sends_banner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """W3.5-d regression: a re-upload (same file bytes) must short-circuit
+    the pipeline BEFORE extract_only runs. Production cost ~$0.013 +
+    63s per re-upload before this fix (request 69227d42, 2026-06-16).
+    """
+    captures = _patch_common(monkeypatch, firm=_FakeFirm(), client=_FakeClient())
+
+    existing_id = uuid.uuid4()
+
+    class _DupDocumentQuery:
+        def __init__(self, **_kw: Any) -> None: ...
+
+        async def find_by_source_file_hash(
+            self, *, source_file_hash: str
+        ) -> Any:
+            existing = _FakeFirm()  # any object with .id is fine
+            existing.id = existing_id
+            return existing
+
+    monkeypatch.setattr(worker_module, "DocumentQuery", _DupDocumentQuery)
+
+    await worker_module._run_document_pipeline(_envelope())
+
+    # Zero extract calls — the whole point of the early-dedup fix.
+    assert captures["pipeline_calls"] == []
+    # One banner message sent to the user with the existing doc's ref.
+    assert len(captures["sends"]) == 1
+    body = captures["sends"][0]["html_text"]
+    assert "Re-upload detected" in body
+    assert str(existing_id)[:8] in body

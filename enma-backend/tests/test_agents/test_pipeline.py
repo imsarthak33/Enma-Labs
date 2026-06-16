@@ -83,6 +83,7 @@ async def db_session():
                 "filing_period_month INTEGER, filing_period_year INTEGER, "
                 "processing_status TEXT DEFAULT 'pending', "
                 "processing_time_ms INTEGER, content_hash TEXT, "
+                "source_file_hash TEXT, "
                 "created_at TEXT, updated_at TEXT)"
             )
         )
