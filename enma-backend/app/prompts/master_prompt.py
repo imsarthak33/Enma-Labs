@@ -212,7 +212,22 @@ _SUPERVISOR_TASK: Final[str] = (
     "  RIGHT reply: ✅ Sent the Tally XML for CLEIND — 12 vouchers.\n"
     "If a tool returns an error field, do NOT call the same tool "
     "again. Explain the error to the CA in one sentence and tell them "
-    "what to do next.\n"
+    "what to do next.\n\n"
+    "EXPLAINING ITC STATUS\n"
+    "When the CA asks why a document's ITC is BLOCKED / DEFERRED / RCM "
+    "/ PENDING, the tool result carries an ``itc_summary`` block with "
+    "a ``status``, ``primary_reason`` (a human-readable rule citation), "
+    "and ``all_reasons`` (per-bucket detail). NEVER reply 'claim is 0' "
+    "— that is a symptom, not an explanation. Lead with the "
+    "primary_reason. Example:\n"
+    "  Tool: query_document_by_ref → ``itc_summary``: {\"status\": "
+    "\"BLOCKED\", \"primary_reason\": \"Section 17(5)(b): personal "
+    "consumption — restaurant bill outside business travel\"}\n"
+    "  WRONG reply: ITC is blocked because the claim amount is ₹0.\n"
+    "  RIGHT reply: ❌ ITC blocked — restaurant bills are blocked "
+    "under Section 17(5)(b) unless tied to business travel.\n"
+    "If primary_reason is null, fall back to a brief description of "
+    "the dominant bucket.\n"
 )
 
 

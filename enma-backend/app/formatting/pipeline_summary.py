@@ -15,9 +15,9 @@ extracted highlights.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Final
 
-from app.agents.pipeline import PipelineResult, PipelineStageStatus
+from app.agents.pipeline import PipelineResult, PipelineStage, PipelineStageStatus
 from app.agents.verifier import (
     VerificationIssue,
     VerificationResult,
@@ -26,6 +26,9 @@ from app.agents.verifier import (
 from app.formatting.telegram_html import bold, code, italic, safe_text
 
 __all__ = ["render_pipeline_summary"]
+
+
+_DUP_PREFIX: Final[str] = "duplicate of "
 
 
 # ---------------------------------------------------------------------------
@@ -37,6 +40,11 @@ def render_pipeline_summary(result: PipelineResult) -> str:
     """Compose the Telegram HTML summary for a pipeline result."""
     sections: list[str] = []
     sections.append(_header(result))
+    # W3.5-a: surface dedup hits prominently so a CA re-uploading the
+    # same invoice sees we recognised it (vs thinking we re-processed).
+    dup_banner = _duplicate_banner(result)
+    if dup_banner:
+        sections.append(dup_banner)
     sections.append(_verdict_line(result.verification))
     extraction = result.extraction or {}
     sections.append(_extraction_block(extraction))
@@ -45,6 +53,37 @@ def render_pipeline_summary(result: PipelineResult) -> str:
         sections.append(issues_block)
     sections.append(_stage_block(result))
     return "\n\n".join(s for s in sections if s)
+
+
+def _duplicate_ref(result: PipelineResult) -> str | None:
+    """Return the 8-char ref of the existing doc when this run was a dedup hit.
+
+    Detection: ``finalize_document`` returns a PipelineResult whose
+    PERSISTENCE stage is SKIPPED with an error string starting
+    ``"duplicate of <uuid>"``. Returns the first 8 hex chars of that
+    UUID, matching the ``Ref:`` style shown in :func:`_header`.
+    """
+    for stage in result.stages:
+        if (
+            stage.stage is PipelineStage.PERSISTENCE
+            and stage.status is PipelineStageStatus.SKIPPED
+            and stage.error
+            and stage.error.startswith(_DUP_PREFIX)
+        ):
+            existing_id = stage.error[len(_DUP_PREFIX):].strip()
+            return existing_id[:8] if existing_id else None
+    return None
+
+
+def _duplicate_banner(result: PipelineResult) -> str:
+    """Render the 'this is a duplicate of <ref>' banner, or empty if not."""
+    dup_ref = _duplicate_ref(result)
+    if dup_ref is None:
+        return ""
+    return (
+        f"{italic('Re-upload detected.')} "
+        f"Already in your ledger as {code(dup_ref)} — nothing new persisted."
+    )
 
 
 # ---------------------------------------------------------------------------

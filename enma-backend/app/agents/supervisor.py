@@ -275,6 +275,7 @@ async def _tool_query_documents(
                 "processing_status": d.processing_status,
                 "created_at": d.created_at.isoformat(),
                 "tax_verdict": d.tax_verdict,
+                "itc_summary": _summarize_itc_verdict(d.tax_verdict),
             }
             for d in rows[:25]
         ],
@@ -964,6 +965,91 @@ _MONTH_NAMES_TITLE: Final[tuple[str, ...]] = (
     "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December",
 )
+
+
+# ---------------------------------------------------------------------------
+# W3.5-b — derive a CA-readable ITC summary from a raw tax_verdict.
+#
+# verdict.reasons is {"claim": [...], "block": [...], ...} keyed by bucket.
+# Raw, the LLM sees this as opaque JSON and replies with "claim is 0" when
+# asked why ITC is blocked. The summary picks the dominant bucket (largest
+# amount) and surfaces its primary reason so the LLM has something concrete
+# to paraphrase.
+# ---------------------------------------------------------------------------
+
+
+def _summarize_itc_verdict(verdict: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Pick the dominant ITC bucket + its top reason from a tax_verdict.
+
+    Returns ``None`` when ``verdict`` is missing or unrecognised. Output
+    shape:
+
+      {
+        "status": "ELIGIBLE" | "BLOCKED" | "DEFERRED" | "RCM" | "PENDING",
+        "primary_reason": str | None,
+        "all_reasons": dict[bucket -> list[str]],
+        "amounts": {claim, block, defer, rcm, tds (all strings)},
+      }
+    """
+    if not isinstance(verdict, dict):
+        return None
+
+    def _amt(key: str) -> Decimal:
+        raw = verdict.get(key)
+        if raw is None or raw == "":
+            return Decimal("0")
+        try:
+            return Decimal(str(raw))
+        except (ValueError, ArithmeticError):
+            return Decimal("0")
+
+    claim = _amt("claim_amount")
+    block = _amt("block_amount")
+    defer = _amt("defer_amount")
+    rcm = _amt("rcm_liability")
+    tds = _amt("tds_amount")
+
+    # Tie-break ELIGIBLE > BLOCKED > DEFERRED > RCM > PENDING (matches
+    # app/services/export._derive_itc_status — single source of truth).
+    if claim > Decimal("0") and claim >= block and claim >= defer:
+        status = "ELIGIBLE"
+        primary_bucket = "claim"
+    elif block > Decimal("0") and block >= defer:
+        status = "BLOCKED"
+        primary_bucket = "block"
+    elif defer > Decimal("0"):
+        status = "DEFERRED"
+        primary_bucket = "defer"
+    elif rcm > Decimal("0"):
+        status = "RCM"
+        primary_bucket = "rcm"
+    else:
+        status = "PENDING"
+        # No dominant bucket; claim reasons tend to be the most informative.
+        primary_bucket = "claim"
+
+    raw_reasons = verdict.get("reasons")
+    all_reasons: dict[str, list[str]] = {}
+    if isinstance(raw_reasons, dict):
+        for bucket, items in raw_reasons.items():
+            if isinstance(items, list | tuple):
+                all_reasons[str(bucket)] = [str(x) for x in items if x]
+
+    primary_list = all_reasons.get(primary_bucket) or []
+    primary_reason = primary_list[0] if primary_list else None
+
+    return {
+        "status": status,
+        "primary_reason": primary_reason,
+        "all_reasons": all_reasons,
+        "amounts": {
+            "claim_amount": str(claim),
+            "block_amount": str(block),
+            "defer_amount": str(defer),
+            "rcm_liability": str(rcm),
+            "tds_amount": str(tds),
+        },
+    }
 
 
 async def _tool_approve_filing(

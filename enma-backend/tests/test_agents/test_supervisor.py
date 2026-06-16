@@ -27,6 +27,7 @@ from app.agents.supervisor import (
     _coerce_int_or_none,
     _coerce_uuid_or_none,
     _looks_like_json,
+    _summarize_itc_verdict,
     _tool_result_carries_error,
     run_supervisor,
 )
@@ -627,3 +628,75 @@ class TestMutatingToolRunners:
         assert result["stored"] is True
         assert result["scope"] == "firm"
         assert result["client_id"] is None
+
+
+class TestSummarizeItcVerdict:
+    """W3.5-b: derive a primary status + reason from a raw tax_verdict.
+
+    The supervisor sees `tax_verdict` as opaque JSON and used to reply
+    'claim is 0' when asked why ITC was blocked. The summarizer picks
+    the dominant bucket and surfaces its top reason so the LLM has
+    something concrete to paraphrase.
+    """
+
+    def test_eligible_when_claim_dominates(self) -> None:
+        summary = _summarize_itc_verdict({
+            "claim_amount": "1000.00",
+            "block_amount": "0",
+            "defer_amount": "0",
+            "rcm_liability": "0",
+            "reasons": {"claim": ["Standard B2B purchase, vendor registered."]},
+        })
+        assert summary is not None
+        assert summary["status"] == "ELIGIBLE"
+        assert "Standard B2B" in summary["primary_reason"]
+
+    def test_blocked_surfaces_block_reason(self) -> None:
+        summary = _summarize_itc_verdict({
+            "claim_amount": "0",
+            "block_amount": "500.00",
+            "defer_amount": "0",
+            "rcm_liability": "0",
+            "reasons": {"block": ["Section 17(5)(b): personal consumption."]},
+        })
+        assert summary is not None
+        assert summary["status"] == "BLOCKED"
+        assert "17(5)(b)" in summary["primary_reason"]
+
+    def test_deferred_picks_defer_bucket(self) -> None:
+        summary = _summarize_itc_verdict({
+            "claim_amount": "0",
+            "block_amount": "0",
+            "defer_amount": "200.00",
+            "rcm_liability": "0",
+            "reasons": {"defer": ["Filing period locked; defer to next period."]},
+        })
+        assert summary is not None
+        assert summary["status"] == "DEFERRED"
+        assert "locked" in summary["primary_reason"]
+
+    def test_pending_when_no_amounts(self) -> None:
+        summary = _summarize_itc_verdict({
+            "claim_amount": "0", "block_amount": "0",
+            "defer_amount": "0", "rcm_liability": "0",
+            "reasons": {},
+        })
+        assert summary is not None
+        assert summary["status"] == "PENDING"
+        assert summary["primary_reason"] is None
+
+    def test_none_verdict_returns_none(self) -> None:
+        assert _summarize_itc_verdict(None) is None
+        assert _summarize_itc_verdict({}) is not None  # empty dict is valid → PENDING
+
+    def test_amounts_block_present(self) -> None:
+        summary = _summarize_itc_verdict({
+            "claim_amount": "12.34", "block_amount": "0",
+            "defer_amount": "0", "rcm_liability": "5.00",
+            "tds_amount": "1.00",
+            "reasons": {},
+        })
+        assert summary is not None
+        assert summary["amounts"]["claim_amount"] == "12.34"
+        assert summary["amounts"]["rcm_liability"] == "5.00"
+        assert summary["amounts"]["tds_amount"] == "1.00"

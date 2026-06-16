@@ -136,3 +136,51 @@ class TestRenderSummary:
             )
         )
         assert "not persisted" in html
+
+
+class TestDuplicateBanner:
+    """W3.5-a regression: dedup hits must be visible in the summary."""
+
+    def _dedup_stages(self, existing_id: str) -> tuple[PipelineStageOutcome, ...]:
+        # finalize_document emits SKIPPED persistence with "duplicate of <uuid>"
+        # error string on the dedup return path.
+        stages = []
+        for s in PipelineStage:
+            if s is PipelineStage.PERSISTENCE:
+                stages.append(
+                    PipelineStageOutcome(
+                        stage=s,
+                        status=PipelineStageStatus.SKIPPED,
+                        duration_ms=0,
+                        error=f"duplicate of {existing_id}",
+                    )
+                )
+            else:
+                stages.append(
+                    PipelineStageOutcome(stage=s, status=PipelineStageStatus.OK, duration_ms=1)
+                )
+        return tuple(stages)
+
+    def test_duplicate_banner_renders(self) -> None:
+        existing = uuid.uuid4()
+        result = PipelineResult(
+            document_id=existing,
+            document_type="B2B_INVOICE",
+            extraction={"vendor": {"name": "V"}, "totals": {}, "line_items": []},
+            verification=VerificationResult(issues=()),
+            stages=self._dedup_stages(str(existing)),
+        )
+        html = render_pipeline_summary(result)
+        assert "Re-upload detected" in html
+        assert str(existing)[:8] in html
+
+    def test_no_banner_when_persistence_ok(self) -> None:
+        result = PipelineResult(
+            document_id=uuid.uuid4(),
+            document_type="B2B_INVOICE",
+            extraction={"vendor": {"name": "V"}, "totals": {}, "line_items": []},
+            verification=VerificationResult(issues=()),
+            stages=_stages_ok(),
+        )
+        html = render_pipeline_summary(result)
+        assert "Re-upload detected" not in html
