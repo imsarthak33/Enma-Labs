@@ -159,10 +159,21 @@ async def test_telegram_client_wraps_underlying_errors(
 # ---------------------------------------------------------------------------
 
 
-def _firm(*, channel: str = "telegram") -> MagicMock:
+def _firm(
+    *,
+    channel: str = "telegram",
+    wa_provider: str | None = None,
+    wa_account_id: str | None = None,
+    wa_phone: str | None = None,
+    wa_token_encrypted: bytes | None = None,
+) -> MagicMock:
     f = MagicMock()
     f.id = uuid.uuid4()
     f.primary_channel = channel
+    f.whatsapp_provider = wa_provider
+    f.whatsapp_account_id = wa_account_id
+    f.whatsapp_phone_number = wa_phone
+    f.whatsapp_auth_token_encrypted = wa_token_encrypted
     return f
 
 
@@ -170,6 +181,13 @@ def _user(*, channel: str | None) -> MagicMock:
     u = MagicMock()
     u.primary_channel = channel
     return u
+
+
+@pytest.fixture(autouse=True)
+def _reset_wa_cache():
+    factory.reset_whatsapp_cache()
+    yield
+    factory.reset_whatsapp_cache()
 
 
 class TestFactory:
@@ -193,7 +211,159 @@ class TestFactory:
         client = factory.client_for(firm=_firm(channel="telegram"))
         assert isinstance(client, TelegramClient)
 
-    def test_client_for_whatsapp_raises_until_wired(self) -> None:
-        """P2.a stub — WA wiring lands in P2.b."""
-        with pytest.raises(MessagingError, match="WhatsApp client not yet wired"):
-            factory.client_for(firm=_firm(channel="whatsapp"))
+    def test_client_for_whatsapp_returns_whatsapp_client(self) -> None:
+        from app.services.messaging.whatsapp_client import WhatsAppClient
+        from app.utils.crypto import encrypt_token
+
+        firm = _firm(
+            channel="whatsapp",
+            wa_provider="twilio",
+            wa_account_id="ACxxxx",
+            wa_phone="+14155238886",
+            wa_token_encrypted=encrypt_token("test_auth_token"),
+        )
+        client = factory.client_for(firm=firm)
+        assert isinstance(client, WhatsAppClient)
+
+    def test_client_for_whatsapp_cached_per_firm(self) -> None:
+        from app.utils.crypto import encrypt_token
+
+        firm = _firm(
+            channel="whatsapp",
+            wa_provider="twilio",
+            wa_account_id="ACxxxx",
+            wa_phone="+14155238886",
+            wa_token_encrypted=encrypt_token("test_auth_token"),
+        )
+        first = factory.client_for(firm=firm)
+        second = factory.client_for(firm=firm)
+        assert first is second  # cached, same instance
+
+    def test_client_for_whatsapp_unsupported_provider_raises(self) -> None:
+        firm = _firm(
+            channel="whatsapp",
+            wa_provider="meta_cloud",  # not yet wired
+            wa_account_id="x",
+            wa_phone="+1",
+            wa_token_encrypted=b"x",
+        )
+        with pytest.raises(MessagingError, match="unsupported provider"):
+            factory.client_for(firm=firm)
+
+    def test_client_for_whatsapp_missing_token_raises(self) -> None:
+        firm = _firm(
+            channel="whatsapp",
+            wa_provider="twilio",
+            wa_account_id="ACxxxx",
+            wa_phone="+14155238886",
+            wa_token_encrypted=None,
+        )
+        with pytest.raises(MessagingError, match="no encrypted auth_token"):
+            factory.client_for(firm=firm)
+
+    def test_client_for_whatsapp_corrupt_token_raises(self) -> None:
+        firm = _firm(
+            channel="whatsapp",
+            wa_provider="twilio",
+            wa_account_id="ACxxxx",
+            wa_phone="+14155238886",
+            wa_token_encrypted=b"not_a_real_fernet_blob",
+        )
+        with pytest.raises(MessagingError, match="failed to decrypt auth_token"):
+            factory.client_for(firm=firm)
+
+
+# ---------------------------------------------------------------------------
+# WhatsAppClient — via httpx.MockTransport
+# ---------------------------------------------------------------------------
+
+
+import httpx  # noqa: E402 — co-located with the WA tests
+from app.services.messaging.whatsapp_client import WhatsAppClient  # noqa: E402
+
+
+def _wa_client_with_mock(handler) -> WhatsAppClient:
+    transport = httpx.MockTransport(handler)
+    http = httpx.AsyncClient(transport=transport)
+    return WhatsAppClient(
+        account_sid="ACtestsid",
+        auth_token="testtoken",
+        from_number="+14155238886",
+        http_client=http,
+    )
+
+
+class TestWhatsAppClient:
+    @pytest.mark.asyncio
+    async def test_send_message_posts_to_twilio_with_expected_form(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["url"] = str(request.url)
+            captured["auth"] = request.headers.get("authorization", "")
+            captured["body"] = request.content.decode()
+            return httpx.Response(201, json={"sid": "SMxxxx", "status": "queued"})
+
+        client = _wa_client_with_mock(handler)
+        result = await client.send_message(
+            recipient="+919876543210",
+            body=Concat((Text("hi "), Bold(Text("CA")))),
+        )
+        assert result["sid"] == "SMxxxx"
+        assert "ACtestsid/Messages.json" in captured["url"]
+        assert captured["auth"].startswith("Basic ")
+        # form-encoded From/To/Body — both must carry whatsapp: prefix.
+        assert "From=whatsapp%3A%2B14155238886" in captured["body"]
+        assert "To=whatsapp%3A%2B919876543210" in captured["body"]
+        assert "hi+%2ACA%2A" in captured["body"]  # "hi *CA*"
+
+    @pytest.mark.asyncio
+    async def test_send_message_4xx_raises(self) -> None:
+        def handler(_req: httpx.Request) -> httpx.Response:
+            return httpx.Response(400, json={"code": 21211, "message": "Invalid 'To'"})
+
+        client = _wa_client_with_mock(handler)
+        with pytest.raises(MessagingError, match="twilio send_message HTTP 400"):
+            await client.send_message(recipient="+1", body=Text("x"))
+
+    @pytest.mark.asyncio
+    async def test_send_message_rejects_int_recipient(self) -> None:
+        client = _wa_client_with_mock(lambda r: httpx.Response(201, json={}))
+        with pytest.raises(MessagingError, match="must be an E.164 phone string"):
+            await client.send_message(recipient=12345, body=Text("x"))
+
+    @pytest.mark.asyncio
+    async def test_send_message_empty_body_raises(self) -> None:
+        client = _wa_client_with_mock(lambda r: httpx.Response(201, json={}))
+        with pytest.raises(MessagingError, match="empty body"):
+            await client.send_message(recipient="+1", body=Text(""))
+
+    @pytest.mark.asyncio
+    async def test_send_document_not_implemented(self) -> None:
+        client = _wa_client_with_mock(lambda r: httpx.Response(201, json={}))
+        with pytest.raises(NotImplementedError, match="P2.b.2"):
+            await client.send_document(
+                recipient="+1", file_bytes=b"x", filename="x.csv"
+            )
+
+    @pytest.mark.asyncio
+    async def test_download_file_uses_basic_auth(self) -> None:
+        captured: dict[str, str] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["url"] = str(request.url)
+            captured["auth"] = request.headers.get("authorization", "")
+            return httpx.Response(200, content=b"PDF_BYTES")
+
+        client = _wa_client_with_mock(handler)
+        out = await client.download_file(
+            "https://api.twilio.com/2010-04-01/Accounts/AC/Messages/SM/Media/ME"
+        )
+        assert out == b"PDF_BYTES"
+        assert captured["auth"].startswith("Basic ")
+
+    @pytest.mark.asyncio
+    async def test_download_file_rejects_non_https(self) -> None:
+        client = _wa_client_with_mock(lambda r: httpx.Response(200))
+        with pytest.raises(MessagingError, match="expected an https Twilio Media URL"):
+            await client.download_file("file:///etc/passwd")
