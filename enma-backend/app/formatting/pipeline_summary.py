@@ -29,6 +29,7 @@ __all__ = ["render_pipeline_summary"]
 
 
 _DUP_PREFIX: Final[str] = "duplicate of "
+_LOCKED_MARKER: Final[str] = "is locked"
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +46,13 @@ def render_pipeline_summary(result: PipelineResult) -> str:
     dup_banner = _duplicate_banner(result)
     if dup_banner:
         sections.append(dup_banner)
+    # W3.5-e: locked-period refusal — make explicit why the doc was
+    # NOT added to the books. Without this the CA sees "Ref: not
+    # persisted" with no explanation and thinks the pipeline silently
+    # broke.
+    locked_banner = _locked_period_banner(result)
+    if locked_banner:
+        sections.append(locked_banner)
     sections.append(_verdict_line(result.verification))
     extraction = result.extraction or {}
     sections.append(_extraction_block(extraction))
@@ -84,6 +92,33 @@ def _duplicate_banner(result: PipelineResult) -> str:
         f"{italic('Re-upload detected.')} "
         f"Already in your ledger as {code(dup_ref)} — nothing new persisted."
     )
+
+
+def _locked_period_banner(result: PipelineResult) -> str:
+    """Render an explicit refusal when persistence skipped on a locked period.
+
+    finalize_document emits the SKIPPED persistence stage with an
+    error like ``"period 8/2025 is locked"`` when the invoice's
+    derived period falls inside a filing the CA already approved.
+    Without surfacing this the summary just says "Ref: not persisted"
+    and the CA assumes a silent failure.
+    """
+    for stage in result.stages:
+        if (
+            stage.stage is PipelineStage.PERSISTENCE
+            and stage.status is PipelineStageStatus.SKIPPED
+            and stage.error
+            and _LOCKED_MARKER in stage.error
+        ):
+            return (
+                f"⚠ {bold('Not added to books.')} "
+                f"{safe_text(stage.error.capitalize())}. "
+                f"The filing was approved earlier — adding this invoice "
+                f"would change the locked totals. If it really belongs "
+                f"in this period, unlock the filing first, or re-date "
+                f"the invoice."
+            )
+    return ""
 
 
 # ---------------------------------------------------------------------------

@@ -184,3 +184,53 @@ class TestDuplicateBanner:
         )
         html = render_pipeline_summary(result)
         assert "Re-upload detected" not in html
+
+
+class TestLockedPeriodBanner:
+    """W3.5-e regression: when finalize_document refuses to insert into
+    a locked filing period, the summary must say so explicitly. Without
+    this the CA sees 'Ref: not persisted' and thinks the pipeline
+    silently broke.
+    """
+
+    def _locked_stages(self) -> tuple[PipelineStageOutcome, ...]:
+        stages = []
+        for s in PipelineStage:
+            if s is PipelineStage.PERSISTENCE:
+                stages.append(
+                    PipelineStageOutcome(
+                        stage=s,
+                        status=PipelineStageStatus.SKIPPED,
+                        duration_ms=0,
+                        error="period 8/2025 is locked",
+                    )
+                )
+            else:
+                stages.append(
+                    PipelineStageOutcome(stage=s, status=PipelineStageStatus.OK, duration_ms=1)
+                )
+        return tuple(stages)
+
+    def test_locked_banner_renders(self) -> None:
+        result = PipelineResult(
+            document_id=None,  # — refused, no row created
+            document_type="B2B_INVOICE",
+            extraction={"vendor": {"name": "V"}, "totals": {}, "line_items": []},
+            verification=VerificationResult(issues=()),
+            stages=self._locked_stages(),
+        )
+        html = render_pipeline_summary(result)
+        assert "Not added to books" in html
+        assert "8/2025" in html
+        assert "locked" in html.lower()
+
+    def test_no_locked_banner_when_persistence_ok(self) -> None:
+        result = PipelineResult(
+            document_id=uuid.uuid4(),
+            document_type="B2B_INVOICE",
+            extraction={"vendor": {"name": "V"}, "totals": {}, "line_items": []},
+            verification=VerificationResult(issues=()),
+            stages=_stages_ok(),
+        )
+        html = render_pipeline_summary(result)
+        assert "Not added to books" not in html

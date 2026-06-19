@@ -161,15 +161,32 @@ async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PL
                 existing_id=str(existing_dup.id),
                 source_file_hash=source_file_hash,
             )
+            dedup_html = (
+                f"<i>Re-upload detected.</i> Already in your ledger as "
+                f"<code>{str(existing_dup.id)[:8]}</code> — nothing new "
+                f"processed. (Saved one extraction.)"
+            )
             await telegram.send_message(
                 chat_id=envelope.chat_id,
-                html_text=(
-                    f"<i>Re-upload detected.</i> Already in your ledger as "
-                    f"<code>{str(existing_dup.id)[:8]}</code> — nothing new "
-                    f"processed. (Saved one extraction.)"
-                ),
+                html_text=dedup_html,
                 reply_to_message_id=envelope.message_id,
             )
+            # W3.5-e — persist this turn too, so the LLM knows "the
+            # user re-uploaded the file I already have as <ref>".
+            try:
+                await ConversationQuery(session=session, ca_firm_id=firm.id).append_turn(
+                    chat_id=envelope.chat_id,
+                    role="assistant",
+                    content=dedup_html,
+                    client_id=existing_dup.client_id,
+                    metadata={
+                        "kind": "document_dedup",
+                        "document_id": str(existing_dup.id),
+                    },
+                )
+                await session.commit()
+            except Exception as exc:  # — memory must not break user reply
+                _log.error("conversation_dedup_persist_failed", error=str(exc))
             return
 
         # ---- Step 3: extract (no client_id needed yet) ------------------
@@ -296,6 +313,27 @@ async def _finalize_and_summarise(
         html_text=html,
         reply_to_message_id=reply_to_message_id,
     )
+
+    # W3.5-e — L1 session memory. Persist the document summary as an
+    # assistant turn so the supervisor LLM sees it in conversation
+    # history on later questions like "is this invoice ITC claimable?"
+    # or "show me the most recent invoice". Without this the LLM has
+    # no way to recall what we just told the CA 60 seconds earlier.
+    try:
+        await ConversationQuery(session=session, ca_firm_id=firm.id).append_turn(
+            chat_id=chat_id,
+            role="assistant",
+            content=html,
+            client_id=client.id,
+            metadata={
+                "kind": "document_summary",
+                "document_id": str(result.document_id) if result.document_id else None,
+                "document_type": result.document_type,
+            },
+        )
+        await session.commit()
+    except Exception as exc:  # — memory persistence must never break the user reply
+        _log.error("conversation_summary_persist_failed", error=str(exc))
 
 
 async def _send_informed_pending_prompt(
