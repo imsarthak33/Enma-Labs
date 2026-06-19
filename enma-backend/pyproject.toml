@@ -31,6 +31,8 @@ dependencies = [
     # Phase 8 — caching + rate limiting
     "redis>=5.0.0,<6.0.0",
     "slowapi>=0.1.9,<0.2.0",
+    # W4 — at-rest credential encryption for multi-channel WhatsApp tokens
+    "cryptography>=42.0.0,<44.0.0",
 ]
 
 [project.optional-dependencies]

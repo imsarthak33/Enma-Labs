@@ -129,6 +129,19 @@ class Settings(BaseSettings):
         description="Shared HMAC secret for envelope signature verification.",
     )
 
+    # -- Multi-channel credential encryption (W4) ----------------------------
+    # Fernet key for at-rest encryption of per-firm WhatsApp tokens.
+    # Generate once via Fernet.generate_key() and set in the prod task
+    # def env. The default below is a VALID Fernet key reserved for
+    # dev / test only — never commit a real key here.
+    enma_crypto_key: SecretStr = Field(
+        # Valid Fernet key (base64 of 32 bytes) reserved for dev/test
+        # ONLY. Real keys live in the prod task-def env. Decoded value
+        # is the ASCII string "dev-only-key-not-for-production-".
+        default=SecretStr("ZGV2LW9ubHkta2V5LW5vdC1mb3ItcHJvZHVjdGlvbi0="),
+        description="Fernet key for at-rest credential encryption.",
+    )
+
     # -- Telegram -------------------------------------------------------------
     telegram_bot_token: SecretStr = Field(default=SecretStr("changeme-telegram-bot-token"))
 
