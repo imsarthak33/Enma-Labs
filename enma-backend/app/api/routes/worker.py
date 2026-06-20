@@ -82,6 +82,8 @@ from app.identity.resolver import (
 from app.logging_setup import get_logger
 from app.services import telegram
 from app.services.llm import LLMError
+from app.services.messaging import factory as messaging_factory
+from app.services.messaging.base import RawHtml
 from app.utils.background import get_registry
 
 router = APIRouter(prefix="/worker", tags=["worker"])
@@ -166,10 +168,13 @@ async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PL
                 f"<code>{str(existing_dup.id)[:8]}</code> — nothing new "
                 f"processed. (Saved one extraction.)"
             )
-            await telegram.send_message(
-                chat_id=envelope.chat_id,
-                html_text=dedup_html,
-                reply_to_message_id=envelope.message_id,
+            # W4-P2c — route via the messaging factory so a WhatsApp firm
+            # gets the dedup banner over WA when the time comes. Telegram
+            # firms keep the same wire as pre-W4 via TelegramClient.
+            await messaging_factory.client_for(firm=firm).send_message(
+                recipient=envelope.chat_id,
+                body=RawHtml(dedup_html),
+                reply_to_id=envelope.message_id,
             )
             # W3.5-e — persist this turn too, so the LLM knows "the
             # user re-uploaded the file I already have as <ref>".
@@ -308,10 +313,12 @@ async def _finalize_and_summarise(
         return
 
     html = render_pipeline_summary(result)
-    await telegram.send_message(
-        chat_id=chat_id,
-        html_text=html,
-        reply_to_message_id=reply_to_message_id,
+    # W4-P2c — factory route. RawHtml preserves the existing summary
+    # exactly on Telegram; WA degrades it (strips tags) automatically.
+    await messaging_factory.client_for(firm=firm).send_message(
+        recipient=chat_id,
+        body=RawHtml(html),
+        reply_to_id=reply_to_message_id,
     )
 
     # W3.5-e — L1 session memory. Persist the document summary as an
@@ -1072,10 +1079,14 @@ async def _handle_supervisor(
     await convs.maybe_compact(chat_id=chat_id)
     await session.commit()
 
-    await telegram.send_message(
-        chat_id=chat_id,
-        html_text=safe_text(reply.text) if reply.text else italic("(no reply)"),
-        reply_to_message_id=reply_to,
+    # W4-P2c — supervisor reply via the messaging factory. RawHtml
+    # preserves the existing Telegram rendering exactly; WA degrades
+    # the HTML automatically when a WA firm is on the receiving end.
+    reply_html = safe_text(reply.text) if reply.text else italic("(no reply)")
+    await messaging_factory.client_for(firm=firm).send_message(
+        recipient=chat_id,
+        body=RawHtml(reply_html),
+        reply_to_id=reply_to,
     )
 
 

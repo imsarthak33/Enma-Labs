@@ -236,6 +236,7 @@ def _patch_common(
 
 class _FakeFirm:
     id = uuid.uuid4()
+    primary_channel = "telegram"  # W4-P1 default — factory picks TelegramClient
 
 
 class _FakeClient:
