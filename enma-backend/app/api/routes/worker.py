@@ -71,6 +71,7 @@ from app.db.queries.conversations import RECENT_WINDOW_TURNS, ConversationQuery
 from app.db.queries.documents import DocumentQuery
 from app.db.queries.firms import find_firm_by_admin_chat_id
 from app.db.queries.pending_assignments import PendingAssignmentQuery
+from app.db.queries.trajectories import TrajectoryQuery
 from app.db.session import get_sessionmaker
 from app.formatting.pipeline_summary import render_pipeline_summary
 from app.formatting.telegram_html import bold, code, italic, safe_text
@@ -1078,6 +1079,29 @@ async def _handle_supervisor(
     )
     await convs.maybe_compact(chat_id=chat_id)
     await session.commit()
+
+    # P0 — agentic_trajectories: one row per supervisor turn. Wrapped
+    # in best-effort so a logging failure cannot silence a real reply.
+    # The convs work above is already committed, so a rollback here
+    # only discards the trajectory row.
+    try:
+        trajectories = TrajectoryQuery(session=session, ca_firm_id=ca_firm_id)
+        await trajectories.record_turn(
+            chat_id=chat_id,
+            user_text=text,
+            tool_calls_made=list(reply.tool_call_log),
+            final_reply=reply.text,
+            input_tokens=reply.input_tokens,
+            output_tokens=reply.output_tokens,
+        )
+        await session.commit()
+    except Exception as exc:
+        await session.rollback()
+        _log.warning(
+            "trajectory_record_failed",
+            error=str(exc),
+            chat_id=chat_id,
+        )
 
     # W4-P2c — supervisor reply via the messaging factory. RawHtml
     # preserves the existing Telegram rendering exactly; WA degrades

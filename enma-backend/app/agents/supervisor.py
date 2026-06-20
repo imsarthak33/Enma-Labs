@@ -52,6 +52,7 @@ from app.db.queries.filings import FilingQuery
 from app.db.queries.rules import RuleQuery
 from app.db.queries.tally_exports import TallyExportQuery
 from app.db.queries.tasks import TaskQuery
+from app.db.queries.verdict_corrections import VerdictCorrectionQuery
 from app.logging_setup import get_logger
 from app.prompts.master_prompt import build_supervisor_prompt
 from app.services import telegram as telegram_service
@@ -127,12 +128,19 @@ class SupervisorContext:
 
 @dataclass(frozen=True)
 class SupervisorReply:
-    """The supervisor's final user-facing answer + audit metadata."""
+    """The supervisor's final user-facing answer + audit metadata.
+
+    ``tool_call_log`` is the structured per-call record fed into the
+    P0 ``agentic_trajectories`` table: ``[{"name": str, "args": dict,
+    "had_error": bool}, ...]`` in call order. Empty tuple when the
+    supervisor answered without tool calls.
+    """
 
     text: str
     tool_calls_made: int
     input_tokens: int
     output_tokens: int
+    tool_call_log: tuple[dict[str, Any], ...] = ()
 
 
 ToolCallable = Callable[[SupervisorContext, dict[str, Any]], Awaitable[Any]]
@@ -653,6 +661,176 @@ async def _tool_mark_document(
         "ref": str(updated.id)[:8],
         "processing_status": updated.processing_status,
         "updated": True,
+    }
+
+
+# ---------------------------------------------------------------------------
+# P0 — correct_verdict: capture a CA's correction into the LoRA corpus.
+#
+# Three things happen atomically (single commit):
+#   1. ``verdict_corrections`` row with anonymized invoice features.
+#   2. ``ca_firm_rule`` row (source=human_correction) so the same kind
+#      of invoice gets the right treatment on the next pass.
+#   3. ``documents.tax_verdict`` JSONB gains a ``corrected`` marker so
+#      downstream views (Tally export, ledger CSV) can surface the
+#      corrected status to the CA.
+#
+# Anonymization is a strict allow-list — we never persist vendor
+# names, GSTINs, invoice numbers, or invoice dates to the corpus.
+# Magnitude buckets (log10 rounded) keep the training signal without
+# the identifying rupee amount.
+# ---------------------------------------------------------------------------
+
+
+_CORRECTED_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+    {"claim", "block", "defer", "rcm"}
+)
+
+_ANONYMIZE_SAFE_KEYS: Final[tuple[str, ...]] = (
+    "document_type",
+    "gst_rate",
+    "hsn_sac",
+    "has_eway_bill",
+    "place_of_supply",
+    "supply_type",
+    "is_interstate",
+)
+
+
+def _anonymize_invoice_features(extraction: dict[str, Any] | None) -> dict[str, Any]:
+    """Strip identifying fields from an extraction, keep tax-shape features.
+
+    Allow-list only — anything not explicitly named is dropped. Money
+    amounts are bucketised as ``log10(amount)`` floats so the corpus
+    captures the order of magnitude without the literal rupee figure.
+    """
+    if not isinstance(extraction, dict):
+        return {}
+    safe: dict[str, Any] = {}
+    for key in _ANONYMIZE_SAFE_KEYS:
+        value = extraction.get(key)
+        if value is not None:
+            safe[key] = value
+    vendor = extraction.get("vendor")
+    if isinstance(vendor, dict):
+        state_code = vendor.get("state_code")
+        if state_code is not None:
+            safe["vendor_state_code"] = state_code
+    totals = extraction.get("totals")
+    if isinstance(totals, dict):
+        for tkey, tval in totals.items():
+            try:
+                amount = Decimal(str(tval))
+            except (ValueError, ArithmeticError):
+                continue
+            if amount > Decimal("0"):
+                # log10(amount) — Decimal has no native log; cast carefully.
+                magnitude = round(float(amount.ln() / Decimal("2.302585")), 2)
+                safe[f"totals_{tkey}_log10"] = magnitude
+    return safe
+
+
+async def _tool_correct_verdict(
+    ctx: SupervisorContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Record a CA's correction of a document's tax verdict.
+
+    Args:
+        ref: Short hex 'Ref:' hash shown on summaries (e.g. '4b8d91e0').
+        corrected_status: One of 'claim' | 'block' | 'defer' | 'rcm'.
+            What the CA says the dominant bucket should be.
+        reason: Free-text explanation, verbatim.
+
+    Side effects:
+        * Inserts one ``verdict_corrections`` row.
+        * Inserts one ``ca_firm_rule`` with source='human_correction'
+          and the CA's reason as rule_text, so the same shape of
+          invoice gets the corrected treatment on next retrieval.
+        * No mutation of the original ``documents.tax_verdict`` — the
+          corpus row carries the corrected shape; downstream readers
+          consult corrections via :class:`VerdictCorrectionQuery`.
+    """
+    ref = args.get("ref")
+    corrected_status = args.get("corrected_status")
+    reason = args.get("reason")
+
+    if not isinstance(ref, str) or not ref.strip():
+        raise ToolError("ref is required (e.g. '4b8d91e0' as shown on the summary)")
+    if (
+        not isinstance(corrected_status, str)
+        or corrected_status.strip().lower() not in _CORRECTED_STATUS_VALUES
+    ):
+        raise ToolError(
+            "corrected_status must be one of 'claim', 'block', 'defer', 'rcm'"
+        )
+    if not isinstance(reason, str) or not reason.strip():
+        raise ToolError("reason is required — the CA's explanation, verbatim")
+    corrected_status = corrected_status.strip().lower()
+    reason = reason.strip()
+
+    docs_q = DocumentQuery(session=ctx.session, ca_firm_id=ctx.ca_firm_id)
+    try:
+        matches = await docs_q.find_by_ref_prefix(ref)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+    if not matches:
+        return {"matched": False, "ref": ref}
+    if len(matches) > 1:
+        return {
+            "ambiguous": True,
+            "matches": [{"id": str(d.id), "ref": str(d.id)[:8]} for d in matches],
+        }
+    doc = matches[0]
+
+    anonymized_features = _anonymize_invoice_features(doc.extraction_data)
+
+    corrections_q = VerdictCorrectionQuery(
+        session=ctx.session, ca_firm_id=ctx.ca_firm_id
+    )
+    correction = await corrections_q.record(
+        source_document_id=doc.id,
+        original_verdict=doc.tax_verdict or {},
+        corrected_verdict={
+            "dominant_bucket": corrected_status,
+            "corrected_at": datetime.now(UTC).isoformat(),
+        },
+        correction_reason_text=reason,
+        corrected_by_chat_id=ctx.chat_id,
+        track="A",
+        invoice_features_anonymized=anonymized_features,
+    )
+
+    rule_text = (
+        f"On invoices like {ref}: treat the verdict as "
+        f"{corrected_status.upper()}. Reason: {reason}"
+    )
+    rules_q = RuleQuery(session=ctx.session, ca_firm_id=ctx.ca_firm_id)
+    rule = await rules_q.insert_rule(
+        rule_text=rule_text,
+        directive=None,
+        source="human_correction",
+        rule_type="correction",
+        client_id=doc.client_id,
+    )
+
+    await ctx.session.commit()
+
+    _log.info(
+        "verdict_corrected",
+        ca_firm_id=str(ctx.ca_firm_id),
+        document_id=str(doc.id),
+        correction_id=str(correction.id),
+        rule_id=str(rule.id),
+        corrected_status=corrected_status,
+    )
+
+    return {
+        "captured": True,
+        "ref": str(doc.id)[:8],
+        "document_id": str(doc.id),
+        "corrected_status": corrected_status,
+        "correction_id": str(correction.id),
+        "rule_id": str(rule.id),
     }
 
 
@@ -1420,6 +1598,43 @@ TOOLS: Final[dict[str, ToolSpec]] = {
         },
         runner=_tool_mark_document,
     ),
+    "correct_verdict": ToolSpec(
+        name="correct_verdict",
+        description=(
+            "Record a CA's correction of one document's tax verdict and "
+            "create a matching firm rule so similar invoices get the "
+            "corrected treatment going forward. Use when the CA says "
+            "'doc 4b8d91e0 should be BLOCKED, not eligible', 'mark this "
+            "as RCM not claim', 'this invoice was wrong — should be "
+            "deferred to next quarter'. Pass the short 'ref' hash plus "
+            "'corrected_status' (one of: claim | block | defer | rcm) "
+            "and a verbatim 'reason' string. Returns "
+            "correction_id and rule_id on success. The LoRA training "
+            "corpus depends on every correction landing here — never "
+            "respond with 'noted' without calling this tool first."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "ref": {
+                    "type": "string",
+                    "description": "Short hex ref shown on summaries (e.g. '4b8d91e0').",
+                },
+                "corrected_status": {
+                    "type": "string",
+                    "enum": ["claim", "block", "defer", "rcm"],
+                    "description": "Dominant bucket the verdict should land in.",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "CA's free-form explanation, verbatim.",
+                },
+            },
+            "required": ["ref", "corrected_status", "reason"],
+            "additionalProperties": False,
+        },
+        runner=_tool_correct_verdict,
+    ),
     "add_firm_rule": ToolSpec(
         name="add_firm_rule",
         description=(
@@ -1679,7 +1894,7 @@ async def _humanize_if_json(
     return rewritten, rewrite.input_tokens, rewrite.output_tokens
 
 
-async def run_supervisor(
+async def run_supervisor(  # noqa: PLR0915 — P0 trajectory log inflated body
     *,
     ctx: SupervisorContext,
     user_text: str,
@@ -1713,6 +1928,7 @@ async def run_supervisor(
     total_input = 0
     total_output = 0
     tool_calls_made = 0
+    tool_call_log: list[dict[str, Any]] = []
     tools = _openai_tools()
     # When the previous iteration produced a tool error, force the next
     # call to text-reply rather than retry the failing tool.
@@ -1749,6 +1965,7 @@ async def run_supervisor(
                 tool_calls_made=tool_calls_made,
                 input_tokens=total_input,
                 output_tokens=total_output,
+                tool_call_log=tuple(tool_call_log),
             )
 
         # Echo the assistant message (with tool_calls) back so the model
@@ -1772,6 +1989,22 @@ async def run_supervisor(
             result_json = await _execute_tool(ctx, name, raw_args)
             had_error = _tool_result_carries_error(result_json)
             force_text_next = force_text_next or had_error
+            # Best-effort parse of the args JSON for the trajectory log.
+            # The raw string is what the LLM emitted; round-tripping
+            # through json.loads gives us a structured dict for the
+            # LoRA corpus. Failures fall back to the raw string.
+            args_payload: Any
+            try:
+                args_payload = json.loads(raw_args) if raw_args else {}
+            except (ValueError, TypeError):
+                args_payload = raw_args
+            tool_call_log.append(
+                {
+                    "name": name,
+                    "args": args_payload,
+                    "had_error": had_error,
+                }
+            )
             _log.info(
                 "supervisor_tool_called",
                 tool=name,
@@ -1821,4 +2054,5 @@ async def run_supervisor(
         tool_calls_made=tool_calls_made,
         input_tokens=total_input,
         output_tokens=total_output,
+        tool_call_log=tuple(tool_call_log),
     )

@@ -30,6 +30,7 @@ from typing import Final
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db.queries.bug_reports import BugReportQuery
 from app.db.queries.clients import ClientQuery
 from app.db.queries.pending_assignments import PendingAssignmentQuery
 from app.db.queries.tasks import TaskQuery
@@ -267,6 +268,28 @@ async def _cmd_assign(ctx: _ExecCtx, cmd: ParsedCommand) -> CommandResult:
 
 
 # ---------------------------------------------------------------------------
+# /bug
+# ---------------------------------------------------------------------------
+
+
+async def _cmd_bug(ctx: _ExecCtx, cmd: ParsedCommand) -> CommandResult:
+    if not cmd.args:
+        return _fail(
+            "Usage: " + code("/bug \"What went wrong?\""),
+        )
+    body = " ".join(arg.strip() for arg in cmd.args if arg.strip()).strip()
+    if not body:
+        return _fail("Bug report cannot be empty.")
+    bugs = BugReportQuery(session=ctx.session, ca_firm_id=ctx.ca_firm_id)
+    await bugs.record(chat_id=ctx.chat_id, body=body)
+    await ctx.session.commit()
+    return CommandResult(
+        html=bold("Bug reported") + " — thank you. We'll take a look.",
+        success=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Failure helper
 # ---------------------------------------------------------------------------
 
@@ -282,7 +305,8 @@ def _fail(html: str) -> CommandResult:
 
 _HANDLERS: Final[dict[str, _Handler]] = {
     "add_client": _cmd_add_client,
+    "assign": _cmd_assign,
+    "bug": _cmd_bug,
     "list_clients": _cmd_list_clients,
     "status": _cmd_status,
-    "assign": _cmd_assign,
 }

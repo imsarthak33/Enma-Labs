@@ -125,6 +125,13 @@ class TaxVerdict:
     engine_version: str = ENGINE_VERSION
     defer_strategy: str = DEFER_STRATEGY
     currency: str = "INR"
+    # P0 brain substrate: every verdict carries a confidence score. The
+    # default 1.0 reflects the deterministic reconciler path — the
+    # engine produced the verdict from explicit rules, no probabilistic
+    # step involved. Future engine refinements (P9 LoRA, P10 RAG) will
+    # write real <1.0 values so the supervisor can threshold-gate
+    # auto-execute vs. CA-review.
+    confidence: Decimal = field(default_factory=lambda: Decimal("1.0"))
 
     def to_jsonb(self) -> dict[str, Any]:
         """Serialise to the JSONB shape persisted in ``documents.tax_verdict``."""
@@ -142,6 +149,7 @@ class TaxVerdict:
             "engine_version": self.engine_version,
             "rule_corpus_hash": self.rule_corpus_hash,
             "computed_at": self.computed_at.isoformat(),
+            "confidence": f"{self.confidence:.4f}",
         }
 
 
