@@ -11,11 +11,12 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.api.routes import cron, health, worker
+from app.api.routes import cron, health, whatsapp, worker
 
 api_router = APIRouter()
 api_router.include_router(health.router)
 api_router.include_router(worker.router)
 api_router.include_router(cron.router)
+api_router.include_router(whatsapp.router)
 
 __all__ = ["api_router"]

@@ -182,13 +182,24 @@ def _ensure_whatsapp_prefix(number: str) -> str:
 
 
 def _coerce_phone(recipient: int | str) -> str:
-    """WhatsApp recipients must be E.164 strings — reject ints loudly."""
+    """Accept an int (synthesized chat_id) or an E.164 string.
+
+    W4-P3 — the gateway derives ``chat_id`` from the inbound WA phone by
+    stripping the ``+`` and parsing the remaining digits as int (E.164
+    has only digits after the country code prefix). The backend's worker
+    route then passes that int back to us at outbound time as
+    ``recipient=chat_id`` — same path the Telegram client uses. We
+    reverse the synthesis here: ``918178803301`` → ``"+918178803301"``.
+
+    Strings are passed through verbatim (callers that already have a
+    real ``+E.164`` phone don't pay the round-trip).
+    """
     if isinstance(recipient, int):
-        raise MessagingError(
-            f"WhatsAppClient: recipient must be an E.164 phone string "
-            f"(e.g. '+919876543210'), got int {recipient!r} — that's "
-            f"a Telegram chat_id slipped through the factory."
-        )
+        if recipient <= 0:
+            raise MessagingError(
+                f"WhatsAppClient: recipient int must be > 0, got {recipient!r}"
+            )
+        return f"+{recipient}"
     if not recipient:
         raise MessagingError("WhatsAppClient: recipient is required")
     return recipient
