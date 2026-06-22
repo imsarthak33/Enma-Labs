@@ -912,6 +912,7 @@ async def _run_command_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PLR
             reply_to=envelope.message_id,
             message_id=envelope.message_id,
             text=text,
+            channel=envelope.payload.get("channel"),
         )
 
 
@@ -1030,6 +1031,7 @@ async def _handle_supervisor(
     reply_to: int | None,
     message_id: int | None,
     text: str,
+    channel: Any = None,
 ) -> None:
     """Run the supervisor agent and reply with its answer."""
     ca_firm_id = firm.id
@@ -1103,11 +1105,16 @@ async def _handle_supervisor(
             chat_id=chat_id,
         )
 
-    # W4-P2c — supervisor reply via the messaging factory. RawHtml
-    # preserves the existing Telegram rendering exactly; WA degrades
-    # the HTML automatically when a WA firm is on the receiving end.
+    # W4-P3 — reply via the channel the inbound envelope arrived on, not
+    # the firm-level default. Lets a firm with both channels live answer
+    # Telegram messages on TG and WhatsApp messages on WA in the same
+    # session without state. ``channel`` is None for legacy / unstamped
+    # envelopes; the helper falls back to firm.primary_channel.
     reply_html = safe_text(reply.text) if reply.text else italic("(no reply)")
-    await messaging_factory.client_for(firm=firm).send_message(
+    await messaging_factory.client_for_envelope(
+        envelope_payload={"channel": channel} if channel is not None else {},
+        firm=firm,
+    ).send_message(
         recipient=chat_id,
         body=RawHtml(reply_html),
         reply_to_id=reply_to,

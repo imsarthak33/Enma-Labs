@@ -38,13 +38,33 @@ __all__ = [
 
 
 async def find_firm_by_admin_chat_id(session: AsyncSession, chat_id: int) -> CaFirm | None:
-    """Return the firm whose admin Telegram chat_id matches ``chat_id``.
+    """Return the firm that owns this chat identifier across either channel.
 
-    Phase 4 assumes a 1:1 mapping (one Telegram account per firm); Phase
-    6 introduces the ``firm_users`` join for multi-member firms. The
-    Phase 4 stub queries ``ca_firms.admin_chat_id`` only.
+    Lookup order:
+      1. ``ca_firms.admin_chat_id`` — legacy single-admin Telegram path.
+         Existing Telegram firms continue to resolve here at zero cost.
+      2. ``firm_users.chat_id`` — W4-P3 multi-channel join. WhatsApp
+         users are bound here with ``chat_id`` synthesized from their
+         E.164 phone digits (``+91…`` → ``91…``), so the same column
+         resolves either origin uniformly.
+
+    A firm with both channels live (Telegram on ``admin_chat_id`` +
+    WhatsApp on a ``firm_users`` row) hits path 1 for Telegram envelopes
+    and path 2 for WA envelopes; the same :class:`CaFirm` row is
+    returned either way.
     """
     stmt = select(CaFirm).where(CaFirm.admin_chat_id == chat_id).limit(1)
+    result = await session.execute(stmt)
+    firm = result.scalar_one_or_none()
+    if firm is not None:
+        return firm
+
+    stmt = (
+        select(CaFirm)
+        .join(FirmUser, FirmUser.ca_firm_id == CaFirm.id)
+        .where(FirmUser.chat_id == chat_id)
+        .limit(1)
+    )
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
 

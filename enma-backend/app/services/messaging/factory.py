@@ -33,6 +33,7 @@ from app.utils.crypto import CryptoError, decrypt_token
 
 __all__ = [
     "client_for",
+    "client_for_envelope",
     "reset_whatsapp_cache",
     "resolve_channel",
 ]
@@ -91,6 +92,26 @@ def client_for(*, firm: CaFirm, user: FirmUser | None = None) -> MessageClient:
     if channel == _TELEGRAM:
         return _telegram_singleton()
     return _whatsapp_client_for(firm)
+
+
+def client_for_envelope(
+    *, envelope_payload: dict[str, object], firm: CaFirm
+) -> MessageClient:
+    """Pick the reply channel based on the inbound envelope payload.
+
+    Firms with both channels live can receive a Telegram message on
+    Monday and a WhatsApp message on Tuesday — the reply must go back
+    via the channel the user used. The gateway / inbound webhook stamps
+    ``payload['channel']`` with ``'telegram'`` or ``'whatsapp'``; we
+    honour that. When the field is absent (legacy or unknown), fall
+    back to the firm's default via :func:`client_for`.
+    """
+    raw = envelope_payload.get("channel")
+    if raw == _WHATSAPP:
+        return _whatsapp_client_for(firm)
+    if raw == _TELEGRAM:
+        return _telegram_singleton()
+    return client_for(firm=firm)
 
 
 @lru_cache(maxsize=1)
