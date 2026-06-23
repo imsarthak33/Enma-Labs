@@ -35,10 +35,12 @@ event log; an edit is a new fact, not a mutation).
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Final
+from xml.etree.ElementTree import Element
 
 from defusedxml.ElementTree import fromstring as safe_fromstring
 
@@ -104,7 +106,7 @@ class ParsedTallyExport:
     vouchers: tuple[ParsedVoucher, ...]
 
 
-def _text(node: Any, tag: str, default: str = "") -> str:
+def _text(node: Element, tag: str, default: str = "") -> str:
     """Return the stripped text of ``node``'s first ``tag`` child, or default."""
     child = node.find(tag)
     if child is None or child.text is None:
@@ -129,7 +131,7 @@ def _parse_tally_date(raw: str) -> datetime:
         raise TallyImportError(f"invalid Tally date: {raw!r}") from exc
 
 
-def _parse_ledger_entries(voucher: Any) -> list[dict[str, Any]]:
+def _parse_ledger_entries(voucher: Element) -> list[dict[str, Any]]:
     """Pull every ``<ALLLEDGERENTRIES.LIST>`` into normalised dicts.
 
     Amounts run through :func:`parse_money` (Decimal, never float) and are
@@ -187,7 +189,7 @@ def _compute_dedup_key(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _coerce_to_root(raw: bytes) -> Any:
+def _coerce_to_root(raw: bytes) -> Element:
     """Parse bytes to an XML root, tolerating Tally's encoding quirks.
 
     ElementTree honours the ``<?xml encoding?>`` declaration for bytes.
@@ -197,18 +199,16 @@ def _coerce_to_root(raw: bytes) -> Any:
     """
     try:
         return safe_fromstring(raw)
-    except Exception:  # noqa: BLE001 — any parse failure triggers the cleanup retry
+    except Exception:  # — any parse failure triggers the cleanup retry
         try:
             text = raw.decode("utf-8", errors="replace")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise TallyImportError("could not decode Tally XML bytes") from exc
         # Escape bare & that are not already part of an entity.
-        import re
-
         cleaned = re.sub(r"&(?!amp;|lt;|gt;|quot;|apos;|#)", "&amp;", text)
         try:
             return safe_fromstring(cleaned)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise TallyImportError("not valid XML") from exc
 
 
@@ -219,11 +219,11 @@ def looks_like_tally_xml(raw: bytes) -> bool:
     instead of the invoice extractor. Sniffs the head only — no full parse.
     """
     head = raw[:4096].lstrip()
-    if not head[:1] in (b"<", b"\xef", b"\xff", b"\xfe"):  # XML / BOM start
+    if head[:1] not in (b"<", b"\xef", b"\xff", b"\xfe"):  # XML / BOM start
         return False
     try:
         text = raw[:4096].decode("utf-8", errors="replace").upper()
-    except Exception:  # noqa: BLE001
+    except Exception:
         return False
     return "<ENVELOPE" in text and ("TALLYMESSAGE" in text or "<VOUCHER" in text)
 

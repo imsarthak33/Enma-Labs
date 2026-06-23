@@ -47,6 +47,7 @@ dev = [
     "testcontainers[postgres]>=4.5.0,<5.0.0",
     "aiosqlite>=0.20.0,<0.21.0",
     "types-requests",
+    "types-defusedxml",  # type stubs for the Tally XML parser (P1 ingestion)
     "fakeredis>=2.23.0,<3.0.0",  # in-memory Redis for offline cache tests
 ]
 

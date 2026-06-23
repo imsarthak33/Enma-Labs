@@ -128,9 +128,9 @@ class BrainEventQuery(BaseQuery):
     ) -> tuple[int, int]:
         """Idempotent bulk insert. Returns ``(inserted, skipped)``.
 
-        Built for a Tally Day Book import — hundreds–thousands of vouchers
-        in one upload — so it issues a single
-        ``INSERT … ON CONFLICT DO NOTHING RETURNING`` instead of N
+        Built for a Tally Day Book import — hundreds to thousands of
+        vouchers in one upload — so it issues a single
+        ``INSERT ... ON CONFLICT DO NOTHING RETURNING`` instead of N
         round-trips. ``skipped`` counts everything not newly inserted:
         rows already in the DB *and* intra-file duplicates.
 
