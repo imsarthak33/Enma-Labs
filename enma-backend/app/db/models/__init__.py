@@ -5,6 +5,7 @@ Importing this module ensures all models are registered with
 ``Base.metadata.create_all()`` in tests.
 """
 
+from app.db.models.brain_event import BrainEvent
 from app.db.models.bug_report import BugReport
 from app.db.models.client import Client
 from app.db.models.conversation import Conversation
@@ -26,6 +27,7 @@ from app.db.models.verdict_correction import VerdictCorrection
 
 __all__ = [
     "AgenticTrajectory",
+    "BrainEvent",
     "BugReport",
     "CaFirm",
     "CaFirmRule",
