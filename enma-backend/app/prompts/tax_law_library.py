@@ -199,8 +199,8 @@ class BlockedCategory:
 
 
 # Phase 5 ships the cases the implementation programme enumerates plus
-# their HSN/SAC anchors. The table is intentionally small and explicit;
-# adding cases requires a code review (and a test row).
+# their HSN/SAC anchors. Updated with the full Section 17(5) list per
+# the Tax Knowledge Base (Part 5).
 BLOCKED_CATEGORIES: Final[tuple[BlockedCategory, ...]] = (
     BlockedCategory(
         code="motor_vehicle",
@@ -246,7 +246,7 @@ BLOCKED_CATEGORIES: Final[tuple[BlockedCategory, ...]] = (
     ),
     BlockedCategory(
         code="rent_a_cab",
-        citation="Section 17(5)(b)(i)",
+        citation="Section 17(5)(b)(iii)",
         description=(
             "Rent-a-cab services — blocked unless the recipient is in the "
             "same line of business or required to provide such services to "
@@ -256,12 +256,60 @@ BLOCKED_CATEGORIES: Final[tuple[BlockedCategory, ...]] = (
     ),
     BlockedCategory(
         code="life_health_insurance",
-        citation="Section 17(5)(b)(i)",
+        citation="Section 17(5)(b)(iii)",
         description=(
             "Life and health insurance — blocked unless mandated by law "
             "for the recipient to provide to employees."
         ),
         hsn_prefixes=("9971",),
+    ),
+    # ── Added per Tax Knowledge Base Part 5 ─────────────────────────────
+    BlockedCategory(
+        code="travel_benefits",
+        citation="Section 17(5)(b)(iv)",
+        description=(
+            "Travel benefits to employees — leave or home travel concession. "
+            "ITC blocked unconditionally on the employer."
+        ),
+        hsn_prefixes=("9964T",),  # SAC variant for employee travel
+    ),
+    BlockedCategory(
+        code="works_contract_construction",
+        citation="Section 17(5)(c)",
+        description=(
+            "Works contract services for construction of an immovable "
+            "property (other than plant & machinery). Exception: where it "
+            "is an input service for further supply of works contract service."
+        ),
+        hsn_prefixes=("9954",),
+    ),
+    BlockedCategory(
+        code="immovable_property_construction",
+        citation="Section 17(5)(d)",
+        description=(
+            "Goods or services received for construction of an immovable "
+            "property on own account (other than plant & machinery), "
+            "including when used in the course of business."
+        ),
+        hsn_prefixes=(),  # detected by description keywords, not HSN
+    ),
+    BlockedCategory(
+        code="personal_consumption",
+        citation="Section 17(5)(g)",
+        description=(
+            "Goods or services used for personal consumption — ITC "
+            "blocked unconditionally."
+        ),
+        hsn_prefixes=(),  # detected by description keywords, not HSN
+    ),
+    BlockedCategory(
+        code="lost_stolen_destroyed",
+        citation="Section 17(5)(h)",
+        description=(
+            "Goods lost, stolen, destroyed, written off, or disposed of "
+            "as gift or free sample — ITC on such goods must be reversed."
+        ),
+        hsn_prefixes=(),  # detected by event/description, not HSN
     ),
 )
 
@@ -330,6 +378,31 @@ RCM_TRIGGERS: Final[tuple[RcmTrigger, ...]] = (
             "company."
         ),
         hsn_prefixes=("9983",),
+    ),
+    # ── Added per Tax Knowledge Base Part 6 ─────────────────────────────
+    RcmTrigger(
+        code="security_services",
+        citation="Section 9(3), Notification 13/2017-CT(R) entry 14",
+        description=(
+            "Security services supplied by an unregistered or individual "
+            "provider to a registered recipient — RCM applies on the "
+            "recipient."
+        ),
+        hsn_prefixes=("9985",),
+    ),
+    RcmTrigger(
+        code="raw_cotton_agriculturist",
+        citation="Section 9(3), GST 2.0 textile sector correction",
+        description=(
+            "Raw cotton (HSN 5201) supplied by an agriculturist to any "
+            "registered person — buyer self-assesses at 5% under RCM. "
+            "This preserves the ITC chain since agriculturists are not "
+            "GST-registered and cannot charge GST forward. When vendor "
+            "has no GSTIN and the supply is raw cotton, route to "
+            "rcm_liability computation rather than treating the absent "
+            "vendor GSTIN as a data-quality error."
+        ),
+        hsn_prefixes=("5201",),
     ),
 )
 

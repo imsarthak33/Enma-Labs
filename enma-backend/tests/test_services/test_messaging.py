@@ -327,10 +327,22 @@ class TestWhatsAppClient:
             await client.send_message(recipient="+1", body=Text("x"))
 
     @pytest.mark.asyncio
-    async def test_send_message_rejects_int_recipient(self) -> None:
+    async def test_send_message_accepts_int_recipient(self) -> None:
+        captured: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = request.content.decode()
+            return httpx.Response(201, json={"sid": "SMxxxx", "status": "queued"})
+
+        client = _wa_client_with_mock(handler)
+        await client.send_message(recipient=918178803301, body=Text("hi"))
+        assert "To=whatsapp%3A%2B918178803301" in captured["body"]
+
+    @pytest.mark.asyncio
+    async def test_send_message_rejects_invalid_int_recipient(self) -> None:
         client = _wa_client_with_mock(lambda r: httpx.Response(201, json={}))
-        with pytest.raises(MessagingError, match="must be an E.164 phone string"):
-            await client.send_message(recipient=12345, body=Text("x"))
+        with pytest.raises(MessagingError, match="recipient int must be > 0"):
+            await client.send_message(recipient=-12345, body=Text("x"))
 
     @pytest.mark.asyncio
     async def test_send_message_empty_body_raises(self) -> None:

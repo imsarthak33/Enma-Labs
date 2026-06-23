@@ -8,6 +8,7 @@ let errSpy;
 beforeEach(async () => {
   process.env.NODE_ENV = "test";
   process.env.LOG_LEVEL = "debug";
+  process.env.LOG_FORMAT = "json";
   vi.resetModules();
   const mod = await import("../src/utils/logger.js");
   logger = mod.logger;

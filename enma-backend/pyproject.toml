@@ -33,6 +33,8 @@ dependencies = [
     "slowapi>=0.1.9,<0.2.0",
     # W4 — at-rest credential encryption for multi-channel WhatsApp tokens
     "cryptography>=42.0.0,<44.0.0",
+    # P1 Brain Ingestion — XXE-safe parsing of user-supplied Tally XML
+    "defusedxml>=0.7.1,<0.8.0",
 ]
 
 [project.optional-dependencies]

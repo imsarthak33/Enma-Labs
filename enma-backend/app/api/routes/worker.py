@@ -66,6 +66,7 @@ from app.api.middleware.envelope_verify import DecodedEnvelope, VerifiedEnvelope
 from app.api.middleware.idempotency import IdempotencyDep, IdempotencyVerdict
 from app.db.models.client import Client
 from app.db.models.firm import CaFirm
+from app.db.queries.brain_events import BrainEventQuery
 from app.db.queries.clients import ClientQuery
 from app.db.queries.conversations import RECENT_WINDOW_TURNS, ConversationQuery
 from app.db.queries.documents import DocumentQuery
@@ -81,7 +82,7 @@ from app.identity.resolver import (
     BUYER_NAME_TRGM_THRESHOLD,
 )
 from app.logging_setup import get_logger
-from app.services import telegram
+from app.services import tally_import, telegram
 from app.services.llm import LLMError
 from app.services.messaging import factory as messaging_factory
 from app.services.messaging.base import RawHtml
@@ -146,6 +147,23 @@ async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PL
             await _send_user_error(
                 envelope.chat_id,
                 "I couldn't download that file from Telegram. Could you try again?",
+            )
+            return
+
+        # ---- Step 2a: Tally export? (A2 — Brain ingestion) --------------
+        # A Tally voucher XML is structured accounting data, not an invoice
+        # to OCR. Sniff before the extractor runs and branch to the Brain
+        # ingestion handler (ADR-014). Re-uploads are deduped at the
+        # brain_events layer (content hash), so this bypasses the
+        # document-level early-dedup intentionally.
+        if tally_import.looks_like_tally_xml(file_bytes):
+            await _run_tally_ingestion(
+                session=session,
+                firm=firm,
+                chat_id=envelope.chat_id,
+                reply_to_message_id=envelope.message_id,
+                file_bytes=file_bytes,
+                caption=caption,
             )
             return
 
@@ -272,6 +290,168 @@ def _safe_str(payload: Any, *keys: str) -> str | None:
     if isinstance(cursor, str) and cursor.strip():
         return cursor.strip()
     return None
+
+
+# ---------------------------------------------------------------------------
+# Tally ingestion (A2 — Brain Ingestion v1, ADR-014)
+# ---------------------------------------------------------------------------
+
+
+# Fuzzy-match floor for routing a Tally export to one client. Below this we
+# refuse to guess and ask the CA to name the client (via caption).
+_TALLY_CLIENT_MATCH_FLOOR: float = 0.6
+
+
+async def _resolve_tally_client(
+    *,
+    session: Any,
+    firm: CaFirm,
+    company_name: str,
+    caption: str | None,
+) -> Client | None:
+    """Route a Tally export to one client: caption wins, else company name.
+
+    A Tally company maps to one Enma client. We try the upload caption
+    first (the CA's explicit override), then the export's
+    ``SVCURRENTCOMPANY``. A match must clear
+    :data:`_TALLY_CLIENT_MATCH_FLOOR` and be unambiguous (the runner-up
+    at least 0.05 lower) — otherwise we return ``None`` and the caller
+    asks the CA to name the client.
+    """
+    clients_q = ClientQuery(session=session, ca_firm_id=firm.id)
+    for candidate in (caption, company_name):
+        if not candidate or not candidate.strip():
+            continue
+        ranked = await clients_q.search_by_name_ranked(
+            candidate.strip(), min_similarity=0.55, limit=2
+        )
+        if not ranked:
+            continue
+        top_client, top_sim = ranked[0]
+        unambiguous = len(ranked) == 1 or (ranked[1][1] < top_sim - 0.05)
+        if top_sim >= _TALLY_CLIENT_MATCH_FLOOR and unambiguous:
+            return top_client
+    return None
+
+
+async def _run_tally_ingestion(
+    *,
+    session: Any,
+    firm: CaFirm,
+    chat_id: int,
+    reply_to_message_id: int | None,
+    file_bytes: bytes,
+    caption: str | None,
+) -> None:
+    """Parse an uploaded Tally export and land its vouchers as brain_events.
+
+    Deterministic: no LLM, no tax recompute (Tally already did the math).
+    Re-uploads collapse at the brain_events content-hash dedup layer, so
+    the CA can safely re-send a whole month's Day Book and only new
+    vouchers are added.
+    """
+    try:
+        export = tally_import.parse_tally_export(file_bytes)
+    except tally_import.TallyImportError as exc:
+        _log.warning("tally_import_parse_failed", error=str(exc), chat_id=chat_id)
+        await _send_user_error(
+            chat_id,
+            "That looked like a Tally file but I couldn't read its vouchers. "
+            "Please re-export the Day Book as XML and try again.",
+        )
+        return
+
+    client = await _resolve_tally_client(
+        session=session,
+        firm=firm,
+        company_name=export.company_name,
+        caption=caption,
+    )
+    if client is None:
+        clients_q = ClientQuery(session=session, ca_firm_id=firm.id)
+        active = list(await clients_q.list_active())
+        company_label = safe_text(export.company_name or "(unnamed company)")
+        if not active:
+            await _send_user_error(
+                chat_id,
+                "Your firm has no active clients yet. Add a client first, "
+                "then re-send the Tally file.",
+            )
+            return
+        sample = "\n".join("• " + safe_text(c.trade_name) for c in active[:10])
+        extra = "" if len(active) <= 10 else f"\n{italic(f'+ {len(active) - 10} more')}"
+        html = (
+            bold("Which client is this Tally export for?")
+            + f"\nI couldn't match the Tally company {company_label} to one of "
+            "your clients. Re-send the file with the client's name as the caption.\n"
+            + sample
+            + extra
+        )
+        try:
+            await telegram.send_message(
+                chat_id=chat_id,
+                html_text=html,
+                reply_to_message_id=reply_to_message_id,
+            )
+        except telegram.TelegramAPIError as exc:
+            _log.error("tally_client_prompt_send_failed", error=str(exc))
+        return
+
+    rows = [
+        {
+            "source": "tally",
+            "event_type": v.event_type,
+            "dedup_key": v.dedup_key,
+            "occurred_at": v.date,
+            "payload": v.to_payload(),
+            "client_id": client.id,
+        }
+        for v in export.vouchers
+    ]
+    brain_q = BrainEventQuery(session=session, ca_firm_id=firm.id)
+    inserted, skipped = await brain_q.record_dedup_bulk(rows=rows)
+    await session.commit()
+
+    _log.info(
+        "tally_ingestion_completed",
+        ca_firm_id=str(firm.id),
+        client_id=str(client.id),
+        vouchers=len(export.vouchers),
+        inserted=inserted,
+        skipped=skipped,
+    )
+
+    total = len(export.vouchers)
+    html = (
+        bold("📊 Tally import — " + safe_text(client.trade_name))
+        + f"\nVouchers in file: {total}"
+        + f"\nNew: {inserted}"
+        + (f"\nAlready on file: {skipped}" if skipped else "")
+    )
+    await messaging_factory.client_for(firm=firm).send_message(
+        recipient=chat_id,
+        body=RawHtml(html),
+        reply_to_id=reply_to_message_id,
+    )
+
+    # L1 session memory — record the import so the supervisor can recall
+    # "you imported N Tally vouchers for X" on a later question.
+    try:
+        await ConversationQuery(session=session, ca_firm_id=firm.id).append_turn(
+            chat_id=chat_id,
+            role="assistant",
+            content=html,
+            client_id=client.id,
+            metadata={
+                "kind": "tally_import",
+                "vouchers": total,
+                "inserted": inserted,
+                "skipped": skipped,
+            },
+        )
+        await session.commit()
+    except Exception as exc:  # — memory must never break the user reply
+        _log.error("tally_import_memory_persist_failed", error=str(exc))
 
 
 async def _finalize_and_summarise(
