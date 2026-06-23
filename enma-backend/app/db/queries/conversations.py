@@ -24,6 +24,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any, Final, cast
 
 from sqlalchemy import update
@@ -45,6 +46,7 @@ __all__ = [
     "CompactionResult",
     "ConversationQuery",
     "RECENT_WINDOW_TURNS",
+    "SESSION_IDLE_HOURS",
     "estimate_tokens",
 ]
 
@@ -65,6 +67,11 @@ COMPACT_WINDOW_TURNS: Final[int] = 50
 
 RECENT_WINDOW_TURNS: Final[int] = 10
 """Default size of the window the supervisor reads for context."""
+
+SESSION_IDLE_HOURS: Final[int] = 4
+"""If the most recent turn is older than this many hours, return an empty
+history so the supervisor starts fresh instead of leaking prior-day context
+into an unrelated new message (the 'context bleed' bug from June 19→23)."""
 
 # ---------------------------------------------------------------------------
 # Roles + metadata keys
@@ -209,6 +216,13 @@ class ConversationQuery(BaseQuery):
 
         A turn is *live* iff its metadata does not carry
         ``compacted_into`` — i.e. it has not been replaced by a summary.
+
+        Session-idle guard: if the most recent turn is older than
+        :data:`SESSION_IDLE_HOURS`, we return an empty list so the
+        supervisor starts each gap-resumed conversation from a clean
+        slate. Without this, a CA who messaged on Monday and returns on
+        Thursday gets the Monday invoice thread leaked into their new
+        message — the LLM misreads it as a continuation.
         """
         stmt = (
             self._scoped_select(Conversation)
@@ -220,6 +234,14 @@ class ConversationQuery(BaseQuery):
             .limit(limit)
         )
         rows = await self._fetch_all(stmt)
+        if not rows:
+            return []
+        # ``rows`` is in DESC order here; index 0 is the most recent turn.
+        most_recent_ts = rows[0].created_at
+        if most_recent_ts.tzinfo is None:
+            most_recent_ts = most_recent_ts.replace(tzinfo=UTC)
+        if most_recent_ts < datetime.now(UTC) - timedelta(hours=SESSION_IDLE_HOURS):
+            return []
         return list(reversed(list(rows)))
 
     async def get_last_client_id(
