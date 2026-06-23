@@ -33,6 +33,8 @@ dependencies = [
     "slowapi>=0.1.9,<0.2.0",
     # W4 — at-rest credential encryption for multi-channel WhatsApp tokens
     "cryptography>=42.0.0,<44.0.0",
+    # P1 Brain Ingestion — XXE-safe parsing of user-supplied Tally XML
+    "defusedxml>=0.7.1,<0.8.0",
 ]
 
 [project.optional-dependencies]
@@ -45,6 +47,7 @@ dev = [
     "testcontainers[postgres]>=4.5.0,<5.0.0",
     "aiosqlite>=0.20.0,<0.21.0",
     "types-requests",
+    "types-defusedxml",  # type stubs for the Tally XML parser (P1 ingestion)
     "fakeredis>=2.23.0,<3.0.0",  # in-memory Redis for offline cache tests
 ]
 

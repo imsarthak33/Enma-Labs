@@ -123,6 +123,67 @@ class BrainEventQuery(BaseQuery):
         await self.session.flush()
         return result.scalar_one_or_none()
 
+    async def record_dedup_bulk(
+        self, *, rows: list[dict[str, Any]]
+    ) -> tuple[int, int]:
+        """Idempotent bulk insert. Returns ``(inserted, skipped)``.
+
+        Built for a Tally Day Book import — hundreds to thousands of
+        vouchers in one upload — so it issues a single
+        ``INSERT ... ON CONFLICT DO NOTHING RETURNING`` instead of N
+        round-trips. ``skipped`` counts everything not newly inserted:
+        rows already in the DB *and* intra-file duplicates.
+
+        Each row dict needs ``source``, ``event_type``, ``dedup_key``,
+        ``occurred_at`` (tz-aware), and optionally ``payload`` /
+        ``client_id``. ``ca_firm_id`` is injected from the query scope —
+        callers never pass it (tenant isolation by construction).
+
+        Intra-batch duplicates are collapsed in Python first: ON CONFLICT
+        DO NOTHING resolves conflicts against *existing* rows, not against
+        two identical rows inside the same statement, so we de-dupe on
+        ``(dedup_key, occurred_at)`` before the insert.
+        """
+        original_total = len(rows)
+        if original_total == 0:
+            return (0, 0)
+
+        seen: set[tuple[str, datetime]] = set()
+        values: list[dict[str, Any]] = []
+        for r in rows:
+            dedup_key = r["dedup_key"]
+            occurred_at = r["occurred_at"]
+            key = (dedup_key, occurred_at)
+            if key in seen:
+                continue
+            seen.add(key)
+            self._check_source(r["source"])
+            values.append(
+                {
+                    "ca_firm_id": self.ca_firm_id,
+                    "source": r["source"],
+                    "event_type": r["event_type"],
+                    "dedup_key": dedup_key,
+                    "occurred_at": occurred_at,
+                    "payload": r.get("payload") or {},
+                    "client_id": self._coerce_client_id(r.get("client_id")),
+                }
+            )
+
+        stmt = (
+            pg_insert(BrainEvent)
+            .values(values)
+            .on_conflict_do_nothing(
+                index_elements=["ca_firm_id", "source", "dedup_key", "occurred_at"],
+                index_where=sa_text("dedup_key IS NOT NULL"),
+            )
+            .returning(BrainEvent.id)
+        )
+        result = await self.session.execute(stmt)
+        inserted = len(result.fetchall())
+        await self.session.flush()
+        return (inserted, original_total - inserted)
+
     async def list_recent(
         self, *, limit: int = 50
     ) -> Sequence[BrainEvent]:
