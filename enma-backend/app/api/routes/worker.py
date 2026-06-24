@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import re
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, status
@@ -82,7 +83,7 @@ from app.identity.resolver import (
     BUYER_NAME_TRGM_THRESHOLD,
 )
 from app.logging_setup import get_logger
-from app.services import tally_import, telegram
+from app.services import gstr2b_import, recon_runner, tally_import, telegram
 from app.services.llm import LLMError
 from app.services.messaging import factory as messaging_factory
 from app.services.messaging.base import RawHtml
@@ -164,6 +165,20 @@ async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PL
                 reply_to_message_id=envelope.message_id,
                 file_bytes=file_bytes,
                 caption=caption,
+            )
+            return
+
+        # ---- Step 2a': GSTR-2B JSON? (TA-2 — ingest + auto-reconcile) ---
+        # A GSTR-2B export is the available-ITC leg, not an invoice. Ingest
+        # it to brain_events and immediately reconcile against the client's
+        # books for the return period (ADR-015).
+        if gstr2b_import.looks_like_gstr2b_json(file_bytes):
+            await _run_gstr2b_ingestion(
+                session=session,
+                firm=firm,
+                chat_id=envelope.chat_id,
+                reply_to_message_id=envelope.message_id,
+                file_bytes=file_bytes,
             )
             return
 
@@ -452,6 +467,101 @@ async def _run_tally_ingestion(
         await session.commit()
     except Exception as exc:  # — memory must never break the user reply
         _log.error("tally_import_memory_persist_failed", error=str(exc))
+
+
+async def _run_gstr2b_ingestion(
+    *,
+    session: Any,
+    firm: CaFirm,
+    chat_id: int,
+    reply_to_message_id: int | None,
+    file_bytes: bytes,
+) -> None:
+    """Parse an uploaded GSTR-2B JSON, ingest to brain_events, auto-reconcile.
+
+    Routes to the client by the *recipient* GSTIN on the 2B (reliable, no
+    fuzzy match needed) and derives the period from the return period.
+    Then reconciles the period's books against the freshly-parsed entries
+    (ADR-015). Deterministic — no LLM.
+    """
+    try:
+        parsed = gstr2b_import.parse_gstr2b(file_bytes)
+    except gstr2b_import.Gstr2bParseError as exc:
+        _log.warning("gstr2b_parse_failed", error=str(exc), chat_id=chat_id)
+        await _send_user_error(
+            chat_id,
+            "That looked like a GSTR-2B file but I couldn't read it. "
+            "Please re-download the JSON from the portal and try again.",
+        )
+        return
+
+    period = recon_runner.period_from_rtnprd(parsed.return_period)
+    if period is None:
+        await _send_user_error(
+            chat_id,
+            "I couldn't read the return period from that GSTR-2B file.",
+        )
+        return
+    month, year = period
+
+    clients_q = ClientQuery(session=session, ca_firm_id=firm.id)
+    client = (
+        await clients_q.get_by_gstin(parsed.recipient_gstin)
+        if parsed.recipient_gstin
+        else None
+    )
+    if client is None:
+        await _send_user_error(
+            chat_id,
+            "I couldn't match the GSTR-2B recipient GSTIN "
+            f"({safe_text(parsed.recipient_gstin or 'unknown')}) to one of your "
+            "clients. Add the client with that GSTIN, then re-send the file.",
+        )
+        return
+
+    # Ingest each 2B entry into brain_events (idempotent; reusable by TA-3).
+    rows = [
+        {
+            "source": "gstn_portal",
+            "event_type": "gstr2b_entry",
+            "dedup_key": e.dedup_key,
+            "occurred_at": datetime(
+                e.invoice_date.year, e.invoice_date.month, e.invoice_date.day, tzinfo=UTC
+            ),
+            "payload": {**e.to_payload(), "return_period": parsed.return_period},
+            "client_id": client.id,
+        }
+        for e in parsed.entries
+    ]
+    brain_q = BrainEventQuery(session=session, ca_firm_id=firm.id)
+    inserted, skipped = await brain_q.record_dedup_bulk(rows=rows)
+    await session.commit()
+    _log.info(
+        "gstr2b_ingestion_completed",
+        ca_firm_id=str(firm.id),
+        client_id=str(client.id),
+        entries=len(parsed.entries),
+        inserted=inserted,
+        skipped=skipped,
+    )
+
+    # Auto-reconcile against the client's books for the return period.
+    delivery = await recon_runner.reconcile_and_deliver(
+        session=session,
+        firm=firm,
+        client=client,
+        month=month,
+        year=year,
+        entries=list(parsed.entries),
+        chat_id=chat_id,
+        reply_to_message_id=reply_to_message_id,
+    )
+
+    await messaging_factory.client_for(firm=firm).send_message(
+        recipient=chat_id,
+        body=RawHtml(safe_text(delivery.summary)),
+        reply_to_id=reply_to_message_id,
+    )
 
 
 async def _finalize_and_summarise(

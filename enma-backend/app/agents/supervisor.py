@@ -56,6 +56,7 @@ from app.db.queries.tasks import TaskQuery
 from app.db.queries.verdict_corrections import VerdictCorrectionQuery
 from app.logging_setup import get_logger
 from app.prompts.master_prompt import build_supervisor_prompt
+from app.services import recon_runner
 from app.services import telegram as telegram_service
 from app.services.export import generate_client_ledger_csv
 from app.services.llm import (
@@ -1504,6 +1505,76 @@ async def _tool_query_brain(
 
 
 # ---------------------------------------------------------------------------
+# TA-2 — reconcile_itc: on-demand Tri-Way (2-way) ITC reconciliation.
+#
+# Re-runs the recon for a (client, period) against the GSTR-2B already
+# ingested into brain_events (the auto-recon on upload is in the worker).
+# Deterministic; delivers the CSV + records outcome_units. ADR-015.
+# ---------------------------------------------------------------------------
+
+
+async def _tool_reconcile_itc(
+    ctx: SupervisorContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Reconcile a client's books against GSTR-2B for a filing period.
+
+    Requires the client's GSTR-2B to have been uploaded already (it lives
+    in brain_events). Returns the bucket counts + recoverable / at-risk
+    ITC; delivers the detailed CSV to the CA as a side effect.
+    """
+    from app.db.queries.firms import get_firm_by_id
+
+    month = _coerce_int_or_none(args.get("month"))
+    year = _coerce_int_or_none(args.get("year"))
+    if month is None or year is None:
+        raise ToolError("month and year are required (e.g. month=8, year=2025)")
+    if not (1 <= month <= 12):
+        raise ToolError("month must be between 1 and 12")
+
+    client = await _resolve_client_from_args(ctx, args)
+    entries = await recon_runner.entries_from_brain(
+        session=ctx.session,
+        ca_firm_id=ctx.ca_firm_id,
+        client_id=client.id,
+        month=month,
+        year=year,
+    )
+    if not entries:
+        raise ToolError(
+            f"No GSTR-2B data on file for {client.trade_name} for "
+            f"{month:02d}/{year}. Ask the CA to upload the GSTR-2B JSON first."
+        )
+
+    firm = await get_firm_by_id(ctx.session, ctx.ca_firm_id)
+    if firm is None:
+        raise ToolError("firm not found")
+
+    delivery = await recon_runner.reconcile_and_deliver(
+        session=ctx.session,
+        firm=firm,
+        client=client,
+        month=month,
+        year=year,
+        entries=entries,
+        chat_id=ctx.chat_id,
+    )
+    r = delivery.result
+    return {
+        "reconciled": True,
+        "client": client.trade_name,
+        "month": month,
+        "year": year,
+        "matched": r.matched_count,
+        "amount_mismatch": r.amount_mismatch_count,
+        "in_books_not_in_2b": r.in_books_not_in_2b_count,
+        "in_2b_not_in_books": r.in_2b_not_in_books_count,
+        "recoverable_itc": str(r.recoverable_itc),
+        "at_risk_itc": str(r.at_risk_itc),
+        "summary": delivery.summary,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
@@ -1837,6 +1908,34 @@ TOOLS: Final[dict[str, ToolSpec]] = {
             "additionalProperties": False,
         },
         runner=_tool_export_client_ledger,
+    ),
+    "reconcile_itc": ToolSpec(
+        name="reconcile_itc",
+        description=(
+            "Reconcile a client's purchase books against their GSTR-2B for a "
+            "filing period (the monthly 2A/2B / ITC reconciliation). Use when "
+            "the CA says 'reconcile CLEIND for August 2025', 'run the 2B "
+            "recon for client X', 'how much ITC can I recover for July', "
+            "'check my input credit against 2B'. Requires the client's "
+            "GSTR-2B JSON to have been uploaded already (uploading it also "
+            "auto-reconciles). Pass client_id OR client_name plus month "
+            "(1-12) and year. Returns matched / recoverable / at-risk / "
+            "mismatch counts and the recoverable ITC ₹, and delivers a CSV "
+            "report to the CA. Surface recoverable_itc and the bucket counts "
+            "in your reply."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "client_id": {"type": "string"},
+                "client_name": {"type": "string"},
+                "month": {"type": "integer", "minimum": 1, "maximum": 12},
+                "year": {"type": "integer", "minimum": 2020, "maximum": 2100},
+            },
+            "required": ["month", "year"],
+            "additionalProperties": False,
+        },
+        runner=_tool_reconcile_itc,
     ),
     "query_brain": ToolSpec(
         name="query_brain",

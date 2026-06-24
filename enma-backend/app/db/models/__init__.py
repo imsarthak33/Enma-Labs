@@ -19,6 +19,7 @@ from app.db.models.infrastructure import (
 )
 from app.db.models.outcome_unit import OutcomeUnit
 from app.db.models.pending_assignment import PendingAssignment
+from app.db.models.reconciliation_run import ReconciliationRun
 from app.db.models.rule import CaFirmRule
 from app.db.models.tally_export_run import TallyExportRun
 from app.db.models.task import Task
@@ -41,6 +42,7 @@ __all__ = [
     "IdentityResolutionLog",
     "OutcomeUnit",
     "PendingAssignment",
+    "ReconciliationRun",
     "TallyExportRun",
     "Task",
     "VerdictCorrection",
