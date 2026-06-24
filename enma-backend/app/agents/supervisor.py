@@ -46,6 +46,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.context_injector import format_rules_for_prompt, load_rules_for_engine
+from app.db.queries.brain_events import BrainEventQuery
 from app.db.queries.clients import ClientQuery
 from app.db.queries.documents import DocumentQuery
 from app.db.queries.filings import FilingQuery
@@ -1377,6 +1378,132 @@ async def _tool_export_client_ledger(
 
 
 # ---------------------------------------------------------------------------
+# A5 — Brain Surface: query_brain.
+#
+# The first read path over ``brain_events`` (the substrate A1 created and
+# A2 fills from Tally). Lets the supervisor answer "what data do you have
+# for client X" / "how many vouchers did I import" — the cross-day,
+# cross-client recall the beta will otherwise miss. Deterministic
+# summary; the LLM only paraphrases the numbers.
+# ---------------------------------------------------------------------------
+
+
+_BRAIN_SAMPLE_LIMIT: Final[int] = 10
+_BRAIN_MAX_LIMIT: Final[int] = 200
+
+
+def _party_amount(payload: dict[str, Any]) -> Decimal | None:
+    """Pull the party-ledger amount (the voucher grand total) from a payload.
+
+    Tally vouchers carry one ``is_party`` ledger entry whose amount is the
+    invoice total. Returns ``None`` when there's no party entry (non-Tally
+    events) or the amount won't parse.
+    """
+    entries = payload.get("ledger_entries")
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("is_party"):
+            try:
+                return parse_money(entry.get("amount"))
+            except (ValueError, TypeError):
+                return None
+    return None
+
+
+def _summarize_brain_events(events: Any) -> dict[str, Any]:
+    """Deterministic rollup of brain_events for the ``query_brain`` tool.
+
+    Counts by source + event_type, sums the party-ledger value (Decimal),
+    derives the occurred-at date range, and emits up to
+    :data:`_BRAIN_SAMPLE_LIMIT` sample rows. All money as strings.
+    """
+    by_source: dict[str, int] = {}
+    by_event_type: dict[str, int] = {}
+    total_value = Decimal("0")
+    valued_count = 0
+    dates: list[datetime] = []
+    samples: list[dict[str, Any]] = []
+
+    for ev in events:
+        by_source[ev.source] = by_source.get(ev.source, 0) + 1
+        by_event_type[ev.event_type] = by_event_type.get(ev.event_type, 0) + 1
+        if ev.occurred_at is not None:
+            dates.append(ev.occurred_at)
+        payload = ev.payload if isinstance(ev.payload, dict) else {}
+        amount = _party_amount(payload)
+        if amount is not None:
+            total_value += amount
+            valued_count += 1
+        if len(samples) < _BRAIN_SAMPLE_LIMIT:
+            samples.append(
+                {
+                    "source": ev.source,
+                    "event_type": ev.event_type,
+                    "occurred_at": ev.occurred_at.date().isoformat()
+                    if ev.occurred_at is not None
+                    else None,
+                    "voucher_number": payload.get("voucher_number"),
+                    "amount": str(amount) if amount is not None else None,
+                    "narration": payload.get("narration"),
+                }
+            )
+
+    return {
+        "count": sum(by_source.values()),
+        "by_source": by_source,
+        "by_event_type": by_event_type,
+        "total_party_value": str(total_value) if valued_count else None,
+        "valued_event_count": valued_count,
+        "earliest": min(dates).date().isoformat() if dates else None,
+        "latest": max(dates).date().isoformat() if dates else None,
+        "samples": samples,
+    }
+
+
+async def _tool_query_brain(
+    ctx: SupervisorContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Query the firm's company brain (brain_events) and summarise.
+
+    Optionally scope to a client (id or fuzzy name), a source ('tally',
+    'gmail', …), and/or an event_type ('voucher_purchase'). Returns a
+    deterministic rollup the LLM paraphrases for the CA.
+    """
+    client_name = None
+    client_id: uuid.UUID | None = None
+    if args.get("client_id") or args.get("client_name"):
+        client = await _resolve_client_from_args(ctx, args)
+        client_id = client.id
+        client_name = client.trade_name
+
+    source = args.get("source")
+    source = source.strip() if isinstance(source, str) and source.strip() else None
+    event_type = args.get("event_type")
+    event_type = (
+        event_type.strip() if isinstance(event_type, str) and event_type.strip() else None
+    )
+    limit = _coerce_int_or_none(args.get("limit")) or 100
+    limit = min(limit, _BRAIN_MAX_LIMIT)
+
+    brain_q = BrainEventQuery(session=ctx.session, ca_firm_id=ctx.ca_firm_id)
+    try:
+        events = await brain_q.list_filtered(
+            client_id=client_id,
+            source=source,
+            event_type=event_type,
+            limit=limit,
+        )
+    except ValueError as exc:  # unknown source string
+        raise ToolError(str(exc)) from exc
+
+    summary = _summarize_brain_events(events)
+    summary["client"] = client_name
+    summary["source_filter"] = source
+    return summary
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
@@ -1710,6 +1837,41 @@ TOOLS: Final[dict[str, ToolSpec]] = {
             "additionalProperties": False,
         },
         runner=_tool_export_client_ledger,
+    ),
+    "query_brain": ToolSpec(
+        name="query_brain",
+        description=(
+            "Query the firm's company brain — facts Enma has ingested from "
+            "Tally (and later Gmail / GSTN). Use when the CA asks what data "
+            "Enma holds: 'what Tally vouchers do you have for CLEIND', 'how "
+            "many purchase vouchers did I import', 'what's in the brain for "
+            "client X', 'recall what you have for August'. Pass client_name "
+            "to scope to one client, source ('tally') to filter by origin, "
+            "event_type ('voucher_purchase') to narrow further. Returns "
+            "counts (overall, by source, by event_type), the total party "
+            "value, the date range, and sample vouchers. Distinct from "
+            "query_documents (which lists invoices Enma OCR'd) — this is the "
+            "books-side data ingested from the CA's own systems."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "client_id": {"type": "string"},
+                "client_name": {"type": "string"},
+                "source": {
+                    "type": "string",
+                    "description": "Filter by origin: 'tally' | 'gmail' | "
+                    "'whatsapp_group' | 'gstn_portal' | 'enma_internal'.",
+                },
+                "event_type": {
+                    "type": "string",
+                    "description": "Narrow to one event type, e.g. 'voucher_purchase'.",
+                },
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+            },
+            "additionalProperties": False,
+        },
+        runner=_tool_query_brain,
     ),
     "approve_filing": ToolSpec(
         name="approve_filing",

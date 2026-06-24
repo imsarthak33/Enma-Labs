@@ -195,6 +195,33 @@ class BrainEventQuery(BaseQuery):
         )
         return await self._fetch_all(stmt)
 
+    async def list_filtered(
+        self,
+        *,
+        client_id: uuid.UUID | str | None = None,
+        source: str | None = None,
+        event_type: str | None = None,
+        limit: int = 100,
+    ) -> Sequence[BrainEvent]:
+        """A5 Brain-Surface read: events for this firm, optionally narrowed.
+
+        Powers the ``query_brain`` supervisor tool. Any combination of
+        ``client_id`` / ``source`` / ``event_type`` may be supplied;
+        omitting all returns the firm's most-recent events. Always
+        firm-scoped via :meth:`_scoped_select`. Ordered newest-first by
+        the source event time.
+        """
+        stmt = self._scoped_select(BrainEvent)
+        if client_id is not None:
+            stmt = stmt.where(BrainEvent.client_id == self._coerce_client_id(client_id))
+        if source is not None:
+            self._check_source(source)
+            stmt = stmt.where(BrainEvent.source == source)
+        if event_type is not None:
+            stmt = stmt.where(BrainEvent.event_type == event_type)
+        stmt = stmt.order_by(BrainEvent.occurred_at.desc()).limit(limit)
+        return await self._fetch_all(stmt)
+
     async def list_by_source(
         self, *, source: str, limit: int = 50
     ) -> Sequence[BrainEvent]:
