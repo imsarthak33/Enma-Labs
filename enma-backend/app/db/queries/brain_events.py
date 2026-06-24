@@ -32,7 +32,7 @@ from app.db.queries.base import BaseQuery
 # here so a typo'd source fails fast in Python with a clear message
 # instead of surfacing as a Postgres CHECK violation mid-transaction.
 _ALLOWED_SOURCES: frozenset[str] = frozenset(
-    {"tally", "gmail", "whatsapp_group", "gstn_portal", "enma_internal"}
+    {"tally", "gmail", "whatsapp_group", "gstn_portal", "enma_internal", "bank"}
 )
 
 

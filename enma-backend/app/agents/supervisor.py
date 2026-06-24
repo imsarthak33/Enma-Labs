@@ -56,7 +56,7 @@ from app.db.queries.tasks import TaskQuery
 from app.db.queries.verdict_corrections import VerdictCorrectionQuery
 from app.logging_setup import get_logger
 from app.prompts.master_prompt import build_supervisor_prompt
-from app.services import recon_runner
+from app.services import bank_recon_runner, recon_runner
 from app.services import telegram as telegram_service
 from app.services.export import generate_client_ledger_csv
 from app.services.llm import (
@@ -1579,6 +1579,39 @@ async def _tool_reconcile_itc(
     }
 
 
+async def _tool_reconcile_bank(
+    ctx: SupervisorContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Run the 180-day bank/payment reconciliation for a client.
+
+    Requires the client's bank statement to have been uploaded already
+    (it lives in brain_events). Flags purchase invoices with no payment
+    evidence past 180 days (ITC reversal risk). Delivers a CSV.
+    """
+    from app.db.queries.firms import get_firm_by_id
+
+    client = await _resolve_client_from_args(ctx, args)
+    txns = await bank_recon_runner.txns_from_brain(
+        session=ctx.session, ca_firm_id=ctx.ca_firm_id, client_id=client.id
+    )
+    if not txns:
+        raise ToolError(
+            f"No bank statement on file for {client.trade_name}. Ask the CA "
+            "to upload the bank statement CSV first."
+        )
+    firm = await get_firm_by_id(ctx.session, ctx.ca_firm_id)
+    if firm is None:
+        raise ToolError("firm not found")
+    delivery = await bank_recon_runner.bank_reconcile_and_deliver(
+        session=ctx.session,
+        firm=firm,
+        client=client,
+        transactions=txns,
+        chat_id=ctx.chat_id,
+    )
+    return {"reconciled": True, "client": client.trade_name, "summary": delivery.summary}
+
+
 # ---------------------------------------------------------------------------
 # Tax Knowledge Base — deterministic advice tools.
 #
@@ -2039,6 +2072,32 @@ TOOLS: Final[dict[str, ToolSpec]] = {
             "additionalProperties": False,
         },
         runner=_tool_tds_section_lookup,
+    ),
+    "reconcile_bank": ToolSpec(
+        name="reconcile_bank",
+        description=(
+            "Run the 180-day bank/payment reconciliation for a client — "
+            "flags purchase invoices with no payment evidence that are past "
+            "180 days, where the ITC claimed must be reversed under Section "
+            "16(2). Use when the CA says 'run bank recon for CLEIND', 'which "
+            "invoices are unpaid past 180 days', 'what ITC do I need to "
+            "reverse', 'check payment status against the bank'. Requires the "
+            "client's bank statement CSV to have been uploaded already "
+            "(uploading it also auto-runs this). Pass client_id OR "
+            "client_name. Returns paid / unpaid / over-180 counts and the "
+            "ITC at reversal risk; delivers a CSV. Payment matching is "
+            "advisory (bank narration has no invoice number) — frame "
+            "unpaid as 'no payment found', and surface reversal-risk ITC."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "client_id": {"type": "string"},
+                "client_name": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+        runner=_tool_reconcile_bank,
     ),
     "reconcile_itc": ToolSpec(
         name="reconcile_itc",

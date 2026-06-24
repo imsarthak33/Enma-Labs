@@ -83,7 +83,14 @@ from app.identity.resolver import (
     BUYER_NAME_TRGM_THRESHOLD,
 )
 from app.logging_setup import get_logger
-from app.services import gstr2b_import, recon_runner, tally_import, telegram
+from app.services import (
+    bank_import,
+    bank_recon_runner,
+    gstr2b_import,
+    recon_runner,
+    tally_import,
+    telegram,
+)
 from app.services.llm import LLMError
 from app.services.messaging import factory as messaging_factory
 from app.services.messaging.base import RawHtml
@@ -99,7 +106,7 @@ _log = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
-async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PLR0911
+async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PLR0911, PLR0915
     """Background task for a single document envelope (R2 — extract-first).
 
     The autonomous-routing flow:
@@ -179,6 +186,21 @@ async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PL
                 chat_id=envelope.chat_id,
                 reply_to_message_id=envelope.message_id,
                 file_bytes=file_bytes,
+            )
+            return
+
+        # ---- Step 2a'': Bank statement CSV? (TA-2 phase 2 — 180-day leg) -
+        # A bank statement is the payment leg. Ingest debits to brain_events
+        # and run the 180-day ITC-reversal recon (ADR-016). Bank CSVs carry
+        # no client identifier, so routing relies on the caption.
+        if bank_import.looks_like_bank_csv(file_bytes):
+            await _run_bank_ingestion(
+                session=session,
+                firm=firm,
+                chat_id=envelope.chat_id,
+                reply_to_message_id=envelope.message_id,
+                file_bytes=file_bytes,
+                caption=caption,
             )
             return
 
@@ -557,6 +579,85 @@ async def _run_gstr2b_ingestion(
         reply_to_message_id=reply_to_message_id,
     )
 
+    await messaging_factory.client_for(firm=firm).send_message(
+        recipient=chat_id,
+        body=RawHtml(safe_text(delivery.summary)),
+        reply_to_id=reply_to_message_id,
+    )
+
+
+async def _run_bank_ingestion(
+    *,
+    session: Any,
+    firm: CaFirm,
+    chat_id: int,
+    reply_to_message_id: int | None,
+    file_bytes: bytes,
+    caption: str | None,
+) -> None:
+    """Parse an uploaded bank statement, ingest debits, run 180-day recon.
+
+    Bank CSVs carry no client identifier, so we route by the upload caption
+    (fuzzy-matched to a client); if the firm has exactly one active client
+    we use it; otherwise we ask which client it's for (ADR-016).
+    """
+    try:
+        statement = bank_import.parse_bank_statement(file_bytes)
+    except bank_import.BankStatementParseError as exc:
+        _log.warning("bank_statement_parse_failed", error=str(exc), chat_id=chat_id)
+        await _send_user_error(
+            chat_id,
+            "That looked like a bank statement but I couldn't read its "
+            "columns. Export a CSV with Date, Narration, and Withdrawal/"
+            "Deposit (or Debit/Credit) columns and try again.",
+        )
+        return
+
+    clients_q = ClientQuery(session=session, ca_firm_id=firm.id)
+    client = await _resolve_tally_client(
+        session=session, firm=firm, company_name="", caption=caption
+    )
+    if client is None:
+        active = list(await clients_q.list_active())
+        if len(active) == 1:
+            client = active[0]
+        else:
+            sample = "\n".join("• " + safe_text(c.trade_name) for c in active[:10])
+            await telegram.send_message(
+                chat_id=chat_id,
+                html_text=(
+                    bold("Which client is this bank statement for?")
+                    + "\nRe-send the file with the client's name as the caption.\n"
+                    + sample
+                ),
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+
+    # Ingest all transactions to brain_events (idempotent), then recon.
+    rows = bank_recon_runner.txns_to_brain_rows(
+        transactions=list(statement.transactions), client_id=client.id
+    )
+    brain_q = BrainEventQuery(session=session, ca_firm_id=firm.id)
+    inserted, skipped = await brain_q.record_dedup_bulk(rows=rows)
+    await session.commit()
+    _log.info(
+        "bank_ingestion_completed",
+        ca_firm_id=str(firm.id),
+        client_id=str(client.id),
+        transactions=len(statement.transactions),
+        inserted=inserted,
+        skipped=skipped,
+    )
+
+    delivery = await bank_recon_runner.bank_reconcile_and_deliver(
+        session=session,
+        firm=firm,
+        client=client,
+        transactions=list(statement.transactions),
+        chat_id=chat_id,
+        reply_to_message_id=reply_to_message_id,
+    )
     await messaging_factory.client_for(firm=firm).send_message(
         recipient=chat_id,
         body=RawHtml(safe_text(delivery.summary)),
