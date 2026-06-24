@@ -70,6 +70,11 @@ from app.services.tally import TallyInvoice, compose_tally_envelope
 from app.tax.directives import RuleDirective
 from app.tax.gstin_validator import is_valid_gstin
 from app.tax.reconciler import reconcile_extraction
+from app.tax_engine.gst_rate_master import get_rate_for_hsn
+from app.tax_engine.income_tax_section_mapping import (
+    ACT_TRANSITION_DATE,
+    get_applicable_tds_rule,
+)
 from app.utils.decimal_utils import parse_money
 
 __all__ = [
@@ -1575,6 +1580,77 @@ async def _tool_reconcile_itc(
 
 
 # ---------------------------------------------------------------------------
+# Tax Knowledge Base — deterministic advice tools.
+#
+# Surface the GST 2.0 rate master and the Income Tax Act 2025 TDS map as
+# queryable advice. Pure in-memory lookups (no DB, no LLM); the LLM only
+# paraphrases the returned fact. Citations/rates are deterministic — a
+# hallucinated tax rate is a liability, so the model never invents these.
+# ---------------------------------------------------------------------------
+
+
+def _parse_iso_date_arg(value: object) -> date | None:
+    """Best-effort ISO-date arg parse for tool calls; None when absent/bad."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return date.fromisoformat(value.strip()[:10])
+    except ValueError:
+        return None
+
+
+async def _tool_gst_rate_lookup(
+    ctx: SupervisorContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Look up the GST 2.0 rate for an HSN/SAC code (longest-prefix match)."""
+    hsn = args.get("hsn")
+    if not isinstance(hsn, str) or not hsn.strip():
+        raise ToolError("hsn is required (e.g. '5201', '9963')")
+    as_of = _parse_iso_date_arg(args.get("as_of_date"))
+    entry = get_rate_for_hsn(hsn.strip(), as_of)
+    if entry is None:
+        return {"found": False, "hsn": hsn.strip()}
+    return {
+        "found": True,
+        "hsn_prefix": entry.hsn_prefix,
+        "description": entry.description,
+        "category": entry.category,
+        "gst_rate": str(entry.gst_rate),
+        "notes": entry.notes,
+        "effective_from": entry.effective_from.isoformat(),
+    }
+
+
+async def _tool_tds_section_lookup(
+    ctx: SupervisorContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Look up the applicable TDS section/rate for a payment (Act-transition aware)."""
+    nature = args.get("nature_of_payment")
+    if not isinstance(nature, str) or not nature.strip():
+        raise ToolError(
+            "nature_of_payment is required (e.g. 'contractor', 'rent', "
+            "'professional fees', 'salary')"
+        )
+    payment_date = _parse_iso_date_arg(args.get("payment_date")) or datetime.now(UTC).date()
+    rule = get_applicable_tds_rule(nature.strip(), payment_date)
+    if rule is None:
+        return {"found": False, "nature_of_payment": nature.strip()}
+    return {
+        "found": True,
+        "nature_of_payment": rule.nature_of_payment,
+        "section_reference": rule.new_act_reference,
+        "legacy_section": rule.legacy_section,
+        "rate_percent": str(rule.rate_percent),
+        "threshold_inr": str(rule.threshold_inr),
+        "threshold_notes": rule.threshold_notes,
+        "notes": rule.notes,
+        "payment_date": payment_date.isoformat(),
+        "act": "Income Tax Act 1961" if payment_date < ACT_TRANSITION_DATE
+        else "Income Tax Act 2025",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
@@ -1908,6 +1984,61 @@ TOOLS: Final[dict[str, ToolSpec]] = {
             "additionalProperties": False,
         },
         runner=_tool_export_client_ledger,
+    ),
+    "gst_rate_lookup": ToolSpec(
+        name="gst_rate_lookup",
+        description=(
+            "Look up the current GST 2.0 rate for an HSN/SAC code or product "
+            "category. Use when the CA asks 'what's the GST rate on cotton / "
+            "HSN 5201', 'what rate applies to restaurant services', 'is this "
+            "18% correct for cement'. Pass the HSN/SAC code as 'hsn' (a "
+            "prefix is fine — longest match wins). Returns the rate, the "
+            "category, a description, and any notes (e.g. RCM, no-ITC, "
+            "exemptions). Rates are the post-22-Sep-2025 (56th Council / "
+            "GST 2.0) structure. This is authoritative — never guess a GST "
+            "rate yourself; call this tool."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "hsn": {"type": "string", "description": "HSN/SAC code or prefix."},
+                "as_of_date": {
+                    "type": "string",
+                    "description": "Optional ISO date for historical rates.",
+                },
+            },
+            "required": ["hsn"],
+            "additionalProperties": False,
+        },
+        runner=_tool_gst_rate_lookup,
+    ),
+    "tds_section_lookup": ToolSpec(
+        name="tds_section_lookup",
+        description=(
+            "Look up the applicable TDS section, rate, and threshold for a "
+            "payment. Transition-aware: payments before 2026-04-01 use the "
+            "Income Tax Act 1961 sections (194C, 194J, …); on/after use the "
+            "Income Tax Act 2025 (Section 392/393). Use when the CA asks "
+            "'what TDS on a contractor payment', 'rate for professional "
+            "fees', 'TDS section for rent in April 2026'. Pass "
+            "'nature_of_payment' (e.g. 'contractor', 'rent', 'professional "
+            "fees', 'salary', 'partner remuneration') and optionally "
+            "'payment_date' (ISO; defaults to today). Authoritative — never "
+            "guess a TDS rate yourself."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "nature_of_payment": {"type": "string"},
+                "payment_date": {
+                    "type": "string",
+                    "description": "Optional ISO date; defaults to today.",
+                },
+            },
+            "required": ["nature_of_payment"],
+            "additionalProperties": False,
+        },
+        runner=_tool_tds_section_lookup,
     ),
     "reconcile_itc": ToolSpec(
         name="reconcile_itc",
