@@ -89,6 +89,10 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S", "PLR2004"]
 "migrations/**" = ["E501", "S"]
+# Tax-KB reference-data modules mirror the seed rows in migrations
+# 014/015 — long rate/section description lines and inherent Indian-tax
+# glyphs (₹, en-dash) get the same E501/RUF002 relief as migrations.
+"app/tax_engine/**" = ["E501", "RUF002"]
 
 [tool.ruff.format]
 quote-style = "double"
