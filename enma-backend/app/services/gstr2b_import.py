@@ -187,7 +187,7 @@ def looks_like_gstr2b_json(raw: bytes) -> bool:
     return "docdata" in text and ("rtnprd" in text or '"b2b"' in text)
 
 
-def parse_gstr2b(raw: bytes) -> ParsedGstr2b:
+def parse_gstr2b(raw: bytes) -> ParsedGstr2b:  # noqa: PLR0912 — defensive parsing is branchy
     """Parse a GSTR-2B JSON export into normalised supplier entries.
 
     Raises :class:`Gstr2bParseError` when the bytes are not a GSTR-2B
@@ -219,9 +219,13 @@ def parse_gstr2b(raw: bytes) -> ParsedGstr2b:
                 inv_date = _parse_2b_date(inv.get("dt"))
             except Gstr2bParseError:
                 continue
-            items = inv.get("items")
+            # Real GSTN b2b exports carry the consolidated tax fields
+            # directly on the invoice object. Some variants nest them in an
+            # item array (``items``/``itms``) — prefer that when present and
+            # non-empty, else fall back to the invoice-level figures.
+            items = inv.get("items") or inv.get("itms")
             taxable = igst = cgst = sgst = cess = ZERO
-            if isinstance(items, list):
+            if isinstance(items, list) and items:
                 for it in items:
                     if not isinstance(it, dict):
                         continue
@@ -230,6 +234,12 @@ def parse_gstr2b(raw: bytes) -> ParsedGstr2b:
                     cgst += _money(it.get("cgst"))
                     sgst += _money(it.get("sgst"))
                     cess += _money(it.get("cess"))
+            else:
+                taxable = _money(inv.get("txval"))
+                igst = _money(inv.get("igst"))
+                cgst = _money(inv.get("cgst"))
+                sgst = _money(inv.get("sgst"))
+                cess = _money(inv.get("cess"))
             iso = inv_date.isoformat()
             entries.append(
                 Gstr2bEntry(

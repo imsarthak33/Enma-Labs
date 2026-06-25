@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from datetime import date
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from app.services.gstr2b_import import (
@@ -18,6 +19,8 @@ from app.services.gstr2b_import import (
     parse_gstr2b,
 )
 from app.services.recon import InvoiceRecord, reconcile
+
+_REAL_FIXTURE = Path(__file__).parent / "fixtures" / "gstr2b_real_032026.json"
 
 
 def _two_b(*invoices: dict) -> bytes:
@@ -96,6 +99,25 @@ def test_parse_rejects_garbage() -> None:
         parse_gstr2b(b"not json at all")
     with pytest.raises(Gstr2bParseError):
         parse_gstr2b(b'{"data": {"foo": "bar"}}')  # no docdata
+
+
+def test_parse_real_gstn_export_invoice_level_tax() -> None:
+    """Regression: real GSTN b2b exports carry tax on the invoice, not in items[]."""
+    parsed = parse_gstr2b(_REAL_FIXTURE.read_bytes())
+    assert parsed.recipient_gstin == "10CDVPS7198R1Z7"
+    assert parsed.return_period == "032026"
+    assert len(parsed.entries) == 2
+    by_inum = {e.invoice_number: e for e in parsed.entries}
+    bandhan = by_inum["BR/TI/0046414579"]
+    assert bandhan.supplier_name == "BANDHAN BANK LIMITED"
+    assert bandhan.taxable == Decimal("300.00")
+    assert bandhan.total_itc == Decimal("54.00")  # 27 cgst + 27 sgst
+    pranay = by_inum["13/2025-26"]
+    assert pranay.igst == Decimal("15608.57")
+    assert pranay.total_itc == Decimal("15608.57")
+    # Total recoverable if none are in the books.
+    total = sum((e.total_itc for e in parsed.entries), Decimal("0"))
+    assert total == Decimal("15662.57")
 
 
 # ── recon engine ────────────────────────────────────────────────────────

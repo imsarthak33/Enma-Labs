@@ -1,0 +1,106 @@
+{
+    "data": {
+        "itcsumm": {
+            "itcavl": {
+                "nonrevsup": {
+                    "sgst": 27,
+                    "b2b": {
+                        "sgst": 27,
+                        "txval": 312471.43,
+                        "cgst": 27,
+                        "cess": 0,
+                        "igst": 15608.57
+                    },
+                    "cgst": 27,
+                    "cess": 0,
+                    "igst": 15608.57
+                }
+            }
+        },
+        "rtnprd": "032026",
+        "docdata": {
+            "b2b": [
+                {
+                    "inv": [
+                        {
+                            "val": 354,
+                            "sgst": 27,
+                            "rev": "N",
+                            "itcavl": "Y",
+                            "txval": 300,
+                            "typ": "R",
+                            "cgst": 27,
+                            "inum": "BR/TI/0046414579",
+                            "rsn": "",
+                            "cess": 0,
+                            "igst": 0,
+                            "dt": "01-03-2026",
+                            "imsStatus": "A",
+                            "pos": "10"
+                        }
+                    ],
+                    "trdnm": "BANDHAN BANK LIMITED",
+                    "supfildt": "10-04-2026",
+                    "supprd": "032026",
+                    "ctin": "10AAGCB1323G1ZI"
+                },
+                {
+                    "inv": [
+                        {
+                            "val": 327780,
+                            "sgst": 0,
+                            "rev": "N",
+                            "itcavl": "Y",
+                            "txval": 312171.43,
+                            "typ": "R",
+                            "cgst": 0,
+                            "inum": "13/2025-26",
+                            "rsn": "",
+                            "cess": 0,
+                            "igst": 15608.57,
+                            "dt": "23-03-2026",
+                            "imsStatus": "A",
+                            "pos": "10"
+                        }
+                    ],
+                    "trdnm": "Pranay construction",
+                    "supfildt": "13-04-2026",
+                    "supprd": "032026",
+                    "ctin": "08DWAPS3131P1Z4"
+                }
+            ]
+        },
+        "gendt": "21-04-2026",
+        "gstin": "10CDVPS7198R1Z7",
+        "version": "1.0",
+        "cpsumm": {
+            "b2b": [
+                {
+                    "sgst": 27,
+                    "ttldocs": 1,
+                    "trdnm": "BANDHAN BANK LIMITED",
+                    "supprd": "032026",
+                    "supfildt": "10-04-2026",
+                    "txval": 300,
+                    "ctin": "10AAGCB1323G1ZI",
+                    "cgst": 27,
+                    "cess": 0,
+                    "igst": 0
+                },
+                {
+                    "sgst": 0,
+                    "ttldocs": 1,
+                    "trdnm": "Pranay construction",
+                    "supprd": "032026",
+                    "supfildt": "13-04-2026",
+                    "txval": 312171.43,
+                    "ctin": "08DWAPS3131P1Z4",
+                    "cgst": 0,
+                    "cess": 0,
+                    "igst": 15608.57
+                }
+            ]
+        }
+    },
+    "chksum": "9b2c5baf693b5bf9f99f82690ad8a50f99aa4a9833a59ec4461d0ef51bc2cd8c"
+}
