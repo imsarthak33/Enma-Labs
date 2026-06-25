@@ -173,6 +173,7 @@ async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PL
                 reply_to_message_id=envelope.message_id,
                 file_bytes=file_bytes,
                 caption=caption,
+                file_id=file_id,
             )
             return
 
@@ -389,6 +390,9 @@ _TALLY_CLIENT_MATCH_FLOOR: float = 0.6
 # invoice finalize path. The double-underscore wrapping keeps it from
 # colliding with any real classifier document_type.
 _PENDING_KIND_BANK: str = "__bank_statement__"
+# Same mechanism for an un-routed Tally export — its parsed brain-event rows
+# ride on the pending row and resume re-runs Tally ingestion.
+_PENDING_KIND_TALLY: str = "__tally_export__"
 
 
 async def _resolve_tally_client(
@@ -423,6 +427,47 @@ async def _resolve_tally_client(
     return None
 
 
+def _tally_base_rows(export: tally_import.ParsedTallyExport) -> list[dict[str, Any]]:
+    """Brain-event rows (sans client_id) for one parsed Tally export."""
+    return [
+        {
+            "source": "tally",
+            "event_type": v.event_type,
+            "dedup_key": v.dedup_key,
+            "occurred_at": v.date,
+            "payload": v.to_payload(),
+        }
+        for v in export.vouchers
+    ]
+
+
+def _tally_rows_to_json(base_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Serialise base rows for a pending-assignment hold (datetime → ISO)."""
+    return [
+        {
+            "event_type": r["event_type"],
+            "dedup_key": r["dedup_key"],
+            "occurred_at": r["occurred_at"].isoformat(),
+            "payload": r["payload"],
+        }
+        for r in base_rows
+    ]
+
+
+def _tally_rows_from_json(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rebuild base rows from a pending hold (ISO → datetime)."""
+    return [
+        {
+            "source": "tally",
+            "event_type": i["event_type"],
+            "dedup_key": i["dedup_key"],
+            "occurred_at": datetime.fromisoformat(i["occurred_at"]),
+            "payload": i["payload"],
+        }
+        for i in items
+    ]
+
+
 async def _run_tally_ingestion(
     *,
     session: Any,
@@ -431,13 +476,16 @@ async def _run_tally_ingestion(
     reply_to_message_id: int | None,
     file_bytes: bytes,
     caption: str | None,
+    file_id: str | None = None,
 ) -> None:
     """Parse an uploaded Tally export and land its vouchers as brain_events.
 
     Deterministic: no LLM, no tax recompute (Tally already did the math).
     Re-uploads collapse at the brain_events content-hash dedup layer, so
     the CA can safely re-send a whole month's Day Book and only new
-    vouchers are added.
+    vouchers are added. When the export can't be routed to a client it is
+    **held** on a pending row (like bank/invoice uploads) so a free-form
+    name reply resumes ingestion instead of dropping the file.
     """
     try:
         export = tally_import.parse_tally_export(file_bytes)
@@ -456,10 +504,10 @@ async def _run_tally_ingestion(
         company_name=export.company_name,
         caption=caption,
     )
+    base_rows = _tally_base_rows(export)
     if client is None:
         clients_q = ClientQuery(session=session, ca_firm_id=firm.id)
         active = list(await clients_q.list_active())
-        company_label = safe_text(export.company_name or "(unnamed company)")
         if not active:
             await _send_user_error(
                 chat_id,
@@ -467,36 +515,43 @@ async def _run_tally_ingestion(
                 "then re-send the Tally file.",
             )
             return
-        sample = "\n".join("• " + safe_text(c.trade_name) for c in active[:10])
-        extra = "" if len(active) <= 10 else f"\n{italic(f'+ {len(active) - 10} more')}"
-        html = (
-            bold("Which client is this Tally export for?")
-            + f"\nI couldn't match the Tally company {company_label} to one of "
-            "your clients. Re-send the file with the client's name as the caption.\n"
-            + sample
-            + extra
+        await _hold_tally_export_pending(
+            session=session,
+            firm=firm,
+            chat_id=chat_id,
+            reply_to_message_id=reply_to_message_id,
+            company_name=export.company_name,
+            base_rows=base_rows,
+            file_id=file_id,
+            active=active,
         )
-        try:
-            await telegram.send_message(
-                chat_id=chat_id,
-                html_text=html,
-                reply_to_message_id=reply_to_message_id,
-            )
-        except telegram.TelegramAPIError as exc:
-            _log.error("tally_client_prompt_send_failed", error=str(exc))
         return
 
-    rows = [
-        {
-            "source": "tally",
-            "event_type": v.event_type,
-            "dedup_key": v.dedup_key,
-            "occurred_at": v.date,
-            "payload": v.to_payload(),
-            "client_id": client.id,
-        }
-        for v in export.vouchers
-    ]
+    await _tally_ingest_for_client(
+        session=session,
+        firm=firm,
+        client=client,
+        base_rows=base_rows,
+        chat_id=chat_id,
+        reply_to_message_id=reply_to_message_id,
+    )
+
+
+async def _tally_ingest_for_client(
+    *,
+    session: Any,
+    firm: CaFirm,
+    client: Client,
+    base_rows: list[dict[str, Any]],
+    chat_id: int,
+    reply_to_message_id: int | None,
+) -> None:
+    """Land a routed Tally export's vouchers to brain_events + reply.
+
+    Shared by the upload path and the resume path. The client is already
+    decided (caption / company match or a resumed pending assignment).
+    """
+    rows = [{**r, "client_id": client.id} for r in base_rows]
     brain_q = BrainEventQuery(session=session, ca_firm_id=firm.id)
     inserted, skipped = await brain_q.record_dedup_bulk(rows=rows)
     await session.commit()
@@ -505,12 +560,12 @@ async def _run_tally_ingestion(
         "tally_ingestion_completed",
         ca_firm_id=str(firm.id),
         client_id=str(client.id),
-        vouchers=len(export.vouchers),
+        vouchers=len(base_rows),
         inserted=inserted,
         skipped=skipped,
     )
 
-    total = len(export.vouchers)
+    total = len(base_rows)
     html = (
         bold("📊 Tally import — " + safe_text(client.trade_name))
         + f"\nVouchers in file: {total}"
@@ -541,6 +596,58 @@ async def _run_tally_ingestion(
         await session.commit()
     except Exception as exc:  # — memory must never break the user reply
         _log.error("tally_import_memory_persist_failed", error=str(exc))
+
+
+async def _hold_tally_export_pending(
+    *,
+    session: Any,
+    firm: CaFirm,
+    chat_id: int,
+    reply_to_message_id: int | None,
+    company_name: str,
+    base_rows: list[dict[str, Any]],
+    file_id: str | None,
+    active: list[Client],
+) -> None:
+    """Park an un-routed Tally export on a pending row + prompt for client.
+
+    Mirrors :func:`_hold_bank_statement_pending`: the parsed voucher rows
+    ride on the pending row's ``extraction`` field, tagged with the Tally
+    kind sentinel so the resume dispatcher re-runs Tally ingestion.
+    """
+    pending_q = PendingAssignmentQuery(session=session, ca_firm_id=firm.id)
+    pending = await pending_q.create(
+        chat_id=chat_id,
+        file_ids=[file_id] if file_id else [],
+        candidate_client_ids=[c.id for c in active],
+        message_id=reply_to_message_id,
+        extraction={"vouchers": _tally_rows_to_json(base_rows)},
+        extraction_document_type=_PENDING_KIND_TALLY,
+    )
+    await session.commit()
+
+    company_label = safe_text(company_name or "(unnamed company)")
+    sample = "\n".join("• " + safe_text(c.trade_name) for c in active[:10])
+    extra = "" if len(active) <= 10 else f"\n{italic(f'+ {len(active) - 10} more')}"
+    html = (
+        bold("Which client is this Tally export for?")
+        + f"\nI parsed {len(base_rows)} vouchers from {company_label}. "
+        + "Just reply with the client's name and I'll file them.\n"
+        + sample
+        + extra
+    )
+    try:
+        sent = await telegram.send_message(
+            chat_id=chat_id,
+            html_text=html,
+            reply_to_message_id=reply_to_message_id,
+        )
+        prompt_id = sent.get("message_id") if isinstance(sent, dict) else None
+        if isinstance(prompt_id, int):
+            await pending_q.attach_prompt_message(pending.id, prompt_id)
+            await session.commit()
+    except telegram.TelegramAPIError as exc:
+        _log.error("tally_pending_prompt_send_failed", error=str(exc))
 
 
 async def _run_gstr2b_ingestion(
@@ -1137,6 +1244,23 @@ async def _resume_pipeline_for_pending_assignment(
             firm=firm,
             client=client,
             statement=statement,
+            chat_id=chat_id,
+            reply_to_message_id=row.message_id,
+        )
+        return
+
+    # Tally-export hold (ADR-014): same mechanism as the bank branch — the
+    # parsed voucher rows ride on the pending row, so resume re-files them
+    # for the resolved client with no re-download or re-parse.
+    if row.extraction_document_type == _PENDING_KIND_TALLY and isinstance(
+        row.extraction, dict
+    ):
+        base_rows = _tally_rows_from_json(row.extraction.get("vouchers", []))
+        await _tally_ingest_for_client(
+            session=session,
+            firm=firm,
+            client=client,
+            base_rows=base_rows,
             chat_id=chat_id,
             reply_to_message_id=row.message_id,
         )
