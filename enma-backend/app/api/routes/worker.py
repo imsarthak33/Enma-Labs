@@ -220,6 +220,7 @@ async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PL
                 reply_to_message_id=envelope.message_id,
                 statement=statement,
                 caption=caption,
+                file_id=file_id,
             )
             return
 
@@ -244,6 +245,7 @@ async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PL
                 reply_to_message_id=envelope.message_id,
                 statement=statement,
                 caption=caption,
+                file_id=file_id,
             )
             return
 
@@ -380,6 +382,13 @@ def _safe_str(payload: Any, *keys: str) -> str | None:
 # Fuzzy-match floor for routing a Tally export to one client. Below this we
 # refuse to guess and ask the CA to name the client (via caption).
 _TALLY_CLIENT_MATCH_FLOOR: float = 0.6
+
+# Pending-assignment kind sentinel. Bank statements that can't be routed on
+# upload are parked on a pending row whose ``extraction_document_type`` holds
+# this value, so the resume dispatcher runs bank ingestion instead of the
+# invoice finalize path. The double-underscore wrapping keeps it from
+# colliding with any real classifier document_type.
+_PENDING_KIND_BANK: str = "__bank_statement__"
 
 
 async def _resolve_tally_client(
@@ -637,14 +646,18 @@ async def _run_bank_ingestion(
     reply_to_message_id: int | None,
     statement: bank_import.ParsedBankStatement,
     caption: str | None,
+    file_id: str | None = None,
 ) -> None:
     """Ingest a parsed bank statement's debits and run the 180-day recon.
 
     The statement has already been parsed from its source format (CSV
     export or PDF e-statement). Bank statements carry no client identifier,
     so we route by the upload caption (fuzzy-matched to a client); if the
-    firm has exactly one active client we use it; otherwise we ask which
-    client it's for (ADR-016).
+    firm has exactly one active client we use it; otherwise we **hold** the
+    parsed statement on a pending-assignment row and ask which client it's
+    for. A free-form name reply then resumes ingestion via
+    :func:`_resume_pipeline_for_pending_assignment` — same UX as invoices,
+    so the file is never dropped (ADR-016).
     """
     clients_q = ClientQuery(session=session, ca_firm_id=firm.id)
     client = await _resolve_tally_client(
@@ -655,19 +668,42 @@ async def _run_bank_ingestion(
         if len(active) == 1:
             client = active[0]
         else:
-            sample = "\n".join("• " + safe_text(c.trade_name) for c in active[:10])
-            await telegram.send_message(
+            await _hold_bank_statement_pending(
+                session=session,
+                firm=firm,
                 chat_id=chat_id,
-                html_text=(
-                    bold("Which client is this bank statement for?")
-                    + "\nRe-send the file with the client's name as the caption.\n"
-                    + sample
-                ),
                 reply_to_message_id=reply_to_message_id,
+                statement=statement,
+                file_id=file_id,
+                active=active,
             )
             return
 
-    # Ingest all transactions to brain_events (idempotent), then recon.
+    await _bank_ingest_for_client(
+        session=session,
+        firm=firm,
+        client=client,
+        statement=statement,
+        chat_id=chat_id,
+        reply_to_message_id=reply_to_message_id,
+    )
+
+
+async def _bank_ingest_for_client(
+    *,
+    session: Any,
+    firm: CaFirm,
+    client: Client,
+    statement: bank_import.ParsedBankStatement,
+    chat_id: int,
+    reply_to_message_id: int | None,
+) -> None:
+    """Ingest a routed statement's transactions to brain_events + recon.
+
+    The client is already decided (caption match, single-client firm, or a
+    resumed pending assignment). Shared by the upload path and the resume
+    path so neither duplicates the ingest/recon/deliver sequence.
+    """
     rows = bank_recon_runner.txns_to_brain_rows(
         transactions=list(statement.transactions), client_id=client.id
     )
@@ -696,6 +732,57 @@ async def _run_bank_ingestion(
         body=RawHtml(safe_text(delivery.summary)),
         reply_to_id=reply_to_message_id,
     )
+
+
+async def _hold_bank_statement_pending(
+    *,
+    session: Any,
+    firm: CaFirm,
+    chat_id: int,
+    reply_to_message_id: int | None,
+    statement: bank_import.ParsedBankStatement,
+    file_id: str | None,
+    active: list[Client],
+) -> None:
+    """Park an un-routed bank statement on a pending row + prompt for client.
+
+    The parsed transactions ride on the pending row's ``extraction`` field
+    (no re-download/re-parse on resume), tagged with the bank kind sentinel
+    in ``extraction_document_type`` so the resume dispatcher runs bank
+    ingestion rather than the invoice finalize path.
+    """
+    pending_q = PendingAssignmentQuery(session=session, ca_firm_id=firm.id)
+    pending = await pending_q.create(
+        chat_id=chat_id,
+        file_ids=[file_id] if file_id else [],
+        candidate_client_ids=[c.id for c in active],
+        message_id=reply_to_message_id,
+        extraction={"transactions": bank_recon_runner.statement_to_payload(statement)},
+        extraction_document_type=_PENDING_KIND_BANK,
+    )
+    await session.commit()
+
+    sample = "\n".join("• " + safe_text(c.trade_name) for c in active[:10])
+    extra = "" if len(active) <= 10 else f"\n{italic(f'+ {len(active) - 10} more')}"
+    html = (
+        bold("Which client is this bank statement for?")
+        + f"\nI parsed {len(statement.transactions)} transactions. "
+        + "Just reply with the client's name and I'll reconcile it.\n"
+        + sample
+        + extra
+    )
+    try:
+        sent = await telegram.send_message(
+            chat_id=chat_id,
+            html_text=html,
+            reply_to_message_id=reply_to_message_id,
+        )
+        prompt_id = sent.get("message_id") if isinstance(sent, dict) else None
+        if isinstance(prompt_id, int):
+            await pending_q.attach_prompt_message(pending.id, prompt_id)
+            await session.commit()
+    except telegram.TelegramAPIError as exc:
+        _log.error("bank_pending_prompt_send_failed", error=str(exc))
 
 
 async def _finalize_and_summarise(
@@ -1031,6 +1118,27 @@ async def _resume_pipeline_for_pending_assignment(
         await _send_user_error(
             chat_id,
             "I couldn't find the routed client. Please re-upload the document.",
+        )
+        return
+
+    # Bank-statement hold (ADR-016): the parsed transactions ride on the
+    # pending row, so resume re-runs bank ingestion for the resolved client
+    # with no re-download. Must precede the invoice paths below — they would
+    # mis-handle the bank payload as a cached document extraction — and the
+    # file_ids guard, since bank resume needs no file at all.
+    if row.extraction_document_type == _PENDING_KIND_BANK and isinstance(
+        row.extraction, dict
+    ):
+        statement = bank_recon_runner.statement_from_payload(
+            row.extraction.get("transactions", [])
+        )
+        await _bank_ingest_for_client(
+            session=session,
+            firm=firm,
+            client=client,
+            statement=statement,
+            chat_id=chat_id,
+            reply_to_message_id=row.message_id,
         )
         return
 

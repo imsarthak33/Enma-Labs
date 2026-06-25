@@ -26,7 +26,7 @@ from app.db.queries.documents import DocumentQuery
 from app.db.queries.outcome_units import OutcomeUnitQuery
 from app.logging_setup import get_logger
 from app.services import telegram
-from app.services.bank_import import BankTxn
+from app.services.bank_import import BankTxn, ParsedBankStatement
 from app.services.bank_recon import (
     PurchaseForPayment,
     build_bank_recon_csv,
@@ -37,6 +37,8 @@ from app.utils.decimal_utils import ZERO, parse_money
 __all__ = [
     "BankReconDelivery",
     "bank_reconcile_and_deliver",
+    "statement_from_payload",
+    "statement_to_payload",
     "txns_from_brain",
     "txns_to_brain_rows",
 ]
@@ -116,6 +118,42 @@ async def _purchases_for_payment(
             )
         )
     return out
+
+
+def statement_to_payload(statement: ParsedBankStatement) -> list[dict[str, Any]]:
+    """Serialise a parsed statement to JSON rows (for a pending-assignment hold).
+
+    Lets an un-routed bank-statement upload park its already-parsed
+    transactions on the pending row, so a later "which client?" reply can
+    resume ingestion without re-downloading or re-parsing the file.
+    """
+    return [
+        {
+            "date": t.txn_date.isoformat(),
+            "narration": t.narration,
+            "amount": str(t.amount),
+            "direction": t.direction,
+        }
+        for t in statement.transactions
+    ]
+
+
+def statement_from_payload(rows: list[dict[str, Any]]) -> ParsedBankStatement:
+    """Rebuild a parsed statement from :func:`statement_to_payload` JSON rows."""
+    txns: list[BankTxn] = []
+    for r in rows:
+        d = _parse_iso_date(r.get("date"))
+        if d is None:
+            continue
+        txns.append(
+            BankTxn(
+                txn_date=d,
+                narration=str(r.get("narration") or ""),
+                amount=_money(r.get("amount")),
+                direction=str(r.get("direction") or "debit"),
+            )
+        )
+    return ParsedBankStatement(transactions=tuple(txns))
 
 
 def txns_to_brain_rows(

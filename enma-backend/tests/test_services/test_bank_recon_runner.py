@@ -15,7 +15,32 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services import bank_recon_runner
+from app.services.bank_import import BankTxn, ParsedBankStatement
 from app.services.bank_recon import PurchaseForPayment
+
+
+def test_statement_payload_round_trip() -> None:
+    stmt = ParsedBankStatement(
+        transactions=(
+            BankTxn(
+                txn_date=date(2026, 1, 2),
+                narration="TO TRANSFER GOLDEN THREAD",
+                amount=Decimal("51000.00"),
+                direction="debit",
+            ),
+            BankTxn(
+                txn_date=date(2026, 1, 5),
+                narration="CASH DEPOSIT SELF",
+                amount=Decimal("12000.00"),
+                direction="credit",
+            ),
+        )
+    )
+    payload = bank_recon_runner.statement_to_payload(stmt)
+    assert payload[0]["amount"] == "51000.00"
+    assert payload[0]["direction"] == "debit"
+    rebuilt = bank_recon_runner.statement_from_payload(payload)
+    assert rebuilt == stmt  # frozen dataclasses → value-equal after a round trip
 
 
 def _firm() -> SimpleNamespace:
