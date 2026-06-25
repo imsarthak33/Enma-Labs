@@ -118,7 +118,7 @@ warn_unreachable = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["pgvector.*", "testcontainers.*", "aiosqlite.*"]
+module = ["pgvector.*", "testcontainers.*", "aiosqlite.*", "pymupdf.*"]
 ignore_missing_imports = true
 
 # ---------------------------------------------------------------------------

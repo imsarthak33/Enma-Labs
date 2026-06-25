@@ -85,6 +85,7 @@ from app.identity.resolver import (
 from app.logging_setup import get_logger
 from app.services import (
     bank_import,
+    bank_pdf_import,
     bank_recon_runner,
     gstr2b_import,
     recon_runner,
@@ -106,7 +107,7 @@ _log = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
-async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PLR0911, PLR0915
+async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PLR0911, PLR0912, PLR0915
     """Background task for a single document envelope (R2 — extract-first).
 
     The autonomous-routing flow:
@@ -189,17 +190,59 @@ async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PL
             )
             return
 
-        # ---- Step 2a'': Bank statement CSV? (TA-2 phase 2 — 180-day leg) -
+        # ---- Step 2a'': Bank statement? (TA-2 phase 2 — 180-day leg) ----
         # A bank statement is the payment leg. Ingest debits to brain_events
-        # and run the 180-day ITC-reversal recon (ADR-016). Bank CSVs carry
-        # no client identifier, so routing relies on the caption.
+        # and run the 180-day ITC-reversal recon (ADR-016). Two ingress
+        # formats: the bank's CSV export, and the far more common PDF
+        # e-statement (parsed from its text layer, never OCR). Bank
+        # statements carry no client identifier, so routing relies on the
+        # caption.
         if bank_import.looks_like_bank_csv(file_bytes):
+            try:
+                statement = bank_import.parse_bank_statement(file_bytes)
+            except bank_import.BankStatementParseError as exc:
+                _log.warning(
+                    "bank_statement_parse_failed",
+                    error=str(exc),
+                    chat_id=envelope.chat_id,
+                )
+                await _send_user_error(
+                    envelope.chat_id,
+                    "That looked like a bank statement but I couldn't read its "
+                    "columns. Export a CSV with Date, Narration, and Withdrawal/"
+                    "Deposit (or Debit/Credit) columns and try again.",
+                )
+                return
             await _run_bank_ingestion(
                 session=session,
                 firm=firm,
                 chat_id=envelope.chat_id,
                 reply_to_message_id=envelope.message_id,
-                file_bytes=file_bytes,
+                statement=statement,
+                caption=caption,
+            )
+            return
+
+        if bank_pdf_import.looks_like_bank_pdf(file_bytes):
+            try:
+                statement = bank_pdf_import.parse_bank_pdf(file_bytes)
+            except bank_import.BankStatementParseError as exc:
+                _log.warning(
+                    "bank_pdf_parse_failed", error=str(exc), chat_id=envelope.chat_id
+                )
+                await _send_user_error(
+                    envelope.chat_id,
+                    "That looked like a bank statement PDF but I couldn't read its "
+                    "transactions. If it's a scanned image, please send the bank's "
+                    "digital PDF or a CSV export instead.",
+                )
+                return
+            await _run_bank_ingestion(
+                session=session,
+                firm=firm,
+                chat_id=envelope.chat_id,
+                reply_to_message_id=envelope.message_id,
+                statement=statement,
                 caption=caption,
             )
             return
@@ -592,27 +635,17 @@ async def _run_bank_ingestion(
     firm: CaFirm,
     chat_id: int,
     reply_to_message_id: int | None,
-    file_bytes: bytes,
+    statement: bank_import.ParsedBankStatement,
     caption: str | None,
 ) -> None:
-    """Parse an uploaded bank statement, ingest debits, run 180-day recon.
+    """Ingest a parsed bank statement's debits and run the 180-day recon.
 
-    Bank CSVs carry no client identifier, so we route by the upload caption
-    (fuzzy-matched to a client); if the firm has exactly one active client
-    we use it; otherwise we ask which client it's for (ADR-016).
+    The statement has already been parsed from its source format (CSV
+    export or PDF e-statement). Bank statements carry no client identifier,
+    so we route by the upload caption (fuzzy-matched to a client); if the
+    firm has exactly one active client we use it; otherwise we ask which
+    client it's for (ADR-016).
     """
-    try:
-        statement = bank_import.parse_bank_statement(file_bytes)
-    except bank_import.BankStatementParseError as exc:
-        _log.warning("bank_statement_parse_failed", error=str(exc), chat_id=chat_id)
-        await _send_user_error(
-            chat_id,
-            "That looked like a bank statement but I couldn't read its "
-            "columns. Export a CSV with Date, Narration, and Withdrawal/"
-            "Deposit (or Debit/Credit) columns and try again.",
-        )
-        return
-
     clients_q = ClientQuery(session=session, ca_firm_id=firm.id)
     client = await _resolve_tally_client(
         session=session, firm=firm, company_name="", caption=caption
