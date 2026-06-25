@@ -61,9 +61,10 @@ class OutcomeUnit(Base):
         String(40),
         nullable=False,
         comment=(
-            "itc_recovered_inr | filed_return | drafted_notice | "
-            "reconciled_period | invoice_processed | liaison_message_sent | "
-            "tally_export_generated | client_ledger_exported"
+            "itc_recovered_inr | itc_reversal_risk_inr | filed_return | "
+            "drafted_notice | reconciled_period | invoice_processed | "
+            "liaison_message_sent | tally_export_generated | "
+            "client_ledger_exported"
         ),
     )
     quantity: Mapped[Decimal] = mapped_column(

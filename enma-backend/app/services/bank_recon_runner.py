@@ -23,6 +23,7 @@ from app.db.models.client import Client
 from app.db.models.firm import CaFirm
 from app.db.queries.brain_events import BrainEventQuery
 from app.db.queries.documents import DocumentQuery
+from app.db.queries.outcome_units import OutcomeUnitQuery
 from app.logging_setup import get_logger
 from app.services import telegram
 from app.services.bank_import import BankTxn
@@ -188,6 +189,25 @@ async def bank_reconcile_and_deliver(
     result = reconcile_payments(
         purchases=purchases, debits=debits, as_of=datetime.now(UTC).date()
     )
+
+    # Outcome unit — the bank leg's Track-A pricing hook (TA-1). The
+    # 180-day reversal-risk rupee figure is the billable signal this recon
+    # surfaces; without it the bank leg produced no trace the outcome meter
+    # could see. Confidence is < 1.0 because bank matching is advisory (the
+    # narration carries no invoice number — "no payment found" is not proof).
+    if result.reversal_risk_itc > ZERO:
+        outcomes_q = OutcomeUnitQuery(session=session, ca_firm_id=firm.id)
+        await outcomes_q.record(
+            kind="itc_reversal_risk_inr",
+            quantity=result.reversal_risk_itc,
+            client_id=client.id,
+            confidence=Decimal("0.7"),
+            metadata={
+                "unpaid_over_180_count": result.unpaid_over_180_count,
+                "basis": "no_payment_within_180_days",
+            },
+        )
+        await session.commit()
 
     csv_bytes = build_bank_recon_csv(result=result, client_name=client.trade_name)
     filename = f"bank_recon_{_slug(client.trade_name)}.csv"

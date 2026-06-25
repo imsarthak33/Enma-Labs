@@ -47,13 +47,14 @@ class ReconRunQuery(BaseQuery):
         )
         return cast(ReconciliationRun, await self._insert(row))
 
-    async def list_recent(self, *, limit: int = 25) -> Sequence[ReconciliationRun]:
-        """Most-recent recon runs for this firm."""
-        stmt = (
-            self._scoped_select(ReconciliationRun)
-            .order_by(ReconciliationRun.created_at.desc())
-            .limit(limit)
-        )
+    async def list_recent(
+        self, *, limit: int = 25, client_id: uuid.UUID | None = None
+    ) -> Sequence[ReconciliationRun]:
+        """Most-recent recon runs for this firm, optionally one client only."""
+        stmt = self._scoped_select(ReconciliationRun)
+        if client_id is not None:
+            stmt = stmt.where(ReconciliationRun.client_id == client_id)
+        stmt = stmt.order_by(ReconciliationRun.created_at.desc()).limit(limit)
         return await self._fetch_all(stmt)
 
 

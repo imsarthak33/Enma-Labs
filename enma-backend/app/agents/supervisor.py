@@ -50,6 +50,8 @@ from app.db.queries.brain_events import BrainEventQuery
 from app.db.queries.clients import ClientQuery
 from app.db.queries.documents import DocumentQuery
 from app.db.queries.filings import FilingQuery
+from app.db.queries.outcome_units import OutcomeUnitQuery
+from app.db.queries.reconciliation_runs import ReconRunQuery
 from app.db.queries.rules import RuleQuery
 from app.db.queries.tally_exports import TallyExportQuery
 from app.db.queries.tasks import TaskQuery
@@ -1613,6 +1615,75 @@ async def _tool_reconcile_bank(
 
 
 # ---------------------------------------------------------------------------
+# TA-1 — outcome_summary: the Track-A outcome meter (read-only).
+#
+# Surfaces the billable / at-risk rupees Enma has already produced: lifetime
+# recovered ITC and 180-day reversal-risk ITC (summed from outcome_units —
+# the model's own SUM(quantity) WHERE kind = ? meter), plus the recent
+# reconciliation runs with their period-level recoverable / at-risk figures.
+# Pure read; no delivery, no mutation. ADR-015 / ADR-016 wrote the rows; this
+# closes the loop "recon ran -> here is the billable value".
+# ---------------------------------------------------------------------------
+
+
+async def _tool_outcome_summary(
+    ctx: SupervisorContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Summarise the billable / at-risk ITC outcomes Enma has produced.
+
+    Firm-wide by default; pass client_id OR client_name to scope to one
+    client. Returns lifetime recovered + reversal-risk ITC totals and the
+    most-recent reconciliation runs (period, recoverable, at-risk, counts).
+    At-risk ITC is point-in-time per run (it shrinks as suppliers file), so
+    it is shown per period, not summed into a lifetime total.
+    """
+    client = None
+    if args.get("client_id") or args.get("client_name"):
+        client = await _resolve_client_from_args(ctx, args)
+    client_id = client.id if client is not None else None
+
+    outcomes_q = OutcomeUnitQuery(session=ctx.session, ca_firm_id=ctx.ca_firm_id)
+    recovered = await outcomes_q.sum_by_kind(
+        kind="itc_recovered_inr", client_id=client_id
+    )
+    reversal_risk = await outcomes_q.sum_by_kind(
+        kind="itc_reversal_risk_inr", client_id=client_id
+    )
+    periods_reconciled = await outcomes_q.sum_by_kind(
+        kind="reconciled_period", client_id=client_id
+    )
+
+    runs_q = ReconRunQuery(session=ctx.session, ca_firm_id=ctx.ca_firm_id)
+    runs = await runs_q.list_recent(limit=12, client_id=client_id)
+    recent_runs = [
+        {
+            "month": r.filing_period_month,
+            "year": r.filing_period_year,
+            "matched": r.matched_count,
+            "amount_mismatch": r.amount_mismatch_count,
+            "in_books_not_in_2b": r.in_books_not_in_2b_count,
+            "in_2b_not_in_books": r.in_2b_not_in_books_count,
+            "recoverable_itc": str(r.recoverable_itc),
+            "at_risk_itc": str(r.at_risk_itc),
+        }
+        for r in runs
+    ]
+
+    return {
+        "scope": client.trade_name if client is not None else "all clients",
+        "recovered_itc_total": str(recovered),
+        "reversal_risk_itc_total": str(reversal_risk),
+        "periods_reconciled": int(periods_reconciled),
+        "recent_runs": recent_runs,
+        "note": (
+            "recovered_itc_total and reversal_risk_itc_total are lifetime sums "
+            "of billable outcomes; at_risk_itc in each run is point-in-time "
+            "(it shrinks as suppliers file their returns)."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tax Knowledge Base — deterministic advice tools.
 #
 # Surface the GST 2.0 rate master and the Income Tax Act 2025 TDS map as
@@ -2126,6 +2197,34 @@ TOOLS: Final[dict[str, ToolSpec]] = {
             "additionalProperties": False,
         },
         runner=_tool_reconcile_itc,
+    ),
+    "outcome_summary": ToolSpec(
+        name="outcome_summary",
+        description=(
+            "Show the billable / recovered / at-risk value Enma has produced "
+            "for the firm (the Track-A outcome meter). Use when the CA asks "
+            "'how much ITC have we recovered', 'what is at risk', 'how much "
+            "do I need to reverse', 'show my outcomes / recovery this month', "
+            "'what has Enma found for client X', 'monthly recovery summary'. "
+            "Firm-wide by default; pass client_id OR client_name to scope to "
+            "one client. Returns lifetime recovered ITC and 180-day "
+            "reversal-risk ITC totals, the count of periods reconciled, and "
+            "the recent reconciliation runs with their period-level "
+            "recoverable / at-risk figures. Read-only — it reports figures "
+            "already on file; it does NOT run a reconciliation (use "
+            "reconcile_itc or reconcile_bank for that). Surface the recovered "
+            "and reversal-risk rupee totals; note that at-risk is "
+            "point-in-time per period, not a lifetime sum."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "client_id": {"type": "string"},
+                "client_name": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+        runner=_tool_outcome_summary,
     ),
     "query_brain": ToolSpec(
         name="query_brain",
