@@ -37,6 +37,8 @@ from app.db.queries.notifications import (
     CHASE_COOLDOWN_DAYS,
     NotificationQuery,
 )
+from app.db.queries.outcome_units import OutcomeUnitQuery
+from app.db.queries.reconciliation_runs import ReconRunQuery
 from app.db.queries.tasks import TaskQuery
 from app.db.session import get_sessionmaker
 from app.formatting.telegram_html import bold, code, italic, safe_text
@@ -44,6 +46,7 @@ from app.logging_setup import get_logger
 from app.services import scraper, telegram
 from app.utils.background import get_registry
 from app.utils.date_utils import FilingPeriod, now_ist
+from app.utils.decimal_utils import ZERO
 
 router = APIRouter(prefix="/worker/cron", tags=["cron"])
 
@@ -201,6 +204,70 @@ async def _chase_for_firm(firm: CaFirm, *, batch_cap: int = CLIENT_CHASE_BATCH_C
         await session.commit()
 
 
+async def _recon_report_for_firm(firm: CaFirm) -> None:
+    """Push a proactive monthly reconciliation digest to the firm admin.
+
+    Report-only (TA-1 + Track-A automation Phase 1): it summarises the
+    recovered / 180-day reversal-risk ITC already on file (``outcome_units``)
+    and each client's latest reconciliation run. It deliberately does NOT
+    re-run any reconciliation — that would re-bill outcome units and
+    re-deliver CSVs on a schedule. Clients (and firms) with no recon
+    activity are skipped so the digest is never empty noise.
+    """
+    if firm.admin_chat_id is None:
+        return  # firm hasn't linked a Telegram chat yet — no one to notify
+    factory = get_sessionmaker()
+    async with factory() as session:
+        clients_q = ClientQuery(session=session, ca_firm_id=firm.id)
+        outcomes_q = OutcomeUnitQuery(session=session, ca_firm_id=firm.id)
+        runs_q = ReconRunQuery(session=session, ca_firm_id=firm.id)
+        clients = list(await clients_q.list_active())
+
+        blocks: list[str] = []
+        firm_recovered = ZERO
+        firm_reversal = ZERO
+        for client in clients:
+            recovered = await outcomes_q.sum_by_kind(
+                kind="itc_recovered_inr", client_id=client.id
+            )
+            reversal = await outcomes_q.sum_by_kind(
+                kind="itc_reversal_risk_inr", client_id=client.id
+            )
+            recent = list(await runs_q.list_recent(limit=1, client_id=client.id))
+            if recovered <= ZERO and reversal <= ZERO and not recent:
+                continue  # no recon activity for this client — skip it
+            firm_recovered += recovered
+            firm_reversal += reversal
+            block = bold(safe_text(client.trade_name))
+            block += "\n  Recovered ITC: " + code(f"₹{recovered}")
+            if reversal > ZERO:
+                block += " · Reversal risk: " + code(f"₹{reversal}")
+            if recent:
+                r = recent[0]
+                block += (
+                    f"\n  Last recon {r.filing_period_month:02d}/{r.filing_period_year}: "
+                    + code(f"₹{r.recoverable_itc}")
+                    + " recoverable, "
+                    + code(f"₹{r.at_risk_itc}")
+                    + " at risk"
+                )
+            blocks.append(block)
+
+    if not blocks:
+        return  # nothing reconciled for this firm yet — stay quiet
+
+    header = bold("📊 Monthly reconciliation summary — " + safe_text(firm.firm_name))
+    header += "\n" + italic(now_ist().strftime("As of %d-%b-%Y"))
+    totals = "\n" + bold("Firm totals") + "\n  Recovered ITC: " + code(f"₹{firm_recovered}")
+    if firm_reversal > ZERO:
+        totals += " · Reversal risk: " + code(f"₹{firm_reversal}")
+    html = header + totals + "\n\n" + "\n\n".join(blocks)
+    try:
+        await telegram.send_message(chat_id=firm.admin_chat_id, html_text=html)
+    except telegram.TelegramAPIError as exc:
+        _log.warning("recon_report_send_failed", firm_id=str(firm.id), error=str(exc))
+
+
 # ---------------------------------------------------------------------------
 # Fan-out drivers
 # ---------------------------------------------------------------------------
@@ -242,6 +309,10 @@ async def _run_briefing(_envelope: DecodedEnvelope) -> None:
 
 async def _run_chase(_envelope: DecodedEnvelope) -> None:
     await _fanout(_chase_for_firm, label="client_chase")
+
+
+async def _run_recon_report(_envelope: DecodedEnvelope) -> None:
+    await _fanout(_recon_report_for_firm, label="monthly_recon")
 
 
 async def _run_idempotency_cleanup(_envelope: DecodedEnvelope) -> None:
@@ -333,11 +404,21 @@ async def cron_idempotency_cleanup(
     return await _process_cron(envelope, verdict, _run_idempotency_cleanup, "idempotency_cleanup")
 
 
+@router.post("/monthly-recon", summary="Cron — monthly reconciliation digest")
+async def cron_monthly_recon(
+    envelope: VerifiedCronEnvelopeDep,
+    verdict: IdempotencyCronDep,
+) -> Response:
+    _assert_kind(envelope, "cron_monthly_recon")
+    return await _process_cron(envelope, verdict, _run_recon_report, "monthly_recon")
+
+
 __all__ = [
     "CLIENT_CHASE_BATCH_CAP",
     "_briefing_for_firm",
     "_chase_for_firm",
     "_heartbeat_for_firm",
+    "_recon_report_for_firm",
     "router",
 ]
 

@@ -55,6 +55,14 @@ export const CRON_JOBS = Object.freeze([
     schedule: "0 2 * * *",
     description: "Daily prune of idempotency_log (72 h TTL).",
   },
+  {
+    // Track-A automation Phase 1 — monthly reconciliation digest. Fires on
+    // the 15th at 09:00 IST, the morning after GSTN generates GSTR-2B (14th),
+    // so the summary reflects the just-closed period's reconciliations.
+    kind: "cron_monthly_recon",
+    schedule: "30 3 15 * *",
+    description: "Monthly reconciliation digest, 15th 09:00 IST.",
+  },
 ]);
 
 /**
