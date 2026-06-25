@@ -66,6 +66,14 @@ __all__ = [
 # beyond this is a real arithmetic disagreement worth surfacing.
 _TOLERANCE_PAISA: Final[Decimal] = Decimal("1.00")
 
+# OCR mis-reads of the totals block pull a value that is far BELOW the real
+# total: a quantity column (7,240 SQFT vs ₹3,25,800), or one per-HSN tax row
+# (₹180 of a ₹4,383 total). When the observed value is below this fraction of
+# the computed total, treat it as a mis-read, not a genuine discrepancy.
+# Over-statements (observed >= computed) and small gaps always surface —
+# an inflated printed total is the direction actually worth worrying about.
+_OCR_MISREAD_FRACTION: Final[Decimal] = Decimal("0.25")
+
 # Regex set for parsing the totals-section labels we see in practice.
 # Labels are matched case-insensitively. The capture group is the rate.
 _RATE_RE: Final[re.Pattern[str]] = re.compile(r"(\d+(?:\.\d+)?)\s*%")
@@ -388,7 +396,26 @@ def _parse_observed_totals(observed: object) -> _ObservedSums:
 # ---------------------------------------------------------------------------
 
 
-def reconcile_extraction(extraction: dict[str, Any]) -> ReconciledInvoice:  # noqa: PLR0912, PLR0915
+def _is_real_discrepancy(observed: Decimal, computed: Decimal) -> bool:
+    """True when ``observed`` genuinely disagrees with ``computed``.
+
+    A discrepancy is real when it exceeds rounding tolerance, EXCEPT when the
+    observed value sits implausibly far below the computed total — the
+    signature of an OCR mis-read that pulled a quantity or a single per-HSN
+    tax row into the totals block. Over-statements and small gaps always
+    surface; only large under-statements (the under-capture pattern) are
+    suppressed, so genuine inflated totals and typos are still caught.
+    """
+    delta = abs(observed - computed)
+    if delta <= _TOLERANCE_PAISA:
+        return False  # within rounding tolerance — a match, not a discrepancy
+    # Implausibly low → OCR under-capture (a quantity / single tax row), not real.
+    return not (
+        computed > ZERO and observed < computed * (Decimal("1") - _OCR_MISREAD_FRACTION)
+    )
+
+
+def reconcile_extraction(extraction: dict[str, Any]) -> ReconciledInvoice:  # noqa: PLR0912
     """Compute canonical totals from an extraction. NEVER trust LLM math.
 
     See module docstring for the architectural rationale.
@@ -426,7 +453,11 @@ def reconcile_extraction(extraction: dict[str, Any]) -> ReconciledInvoice:  # no
     # otherwise trust line items and flag.
     canonical_taxable = line_items_taxable
     if observed.taxable is not None:
-        if abs(observed.taxable - line_items_taxable) > _TOLERANCE_PAISA:
+        if abs(observed.taxable - line_items_taxable) <= _TOLERANCE_PAISA:
+            # Within tolerance — adopt the observed value for its native
+            # precision (it carries the invoice's printed paisa).
+            canonical_taxable = observed.taxable
+        elif _is_real_discrepancy(observed.taxable, line_items_taxable):
             discrepancies.append(
                 ReconciliationIssue(
                     code="taxable_mismatch",
@@ -436,8 +467,8 @@ def reconcile_extraction(extraction: dict[str, Any]) -> ReconciledInvoice:  # no
                     ),
                 )
             )
-        else:
-            canonical_taxable = observed.taxable
+        # else: implausibly large gap → OCR mis-read; keep line-item total,
+        # don't cry wolf.
 
     # Cross-check the observed CGST / SGST / IGST sums (over all rate slices)
     # against the line-item per-bucket sums.
@@ -448,7 +479,7 @@ def reconcile_extraction(extraction: dict[str, Any]) -> ReconciledInvoice:  # no
     ):
         if observed_total is None:
             continue
-        if abs(observed_total - computed_total) > _TOLERANCE_PAISA:
+        if _is_real_discrepancy(observed_total, computed_total):
             discrepancies.append(
                 ReconciliationIssue(
                     code=f"{bucket.lower()}_mismatch",
@@ -462,7 +493,7 @@ def reconcile_extraction(extraction: dict[str, Any]) -> ReconciledInvoice:  # no
     canonical_grand = quantize_money(
         canonical_taxable + line_items_cgst + line_items_sgst + line_items_igst
     )
-    if observed.grand is not None and abs(observed.grand - canonical_grand) > _TOLERANCE_PAISA:
+    if observed.grand is not None and _is_real_discrepancy(observed.grand, canonical_grand):
         discrepancies.append(
             ReconciliationIssue(
                 code="grand_total_mismatch",

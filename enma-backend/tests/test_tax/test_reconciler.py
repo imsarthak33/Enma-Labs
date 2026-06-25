@@ -24,6 +24,7 @@ from decimal import Decimal
 import pytest
 from app.tax.reconciler import (
     ReconciledInvoice,
+    _is_real_discrepancy,
     reconcile_extraction,
 )
 
@@ -111,6 +112,119 @@ class TestReconcilerProductionRegression:
         assert result.grand_total == Decimal("9749.99") or result.grand_total == Decimal(
             "9750.00"
         )
+
+
+def _pranay_like() -> dict[str, object]:
+    """Single-line inter-state invoice whose grand-total row prints qty too.
+
+    Mirrors the real Pranay/Kota-Stone invoice: the extractor pulled the
+    quantity (7,240 SQFT) from the grand-total row instead of ₹3,25,800.
+    """
+    return {
+        "vendor": {"name": "Pranay Construction", "gstin": "08DWAPS3131P1Z4"},
+        "buyer": {"name": "S.S Traders", "gstin": "10CDVPS7198R1Z7"},
+        "invoice_number": "13/2025-26",
+        "invoice_date": "2026-03-23",
+        "line_items": [
+            {
+                "description": "KOTA STONE",
+                "hsn_sac": "2515",
+                "quantity": "7240",
+                "unit_price": "45",
+                "tax_amount": "15514.29",
+                "line_amount": "325800",
+                "igst_rate": "5",
+                "igst_amount": "15514.29",
+            }
+        ],
+        "observed_totals": [
+            {"label": "Taxable Amount", "amount": "310285.71"},
+            {"label": "IGST @5%", "amount": "15514.29"},
+            {"label": "Grand Total", "amount": "7240"},  # qty mis-read
+        ],
+    }
+
+
+def _municipal_like() -> dict[str, object]:
+    """Intra-state 18% invoice with a per-HSN totals table partially captured.
+
+    Mirrors the real Municipal invoice: the extractor grabbed one HSN row's
+    CGST (₹180 of ₹4,383.31) and a partial taxable (₹20,000 of ₹48,703.38).
+    """
+    return {
+        "vendor": {"name": "S.S Traders", "gstin": "10CDVPS7198R1Z7"},
+        "buyer": {"name": "Municipal Office", "gstin": "10ABCDE1234F1Z5"},
+        "invoice_number": "210",
+        "invoice_date": "2026-04-25",
+        "line_items": [
+            {
+                "description": "Electrical goods",
+                "hsn_sac": "8544",
+                "quantity": "1",
+                "unit_price": "48703.38",
+                "tax_amount": "8766.61",
+                "line_amount": "57469.99",
+                "cgst_rate": "9",
+                "sgst_rate": "9",
+            }
+        ],
+        "observed_totals": [
+            {"label": "Taxable Amount", "amount": "20000"},  # partial capture
+            {"label": "CGST @9%", "amount": "180"},  # one HSN row only
+            {"label": "SGST @9%", "amount": "180"},
+        ],
+    }
+
+
+class TestOcrMisreadSuppression:
+    """OCR column-confusion in observed totals must not raise false flags."""
+
+    def test_grand_total_qty_misread_not_flagged(self) -> None:
+        result = reconcile_extraction(_pranay_like())
+        codes = {d.code for d in result.discrepancies}
+        assert "grand_total_mismatch" not in codes
+        # Canonical math is still correct.
+        assert result.grand_total == Decimal("325800.00")
+
+    def test_partial_cgst_and_taxable_not_flagged(self) -> None:
+        result = reconcile_extraction(_municipal_like())
+        codes = {d.code for d in result.discrepancies}
+        assert "cgst_mismatch" not in codes
+        assert "sgst_mismatch" not in codes
+        assert "taxable_mismatch" not in codes
+        # Computed taxable from line math is authoritative.
+        assert result.taxable == Decimal("48703.38")
+
+    def test_small_genuine_discrepancy_still_flagged(self) -> None:
+        # A real printed-total error (₹50 off on a ₹9,750 invoice) is small
+        # relative to the total → it must STILL surface.
+        inv = _sudha_invoice()
+        inv["observed_totals"] = [
+            {"label": "Taxable Amount", "amount": "9285.71"},
+            {"label": "CGST @2.5%", "amount": "232.14"},
+            {"label": "SGST @2.5%", "amount": "232.14"},
+            {"label": "Total Amount", "amount": "9700"},  # ₹50 short — real
+        ]
+        result = reconcile_extraction(inv)
+        codes = {d.code for d in result.discrepancies}
+        assert "grand_total_mismatch" in codes
+
+
+class TestIsRealDiscrepancy:
+    """Unit coverage for the OCR-misread suppression helper."""
+
+    @pytest.mark.parametrize(
+        ("observed", "computed", "expected"),
+        [
+            (Decimal("7240"), Decimal("325800"), False),     # qty mis-read
+            (Decimal("180"), Decimal("4383.31"), False),     # partial tax row
+            (Decimal("20000"), Decimal("48703.38"), False),  # partial taxable
+            (Decimal("9700"), Decimal("9749.99"), True),     # real ₹50 error
+            (Decimal("9750"), Decimal("9749.99"), False),    # within tolerance
+        ],
+    )
+    def test_thresholds(self, observed: Decimal, computed: Decimal, expected: bool) -> None:
+        assert _is_real_discrepancy(observed, computed) is expected
 
     def test_clean_reconciliation_has_no_discrepancies(self) -> None:
         """When line items + observed totals agree, no discrepancies fire."""
