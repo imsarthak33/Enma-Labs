@@ -165,6 +165,17 @@ def _iso(d: date | None) -> str:
     return d.isoformat() if d is not None else ""
 
 
+def _in_2b_note(e: Gstr2bEntry) -> str:
+    """Per-line note for a 2B entry not found in the books."""
+    if e.note_type == "C":
+        return "Credit note in GSTR-2B — reduces ITC; reflect the reversal in your books."
+    if e.note_type == "D":
+        return "Debit note in GSTR-2B — additional ITC available."
+    if e.itc_available:
+        return "In GSTR-2B but not in your books — likely unclaimed ITC."
+    return "In GSTR-2B but ITC not available (check eligibility)."
+
+
 def reconcile(  # noqa: PLR0912 — matching/classification is inherently branchy
     *,
     invoices: list[InvoiceRecord],
@@ -275,6 +286,9 @@ def reconcile(  # noqa: PLR0912 — matching/classification is inherently branch
             continue
         in_2b_only += 1
         if e.itc_available:
+            # total_itc is signed: a credit note's negative tax nets the
+            # recoverable figure down (b2b-only overstated it by ignoring
+            # credit notes); a debit note adds.
             recoverable += e.total_itc
         lines.append(
             ReconLine(
@@ -285,11 +299,7 @@ def reconcile(  # noqa: PLR0912 — matching/classification is inherently branch
                 books_itc=None,
                 available_itc=e.total_itc,
                 delta=None,
-                note=(
-                    "In GSTR-2B but not in your books — likely unclaimed ITC."
-                    if e.itc_available
-                    else "In GSTR-2B but ITC not available (check eligibility)."
-                ),
+                note=_in_2b_note(e),
             )
         )
 

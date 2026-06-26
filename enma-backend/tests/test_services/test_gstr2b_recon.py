@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 from app.services.gstr2b_import import (
+    Gstr2bEntry,
     Gstr2bParseError,
     looks_like_gstr2b_json,
     parse_gstr2b,
@@ -187,3 +188,90 @@ def test_tolerance_one_rupee() -> None:
     entries = [_entry("INV-3", "09-08-2025", 1000, 90, 90)]  # 180.00
     r = reconcile(invoices=books, entries=entries)
     assert r.matched_count == 1
+
+
+# ── credit / debit notes (cdnr) ───────────────────────────────────────────
+
+
+def _cdnr_file(*notes: dict) -> bytes:
+    """Build a minimal GSTR-2B JSON with a cdnr section and no b2b."""
+    return json.dumps(
+        {
+            "data": {
+                "rtnprd": "082025",
+                "gstin": "27AABCC1234D1Z5",
+                "docdata": {
+                    "cdnr": [
+                        {
+                            "ctin": "29AAACW1234F1ZX",
+                            "trdnm": "Acme Supplies",
+                            "nt": list(notes),
+                        }
+                    ]
+                },
+            }
+        }
+    ).encode("utf-8")
+
+
+def _note(ntnum: str, dt: str, typ: str, txval: float, cgst: float, sgst: float) -> dict:
+    return {
+        "ntnum": ntnum,
+        "nt_dt": dt,
+        "typ": typ,
+        "val": txval + cgst + sgst,
+        "itcavl": "Y",
+        "items": [{"rt": 18, "txval": txval, "igst": 0, "cgst": cgst, "sgst": sgst, "cess": 0}],
+    }
+
+
+def test_parse_credit_note_is_signed_negative() -> None:
+    parsed = parse_gstr2b(_cdnr_file(_note("CN-1", "20-08-2025", "C", 1000.0, 90.0, 90.0)))
+    assert len(parsed.entries) == 1
+    e = parsed.entries[0]
+    assert e.note_type == "C"
+    assert e.cgst == Decimal("-90.00")
+    assert e.total_itc == Decimal("-180.00")  # credit note reduces ITC
+    assert e.invoice_value == Decimal("-1180.00")
+
+
+def test_parse_debit_note_is_signed_positive() -> None:
+    parsed = parse_gstr2b(_cdnr_file(_note("DN-1", "21-08-2025", "D", 500.0, 45.0, 45.0)))
+    e = parsed.entries[0]
+    assert e.note_type == "D"
+    assert e.total_itc == Decimal("90.00")  # debit note adds ITC
+
+
+def test_b2b_and_cdnr_parse_together() -> None:
+    # A file with both sections: parse_gstr2b reads b2b then cdnr.
+    raw = json.loads(_two_b(_inv("INV-1", "17-08-2025", 1000.0, 90.0, 90.0)))
+    raw["data"]["docdata"]["cdnr"] = [
+        {
+            "ctin": "29AAACW1234F1ZX",
+            "trdnm": "Acme Supplies",
+            "nt": [_note("CN-9", "18-08-2025", "C", 100.0, 9.0, 9.0)],
+        }
+    ]
+    parsed = parse_gstr2b(json.dumps(raw).encode("utf-8"))
+    kinds = sorted((e.note_type or "INV") for e in parsed.entries)
+    assert kinds == ["C", "INV"]
+
+
+def test_cdnr_payload_round_trip_preserves_sign_and_type() -> None:
+    e = parse_gstr2b(_cdnr_file(_note("CN-2", "20-08-2025", "C", 1000.0, 90.0, 90.0))).entries[0]
+    rebuilt = Gstr2bEntry.from_payload(e.to_payload())
+    assert rebuilt.note_type == "C"
+    assert rebuilt.total_itc == Decimal("-180.00")
+    assert rebuilt.dedup_key == e.dedup_key  # key stable across the round trip
+
+
+def test_recon_credit_note_nets_down_recoverable() -> None:
+    # An unclaimed invoice (+180) and an unreflected credit note (-90) for the
+    # same supplier → net recoverable is 90, not 180.
+    entries = [
+        _entry("INV-1", "17-08-2025", 1000.0, 90.0, 90.0),
+        parse_gstr2b(_cdnr_file(_note("CN-1", "18-08-2025", "C", 500.0, 45.0, 45.0))).entries[0],
+    ]
+    r = reconcile(invoices=[], entries=entries)
+    assert r.in_2b_not_in_books_count == 2
+    assert r.recoverable_itc == Decimal("90.00")  # 180 - 90

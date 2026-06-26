@@ -5,12 +5,15 @@ portal (a JSON file) and uploads it to Enma. This module parses that
 JSON into normalised supplier-invoice entries that the reconciliation
 engine matches against the client's books (the ``documents`` table).
 
-Scope (MVP)
------------
-We parse the ``b2b`` section — regular supplier invoices, which carry the
-bulk of input-tax credit. Credit/debit notes (``cdnr``) and amendments
-(``b2ba``/``cdnra``) are a fast follow; the parser ignores unknown
-sections rather than failing.
+Scope
+-----
+We parse the ``b2b`` section (regular supplier invoices) and the ``cdnr``
+section (credit/debit notes received). A **credit note** reduces available
+ITC and a **debit note** increases it, so note taxes are stored *signed*
+(credit → negative) and flow through the recon's available-ITC math
+correctly — b2b-only silently overstated recoverable ITC by ignoring credit
+notes. Amendments (``b2ba``/``cdnra``) remain a fast follow; the parser
+ignores unknown sections rather than failing.
 
 Determinism + safety
 --------------------
@@ -68,10 +71,15 @@ class Gstr2bEntry:
     cess: Decimal
     itc_available: bool
     dedup_key: str
+    note_type: str | None = None  # None=invoice | 'C'=credit note | 'D'=debit note
 
     @property
     def total_itc(self) -> Decimal:
-        """Total credit on this invoice (IGST + CGST + SGST + cess)."""
+        """Net credit on this line (IGST + CGST + SGST + cess).
+
+        Already signed: a credit note's tax fields are negative, so the sum
+        is the *net* ITC effect (reduction) of the line.
+        """
         return self.igst + self.cgst + self.sgst + self.cess
 
     @classmethod
@@ -80,6 +88,8 @@ class Gstr2bEntry:
         supplier_gstin = str(payload.get("supplier_gstin") or "").strip().upper()
         invoice_number = str(payload.get("invoice_number") or "").strip()
         inv_date = _parse_2b_date(payload.get("invoice_date"))
+        raw_note = payload.get("note_type")
+        note_type = str(raw_note).strip().upper() if raw_note else None
         return cls(
             supplier_gstin=supplier_gstin,
             supplier_name=str(payload.get("supplier_name") or ""),
@@ -92,7 +102,10 @@ class Gstr2bEntry:
             sgst=_money(payload.get("sgst")),
             cess=_money(payload.get("cess")),
             itc_available=bool(payload.get("itc_available", True)),
-            dedup_key=_content_key(supplier_gstin, invoice_number, inv_date.isoformat()),
+            dedup_key=_content_key(
+                supplier_gstin, invoice_number, inv_date.isoformat(), note_type
+            ),
+            note_type=note_type,
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -110,6 +123,7 @@ class Gstr2bEntry:
             "cess": str(self.cess),
             "total_itc": str(self.total_itc),
             "itc_available": self.itc_available,
+            "note_type": self.note_type,
         }
 
 
@@ -143,10 +157,48 @@ def _parse_2b_date(raw: Any) -> date:
     raise Gstr2bParseError(f"unparseable GSTR-2B date: {raw!r}")
 
 
-def _content_key(supplier_gstin: str, invoice_number: str, iso_date: str) -> str:
-    """Same natural-key hash the documents table uses (gstin|invno|date)."""
+def _content_key(
+    supplier_gstin: str,
+    invoice_number: str,
+    iso_date: str,
+    note_type: str | None = None,
+) -> str:
+    """Natural-key hash (gstin|invno|date), the same the documents table uses.
+
+    A credit/debit note carries its own ``note_type`` segment so a note and
+    an invoice that happen to share (gstin, number, date) never collide.
+    """
     payload = f"{supplier_gstin.strip().upper()}|{invoice_number.strip().upper()}|{iso_date}"
+    if note_type:
+        payload += f"|{note_type}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _extract_taxes(obj: dict[str, Any]) -> tuple[Decimal, Decimal, Decimal, Decimal, Decimal]:
+    """Pull (taxable, igst, cgst, sgst, cess) from a 2B invoice/note object.
+
+    Real GSTN exports carry the consolidated tax fields directly on the
+    object; some variants nest them in an item array (``items``/``itms``).
+    Prefer the item array when present and non-empty, else the object level.
+    """
+    items = obj.get("items") or obj.get("itms")
+    taxable = igst = cgst = sgst = cess = ZERO
+    if isinstance(items, list) and items:
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            taxable += _money(it.get("txval"))
+            igst += _money(it.get("igst"))
+            cgst += _money(it.get("cgst"))
+            sgst += _money(it.get("sgst"))
+            cess += _money(it.get("cess"))
+    else:
+        taxable = _money(obj.get("txval"))
+        igst = _money(obj.get("igst"))
+        cgst = _money(obj.get("cgst"))
+        sgst = _money(obj.get("sgst"))
+        cess = _money(obj.get("cess"))
+    return taxable, igst, cgst, sgst, cess
 
 
 def _load_root(raw: bytes) -> dict[str, Any]:
@@ -184,10 +236,12 @@ def looks_like_gstr2b_json(raw: bytes) -> bool:
         text = raw[:8192].decode("utf-8", errors="replace").lower()
     except Exception:
         return False
-    return "docdata" in text and ("rtnprd" in text or '"b2b"' in text)
+    return "docdata" in text and (
+        "rtnprd" in text or '"b2b"' in text or '"cdnr"' in text
+    )
 
 
-def parse_gstr2b(raw: bytes) -> ParsedGstr2b:  # noqa: PLR0912 — defensive parsing is branchy
+def parse_gstr2b(raw: bytes) -> ParsedGstr2b:
     """Parse a GSTR-2B JSON export into normalised supplier entries.
 
     Raises :class:`Gstr2bParseError` when the bytes are not a GSTR-2B
@@ -196,19 +250,34 @@ def parse_gstr2b(raw: bytes) -> ParsedGstr2b:  # noqa: PLR0912 — defensive par
     root = _load_root(raw)
     docdata, recipient_gstin, return_period = _docdata(root)
 
-    b2b = docdata.get("b2b")
-    if not isinstance(b2b, list):
-        raise Gstr2bParseError("no b2b section in docdata")
-
     entries: list[Gstr2bEntry] = []
+    _parse_b2b(docdata.get("b2b"), entries)
+    _parse_cdnr(docdata.get("cdnr"), entries)
+
+    if not entries:
+        raise Gstr2bParseError(
+            "GSTR-2B had no parseable b2b invoices or credit/debit notes"
+        )
+
+    return ParsedGstr2b(
+        recipient_gstin=recipient_gstin,
+        return_period=return_period,
+        entries=tuple(entries),
+    )
+
+
+def _parse_b2b(b2b: Any, out: list[Gstr2bEntry]) -> None:
+    """Parse the b2b (regular supplier invoice) section into ``out``."""
+    if not isinstance(b2b, list):
+        return
     for supplier in b2b:
         if not isinstance(supplier, dict):
             continue
         ctin = str(supplier.get("ctin") or "").strip().upper()
-        trade_name = str(supplier.get("trdnm") or "").strip()
         invoices = supplier.get("inv")
         if not ctin or not isinstance(invoices, list):
             continue
+        trade_name = str(supplier.get("trdnm") or "").strip()
         for inv in invoices:
             if not isinstance(inv, dict):
                 continue
@@ -219,29 +288,9 @@ def parse_gstr2b(raw: bytes) -> ParsedGstr2b:  # noqa: PLR0912 — defensive par
                 inv_date = _parse_2b_date(inv.get("dt"))
             except Gstr2bParseError:
                 continue
-            # Real GSTN b2b exports carry the consolidated tax fields
-            # directly on the invoice object. Some variants nest them in an
-            # item array (``items``/``itms``) — prefer that when present and
-            # non-empty, else fall back to the invoice-level figures.
-            items = inv.get("items") or inv.get("itms")
-            taxable = igst = cgst = sgst = cess = ZERO
-            if isinstance(items, list) and items:
-                for it in items:
-                    if not isinstance(it, dict):
-                        continue
-                    taxable += _money(it.get("txval"))
-                    igst += _money(it.get("igst"))
-                    cgst += _money(it.get("cgst"))
-                    sgst += _money(it.get("sgst"))
-                    cess += _money(it.get("cess"))
-            else:
-                taxable = _money(inv.get("txval"))
-                igst = _money(inv.get("igst"))
-                cgst = _money(inv.get("cgst"))
-                sgst = _money(inv.get("sgst"))
-                cess = _money(inv.get("cess"))
+            taxable, igst, cgst, sgst, cess = _extract_taxes(inv)
             iso = inv_date.isoformat()
-            entries.append(
+            out.append(
                 Gstr2bEntry(
                     supplier_gstin=ctin,
                     supplier_name=trade_name,
@@ -258,11 +307,54 @@ def parse_gstr2b(raw: bytes) -> ParsedGstr2b:  # noqa: PLR0912 — defensive par
                 )
             )
 
-    if not entries:
-        raise Gstr2bParseError("GSTR-2B b2b section had no parseable invoices")
 
-    return ParsedGstr2b(
-        recipient_gstin=recipient_gstin,
-        return_period=return_period,
-        entries=tuple(entries),
-    )
+def _parse_cdnr(cdnr: Any, out: list[Gstr2bEntry]) -> None:
+    """Parse the cdnr (credit/debit notes received) section into ``out``.
+
+    A credit note (``typ='C'``) reduces ITC, a debit note (``typ='D'``)
+    increases it — so the note's money fields are stored *signed* (credit
+    negated). Field names vary across portal versions; we accept the common
+    aliases (``ntnum``/``nt_num``, ``nt_dt``/``ntdt``, ``typ``/``ntty``).
+    """
+    if not isinstance(cdnr, list):
+        return
+    for supplier in cdnr:
+        if not isinstance(supplier, dict):
+            continue
+        ctin = str(supplier.get("ctin") or "").strip().upper()
+        notes = supplier.get("nt")
+        if not ctin or not isinstance(notes, list):
+            continue
+        trade_name = str(supplier.get("trdnm") or "").strip()
+        for nt in notes:
+            if not isinstance(nt, dict):
+                continue
+            ntnum = str(nt.get("ntnum") or nt.get("nt_num") or nt.get("inum") or "").strip()
+            if not ntnum:
+                continue
+            try:
+                nt_date = _parse_2b_date(nt.get("nt_dt") or nt.get("ntdt") or nt.get("dt"))
+            except Gstr2bParseError:
+                continue
+            typ = str(nt.get("typ") or nt.get("ntty") or "C").strip().upper()
+            typ = "D" if typ.startswith("D") else "C"
+            sign = Decimal("1") if typ == "D" else Decimal("-1")
+            taxable, igst, cgst, sgst, cess = _extract_taxes(nt)
+            iso = nt_date.isoformat()
+            out.append(
+                Gstr2bEntry(
+                    supplier_gstin=ctin,
+                    supplier_name=trade_name,
+                    invoice_number=ntnum,
+                    invoice_date=nt_date,
+                    invoice_value=_money(nt.get("val")) * sign,
+                    taxable=taxable * sign,
+                    igst=igst * sign,
+                    cgst=cgst * sign,
+                    sgst=sgst * sign,
+                    cess=cess * sign,
+                    itc_available=str(nt.get("itcavl") or "Y").strip().upper() != "N",
+                    dedup_key=_content_key(ctin, ntnum, iso, typ),
+                    note_type=typ,
+                )
+            )
