@@ -63,6 +63,7 @@ ALLOWED_KINDS: Final[frozenset[str]] = frozenset(
         "cron_client_chase",
         "cron_idempotency_cleanup",
         "cron_monthly_recon",
+        "cron_email_ingest",
     }
 )
 # Phase 7 — gateway-driven cron kinds. Verified by ``verify_cron_envelope``
@@ -75,6 +76,7 @@ CRON_KINDS: Final[frozenset[str]] = frozenset(
         "cron_client_chase",
         "cron_idempotency_cleanup",
         "cron_monthly_recon",
+        "cron_email_ingest",
     }
 )
 

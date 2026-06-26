@@ -25,8 +25,9 @@ from app.api.middleware.envelope_verify import (
     VerifiedCronEnvelopeDep,
 )
 from app.api.middleware.idempotency import IdempotencyCronDep, IdempotencyVerdict
+from app.config import settings
 from app.db.models.firm import CaFirm
-from app.db.queries.clients import ClientQuery
+from app.db.queries.clients import ClientQuery, find_client_with_firm
 from app.db.queries.documents import DocumentQuery
 from app.db.queries.firms import list_all_firms
 from app.db.queries.idempotency import (
@@ -43,7 +44,8 @@ from app.db.queries.tasks import TaskQuery
 from app.db.session import get_sessionmaker
 from app.formatting.telegram_html import bold, code, italic, safe_text
 from app.logging_setup import get_logger
-from app.services import scraper, telegram
+from app.services import auto_ingest, scraper, telegram
+from app.services.providers.email_ingest import get_email_ingest_client
 from app.utils.background import get_registry
 from app.utils.date_utils import FilingPeriod, now_ist
 from app.utils.decimal_utils import ZERO
@@ -315,6 +317,65 @@ async def _run_recon_report(_envelope: DecodedEnvelope) -> None:
     await _fanout(_recon_report_for_firm, label="monthly_recon")
 
 
+async def _run_email_ingest(_envelope: DecodedEnvelope) -> None:
+    """Poll the bank-statement mailbox and auto-ingest each attachment (P7a).
+
+    Not a per-firm fan-out: one shared mailbox receives every client's mail,
+    each routed to its client by the per-client ingest address
+    (``client-<uuid>@…``). Dormant when no IMAP credentials are configured —
+    the provider factory returns a no-op client. One bad attachment never
+    sinks the rest.
+    """
+    email_client = get_email_ingest_client(settings)
+    if not email_client.is_configured:
+        _log.info("email_ingest_skipped_unconfigured")
+        return
+    try:
+        attachments = await email_client.fetch_statements()
+    except Exception as exc:  # — a mailbox/IMAP failure must not crash the cron
+        _log.error("email_ingest_fetch_failed", error=str(exc))
+        return
+    if not attachments:
+        return
+    _log.info("email_ingest_fetched", count=len(attachments))
+
+    factory = get_sessionmaker()
+    async with factory() as session:
+        for att in attachments:
+            client_id = att.client_id
+            if client_id is None:
+                _log.warning(
+                    "email_ingest_unrouted", filename=att.filename, sender=att.sender
+                )
+                continue
+            resolved = await find_client_with_firm(session, client_id)
+            if resolved is None:
+                _log.warning("email_ingest_unknown_client", client_id=str(client_id))
+                continue
+            client, firm = resolved
+            try:
+                result = await auto_ingest.ingest_bank_statement_bytes(
+                    session=session,
+                    firm=firm,
+                    client=client,
+                    file_bytes=att.content,
+                    filename=att.filename,
+                )
+                _log.info(
+                    "email_ingest_processed",
+                    client_id=str(client_id),
+                    filename=att.filename,
+                    ingested=result.ingested,
+                )
+            except Exception as exc:  # — one bad attachment must not sink the rest
+                _log.error(
+                    "email_ingest_item_failed",
+                    client_id=str(client_id),
+                    filename=att.filename,
+                    error=str(exc),
+                )
+
+
 async def _run_idempotency_cleanup(_envelope: DecodedEnvelope) -> None:
     """Daily prune of ``idempotency_log`` entries older than 72 hours.
 
@@ -411,6 +472,15 @@ async def cron_monthly_recon(
 ) -> Response:
     _assert_kind(envelope, "cron_monthly_recon")
     return await _process_cron(envelope, verdict, _run_recon_report, "monthly_recon")
+
+
+@router.post("/email-ingest", summary="Cron — poll the bank-statement mailbox")
+async def cron_email_ingest(
+    envelope: VerifiedCronEnvelopeDep,
+    verdict: IdempotencyCronDep,
+) -> Response:
+    _assert_kind(envelope, "cron_email_ingest")
+    return await _process_cron(envelope, verdict, _run_email_ingest, "email_ingest")
 
 
 __all__ = [

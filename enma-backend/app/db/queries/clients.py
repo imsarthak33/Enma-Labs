@@ -7,9 +7,11 @@ from collections.abc import Sequence
 from typing import cast
 
 from sqlalchemy import exists, func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models.client import Client
 from app.db.models.document import Document
+from app.db.models.firm import CaFirm
 from app.db.queries.base import BaseQuery
 
 
@@ -160,4 +162,26 @@ class ClientQuery(BaseQuery):
         return await self._fetch_all(stmt)
 
 
-__all__ = ["ClientQuery"]
+async def find_client_with_firm(
+    session: AsyncSession, client_id: uuid.UUID
+) -> tuple[Client, CaFirm] | None:
+    """Cross-firm: resolve a client UUID to its (client, owning firm).
+
+    Used by the email-ingest cron to route an auto-ingested statement to the
+    right client + firm — the inbound mail carries the client UUID in its
+    address, but the poll has no firm context. This is a sanctioned
+    cross-firm read (same exemption as :func:`list_all_firms`); allowed
+    caller list (CI grep): ``app/api/routes/cron.py`` only.
+    """
+    stmt = (
+        select(Client, CaFirm)
+        .join(CaFirm, CaFirm.id == Client.ca_firm_id)
+        .where(Client.id == client_id)
+    )
+    row = (await session.execute(stmt)).first()
+    if row is None:
+        return None
+    return (row[0], row[1])
+
+
+__all__ = ["ClientQuery", "find_client_with_firm"]

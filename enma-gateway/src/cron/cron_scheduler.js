@@ -63,6 +63,14 @@ export const CRON_JOBS = Object.freeze([
     schedule: "30 3 15 * *",
     description: "Monthly reconciliation digest, 15th 09:00 IST.",
   },
+  {
+    // Track-A automation Phase 7a — poll the bank-statement mailbox every
+    // 30 minutes and auto-ingest new statements. A no-op until IMAP
+    // credentials are configured in the backend env.
+    kind: "cron_email_ingest",
+    schedule: "*/30 * * * *",
+    description: "Poll the bank-statement mailbox (every 30 min).",
+  },
 ]);
 
 /**

@@ -50,6 +50,8 @@ export const ENVELOPE_KINDS = Object.freeze([
   "cron_idempotency_cleanup",
   // Track-A automation Phase 1 — monthly reconciliation digest.
   "cron_monthly_recon",
+  // Track-A automation Phase 7a — poll the bank-statement mailbox.
+  "cron_email_ingest",
 ]);
 
 /** Subset that callers can use to recognise cron envelopes. */
@@ -59,6 +61,7 @@ export const CRON_ENVELOPE_KINDS = Object.freeze([
   "cron_client_chase",
   "cron_idempotency_cleanup",
   "cron_monthly_recon",
+  "cron_email_ingest",
 ]);
 
 /**
