@@ -68,6 +68,10 @@ from app.services.llm import (
     LLMRole,
     call_chat,
 )
+from app.services.outcome_export import (
+    build_outcome_statement_csv,
+    gather_firm_outcomes,
+)
 from app.services.tally import TallyInvoice, compose_tally_envelope
 from app.tax.directives import RuleDirective
 from app.tax.gstin_validator import is_valid_gstin
@@ -1683,6 +1687,42 @@ async def _tool_outcome_summary(
     }
 
 
+async def _tool_export_outcome_statement(
+    ctx: SupervisorContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Deliver a downloadable CSV outcome statement (TA-1 meter export).
+
+    Firm-wide by default; pass client_id OR client_name to scope to one
+    client. Read-only — renders recovered / reversal-risk ITC + recent recon
+    runs already on file into a CSV and sends it as a document.
+    """
+    clients_q = ClientQuery(session=ctx.session, ca_firm_id=ctx.ca_firm_id)
+    if args.get("client_id") or args.get("client_name"):
+        client = await _resolve_client_from_args(ctx, args)
+        clients = [client]
+    else:
+        clients = list(await clients_q.list_active())
+
+    rows = await gather_firm_outcomes(
+        session=ctx.session, ca_firm_id=ctx.ca_firm_id, clients=clients
+    )
+    if not rows:
+        return {
+            "exported": False,
+            "reason": "No reconciliation outcomes on file yet — run a recon first.",
+        }
+
+    firm_name = ctx.firm_name or "Enma"
+    csv_bytes = build_outcome_statement_csv(rows=rows, firm_name=firm_name)
+    await telegram_service.send_document(
+        chat_id=ctx.chat_id,
+        file_bytes=csv_bytes,
+        filename="outcome_statement.csv",
+        caption_html="<b>Outcome statement</b> — recovered &amp; at-risk ITC",
+    )
+    return {"exported": True, "clients": len(rows)}
+
+
 # ---------------------------------------------------------------------------
 # Tax Knowledge Base — deterministic advice tools.
 #
@@ -2225,6 +2265,28 @@ TOOLS: Final[dict[str, ToolSpec]] = {
             "additionalProperties": False,
         },
         runner=_tool_outcome_summary,
+    ),
+    "export_outcome_statement": ToolSpec(
+        name="export_outcome_statement",
+        description=(
+            "Deliver a downloadable CSV outcome statement — recovered ITC + "
+            "180-day reversal-risk ITC per client plus the recent "
+            "reconciliation runs. Use when the CA asks to 'export/download the "
+            "outcome statement', 'send me the recovery report as a file', "
+            "'give me a CSV of what we've recovered', or wants the billing "
+            "hand-off document. Firm-wide by default; pass client_id OR "
+            "client_name to scope to one client. Read-only — reports figures "
+            "already on file (use outcome_summary for an in-chat summary)."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "client_id": {"type": "string"},
+                "client_name": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+        runner=_tool_export_outcome_statement,
     ),
     "query_brain": ToolSpec(
         name="query_brain",
