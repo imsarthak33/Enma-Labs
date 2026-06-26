@@ -3,6 +3,8 @@
 .env.local
 .env.*.local
 *.local.env
+*.env.example
+*.env.production.example
 
 # Docker
 docker-compose.override.yml
@@ -53,3 +55,12 @@ pgdata/
 *.msi
 install_oci.ps1
 install_oci.py
+
+# Sensitive handoff docs with DB credentials
+CLAUDE_HANDOFF_PROMPT.md
+
+# Deploy archives
+*.zip
+
+# Frontend 
+frontend_source/
