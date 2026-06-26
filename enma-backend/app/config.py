@@ -313,6 +313,13 @@ class Settings(BaseSettings):
         default="INBOX",
         description="IMAP folder to poll for bank-statement attachments.",
     )
+    email_ingest_domain: str = Field(
+        default="ingest.enmalabs.in",
+        description=(
+            "Domain for per-client ingest addresses (client-<uuid>@<domain>). "
+            "A catch-all on this domain must deliver to the polled mailbox."
+        ),
+    )
 
     # Phase 3 — GSTR-2B auto-pull via a GST Suvidha Provider. Dormant until the
     # GSP base URL + API key are set (the per-client OTP auth token is stored

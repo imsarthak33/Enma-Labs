@@ -23,7 +23,9 @@ import asyncio
 import contextlib
 import email
 import imaplib
-from dataclasses import dataclass
+import re
+import uuid
+from dataclasses import dataclass, field
 from email.message import Message
 from typing import Final, Protocol, runtime_checkable
 
@@ -36,8 +38,44 @@ __all__ = [
     "FetchedAttachment",
     "ImapEmailIngestClient",
     "NullEmailIngestClient",
+    "client_id_from_recipients",
     "get_email_ingest_client",
+    "ingest_address_for_client",
 ]
+
+# Recipient headers that may carry the per-client ingest address — a catch-all
+# rewrites the envelope recipient into these on delivery.
+_RECIPIENT_HEADERS: Final[tuple[str, ...]] = (
+    "To",
+    "Delivered-To",
+    "X-Original-To",
+    "Cc",
+)
+# client-<uuid>@<domain> — the per-client ingest address (domain-agnostic match).
+_INGEST_ADDRESS_RE: Final[re.Pattern[str]] = re.compile(
+    r"client-([0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?"
+    r"[0-9a-fA-F]{4}-?[0-9a-fA-F]{12})@",
+)
+
+
+def ingest_address_for_client(client_id: uuid.UUID, *, domain: str) -> str:
+    """The unique ingest address a client forwards bank statements to."""
+    return f"client-{client_id}@{domain}"
+
+
+def client_id_from_recipients(recipients: tuple[str, ...]) -> uuid.UUID | None:
+    """Extract the client UUID from a statement email's recipient addresses.
+
+    Deterministic routing: the per-client ingest address embeds the client
+    UUID, so no fuzzy guessing. Returns ``None`` when no recipient matches.
+    """
+    for raw in recipients:
+        match = _INGEST_ADDRESS_RE.search(raw)
+        if match is None:
+            continue
+        with contextlib.suppress(ValueError):
+            return uuid.UUID(match.group(1))
+    return None
 
 _log = get_logger(__name__)
 
@@ -58,6 +96,12 @@ class FetchedAttachment:
     content: bytes
     sender: str
     subject: str
+    recipients: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def client_id(self) -> uuid.UUID | None:
+        """The routed client UUID from the per-client ingest address, if any."""
+        return client_id_from_recipients(self.recipients)
 
 
 @runtime_checkable
@@ -140,15 +184,24 @@ class ImapEmailIngestClient:
         if not isinstance(raw, bytes | bytearray):
             return []
         msg = email.message_from_bytes(bytes(raw))
-        sender = str(msg.get("From", ""))
-        subject = str(msg.get("Subject", ""))
-        return _attachments_from(msg, sender=sender, subject=subject)
+        return _attachments_from(msg)
 
 
-def _attachments_from(
-    msg: Message, *, sender: str, subject: str
-) -> list[FetchedAttachment]:
+def _recipients_of(msg: Message) -> tuple[str, ...]:
+    """All recipient addresses across the headers a catch-all may rewrite."""
+    out: list[str] = []
+    for header in _RECIPIENT_HEADERS:
+        for value in msg.get_all(header, []):
+            if value:
+                out.append(str(value))
+    return tuple(out)
+
+
+def _attachments_from(msg: Message) -> list[FetchedAttachment]:
     """Extract bank-statement attachments from a parsed email message."""
+    sender = str(msg.get("From", ""))
+    subject = str(msg.get("Subject", ""))
+    recipients = _recipients_of(msg)
     out: list[FetchedAttachment] = []
     for part in msg.walk():
         filename = part.get_filename()
@@ -162,6 +215,7 @@ def _attachments_from(
                     content=payload,
                     sender=sender,
                     subject=subject,
+                    recipients=recipients,
                 )
             )
     return out
