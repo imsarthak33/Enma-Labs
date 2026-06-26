@@ -284,6 +284,48 @@ class Settings(BaseSettings):
         description="Serper.dev search endpoint (defaults to the news vertical).",
     )
 
+    # -- Track-A automation: provider adapters (env-gated, drop-in-key) -------
+    # Each external provider stays DORMANT until its credentials appear in the
+    # env. The factory returns a safe no-op client when a provider is
+    # unconfigured, so the cron poll is a no-op and nothing fires. Paste the
+    # subscription keys into the env and the adapter activates — no code change.
+    #
+    # Phase 2 — bank-statement email ingestion. When host + username + password
+    # are all set, the email-ingest cron polls this IMAP mailbox for bank
+    # statement attachments and lands them in the Brain.
+    email_ingest_host: str | None = Field(
+        default=None,
+        description="IMAP host for the monitored bank-statement mailbox (e.g. imap.gmail.com).",
+    )
+    email_ingest_port: int = Field(
+        default=993,
+        description="IMAP-over-SSL port for the bank-statement mailbox.",
+    )
+    email_ingest_username: str | None = Field(
+        default=None,
+        description="IMAP username for the bank-statement mailbox.",
+    )
+    email_ingest_password: SecretStr | None = Field(
+        default=None,
+        description="IMAP password / app-password for the bank-statement mailbox.",
+    )
+    email_ingest_mailbox: str = Field(
+        default="INBOX",
+        description="IMAP folder to poll for bank-statement attachments.",
+    )
+
+    # Phase 3 — GSTR-2B auto-pull via a GST Suvidha Provider. Dormant until the
+    # GSP base URL + API key are set (the per-client OTP auth token is stored
+    # separately, per consented client).
+    gsp_base_url: str | None = Field(
+        default=None,
+        description="GST Suvidha Provider API base URL (e.g. the GSP's GSTR-2B endpoint root).",
+    )
+    gsp_api_key: SecretStr | None = Field(
+        default=None,
+        description="GST Suvidha Provider API key / client secret.",
+    )
+
     # -- CORS -----------------------------------------------------------------
     cors_origins: list[str] = Field(
         default_factory=lambda: ["http://localhost:3000"],
@@ -303,6 +345,21 @@ class Settings(BaseSettings):
     @classmethod
     def _no_wildcard_in_prod(cls, v: list[str]) -> list[str]:
         return v
+
+    def is_email_ingest_configured(self) -> bool:
+        """True when the bank-statement IMAP mailbox has full credentials.
+
+        The email-ingest adapter stays a no-op until this is True.
+        """
+        return bool(
+            self.email_ingest_host
+            and self.email_ingest_username
+            and self.email_ingest_password
+        )
+
+    def is_gsp_configured(self) -> bool:
+        """True when the GST Suvidha Provider base URL + API key are set."""
+        return bool(self.gsp_base_url and self.gsp_api_key)
 
     def is_production(self) -> bool:
         return self.env == Environment.PRODUCTION
