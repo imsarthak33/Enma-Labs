@@ -29,6 +29,7 @@ from typing import Final
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.db.queries.clients import find_client_with_firm
 from app.db.queries.firms import (
     create_firm_with_admin,
     find_firm_by_admin_chat_id,
@@ -37,6 +38,7 @@ from app.db.queries.firms import (
 )
 from app.formatting.telegram_html import bold, code, italic, safe_text
 from app.logging_setup import get_logger
+from app.services.client_channels import parse_client_link_payload
 from app.tax.gstin_validator import is_valid_gstin
 
 _log = get_logger(__name__)
@@ -134,7 +136,13 @@ async def handle_start(
     """
     clear_onboarding_state(chat_id)
 
-    # ── 1 & 2: payload-driven link ─────────────────────────────────────────
+    # ── 0: client deep-link (ADR-017) — bind this 1:1 chat to a client ─────
+    if payload:
+        client_id = parse_client_link_payload(payload)
+        if client_id is not None:
+            return await _handle_client_link(session, chat_id, client_id)
+
+    # ── 1 & 2: payload-driven firm link ────────────────────────────────────
     if payload:
         firm = await _resolve_firm_payload(session, payload)
         if firm is not None:
@@ -195,6 +203,37 @@ async def _resolve_firm_payload(session: AsyncSession, payload: str):  # type: i
     except ValueError:
         return None
     return await get_firm_by_id(session, firm_id)
+
+
+async def _handle_client_link(
+    session: AsyncSession, chat_id: int, client_id: uuid.UUID
+) -> str:
+    """Bind this 1:1 chat to a client (ADR-017 client deep link)."""
+    resolved = await find_client_with_firm(session, client_id)
+    if resolved is None:
+        return italic(
+            "That client link is no longer valid. Ask your CA for a fresh link."
+        )
+    client, firm = resolved
+    client.telegram_chat_id = chat_id
+    await session.commit()
+    _log.info(
+        "client_chat_bound",
+        client_id=str(client.id),
+        firm_id=str(firm.id),
+        chat_id=chat_id,
+    )
+    return _client_linked_html(client, firm)
+
+
+def _client_linked_html(client, firm) -> str:  # type: ignore[no-untyped-def]
+    return (
+        bold("You're connected to Enma!") + " 🎉\n\n"
+        + "This chat is linked for " + bold(client.trade_name)
+        + " (via " + safe_text(firm.firm_name) + ").\n\n"
+        + bold("Just send your documents here") + " — bank statements, invoices "
+        + "— and I'll take care of the rest. Your CA gets everything automatically."
+    )
 
 
 # ---------------------------------------------------------------------------

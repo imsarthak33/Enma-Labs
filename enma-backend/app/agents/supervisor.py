@@ -60,6 +60,7 @@ from app.logging_setup import get_logger
 from app.prompts.master_prompt import build_supervisor_prompt
 from app.services import bank_recon_runner, recon_runner
 from app.services import telegram as telegram_service
+from app.services.client_channels import client_deep_link, client_ingest_email
 from app.services.export import generate_client_ledger_csv
 from app.services.llm import (
     ChatMessage,
@@ -1723,6 +1724,29 @@ async def _tool_export_outcome_statement(
     return {"exported": True, "clients": len(rows)}
 
 
+async def _tool_get_client_ingest_setup(
+    ctx: SupervisorContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Return how a client sends documents to Enma (ADR-017): link + email.
+
+    The CA forwards these to the client once — tapping the Telegram link
+    binds the client's 1:1 chat (so they can drop documents in chat), and
+    the email address lets them (or their bank) forward statements.
+    """
+    client = await _resolve_client_from_args(ctx, args)
+    return {
+        "client": client.trade_name,
+        "telegram_deep_link": client_deep_link(client.id),
+        "ingest_email": client_ingest_email(client.id),
+        "telegram_connected": client.telegram_chat_id is not None,
+        "note": (
+            "Send the client either channel. Once they tap the Telegram link "
+            "(or email/forward a statement to the address), their documents "
+            "flow into Enma automatically and reconcile."
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Tax Knowledge Base — deterministic advice tools.
 #
@@ -2287,6 +2311,29 @@ TOOLS: Final[dict[str, ToolSpec]] = {
             "additionalProperties": False,
         },
         runner=_tool_export_outcome_statement,
+    ),
+    "get_client_ingest_setup": ToolSpec(
+        name="get_client_ingest_setup",
+        description=(
+            "Get a client's document-ingestion setup — the per-client Telegram "
+            "deep link and email address the client uses to send documents to "
+            "Enma. Use when the CA asks 'how does CLIENT send me their bank "
+            "statement', 'get the link for CLIENT', 'onboard CLIENT to send "
+            "documents', 'what's CLIENT's upload link/email', 'connect CLIENT'. "
+            "Pass client_id OR client_name. Returns the Telegram deep link, the "
+            "ingest email, and whether the client's Telegram is already "
+            "connected. Share both with the client; tapping the link binds "
+            "their chat so documents route automatically."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "client_id": {"type": "string"},
+                "client_name": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+        runner=_tool_get_client_ingest_setup,
     ),
     "query_brain": ToolSpec(
         name="query_brain",

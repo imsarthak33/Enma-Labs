@@ -190,6 +190,38 @@ class TestHandleStart:
         # /start is a fresh entry — the stale state is cleared, not advanced.
         assert get_onboarding_state(CHAT_ID) is None
 
+    @pytest.mark.asyncio
+    async def test_client_deep_link_binds_chat(self) -> None:
+        """A client tapping their deep link binds this 1:1 chat to the client."""
+        session = _mock_session()
+        cid = uuid.uuid4()
+        client = SimpleNamespace(id=cid, trade_name="S.S Traders", telegram_chat_id=None)
+        firm = SimpleNamespace(id=uuid.uuid4(), firm_name="Sarthak & Co")
+
+        with patch(
+            "app.agents.onboarding.find_client_with_firm",
+            new_callable=AsyncMock,
+            return_value=(client, firm),
+        ):
+            html = await handle_start(session, CHAT_ID, f"client_{cid}")
+
+        assert client.telegram_chat_id == CHAT_ID  # bound
+        assert "connected to Enma" in html
+        assert "S.S Traders" in html
+        assert "Sarthak &amp; Co" in html  # firm name HTML-escaped (single-escape)
+
+    @pytest.mark.asyncio
+    async def test_invalid_client_link_is_rejected(self) -> None:
+        session = _mock_session()
+        cid = uuid.uuid4()
+        with patch(
+            "app.agents.onboarding.find_client_with_firm",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            html = await handle_start(session, CHAT_ID, f"client_{cid}")
+        assert "no longer valid" in html
+
 
 # ---------------------------------------------------------------------------
 # Onboarding reply handler tests

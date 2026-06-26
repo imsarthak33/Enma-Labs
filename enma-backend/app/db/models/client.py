@@ -11,6 +11,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
@@ -67,6 +68,10 @@ class Client(Base):
     gsp_auth_token_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Phase 8a (ADR-017) — the client's bound 1:1 Telegram chat, set when they
+    # tap their deep link (t.me/<bot>?start=client_<uuid>). Routes their
+    # documents + chase replies to this client. Partial-unique (migration 020).
+    telegram_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     gst_tds_deductor: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,

@@ -202,4 +202,30 @@ async def find_client_with_firm(
     return (row[0], row[1])
 
 
-__all__ = ["ClientQuery", "find_client_with_firm"]
+async def find_client_by_telegram_chat_id(
+    session: AsyncSession, chat_id: int
+) -> tuple[Client, CaFirm] | None:
+    """Cross-firm: resolve a bound 1:1 client chat to its (client, firm).
+
+    The worker uses this to route a client's inbound documents (ADR-017):
+    the chat is bound to exactly one client via the deep link, so a message
+    from a non-CA chat that matches here belongs to that client. Same
+    cross-firm exemption as :func:`find_client_with_firm`; allowed callers
+    (CI grep): ``app/api/routes/worker.py``.
+    """
+    stmt = (
+        select(Client, CaFirm)
+        .join(CaFirm, CaFirm.id == Client.ca_firm_id)
+        .where(Client.telegram_chat_id == chat_id)
+    )
+    row = (await session.execute(stmt)).first()
+    if row is None:
+        return None
+    return (row[0], row[1])
+
+
+__all__ = [
+    "ClientQuery",
+    "find_client_by_telegram_chat_id",
+    "find_client_with_firm",
+]

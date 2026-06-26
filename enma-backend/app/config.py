@@ -250,6 +250,13 @@ class Settings(BaseSettings):
         default="https://enmalabs.in/onboarding",
         description="Public URL of the marketing-site onboarding form.",
     )
+    telegram_bot_username: str = Field(
+        default="enmalabsbot",
+        description=(
+            "Bot username (without @) for per-client deep links "
+            "(t.me/<username>?start=client_<uuid>). ADR-017."
+        ),
+    )
 
     # -- Observability --------------------------------------------------------
     sentry_dsn: str | None = None
