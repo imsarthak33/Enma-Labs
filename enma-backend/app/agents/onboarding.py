@@ -128,7 +128,12 @@ async def handle_start(
          back".
       4. Bare ``/start`` from an unknown chat → send the user to the
          web onboarding (we do NOT collect consents over Telegram).
+
+    ``/start`` is always a fresh entry point, so it first clears any stale
+    legacy Telegram-onboarding state for this chat (onboarding is web-first).
     """
+    clear_onboarding_state(chat_id)
+
     # ── 1 & 2: payload-driven link ─────────────────────────────────────────
     if payload:
         firm = await _resolve_firm_payload(session, payload)
@@ -148,7 +153,8 @@ async def handle_start(
                 return (
                     italic("This firm is already linked to a different Telegram account.")
                     + "\n\n"
-                    + "If you've changed phones, contact your admin to re-link from the web dashboard."
+                    + "If you've changed phones, contact your admin to "
+                    + "re-link from the web dashboard."
                 )
 
             # Bind this chat to the firm.
@@ -197,9 +203,9 @@ async def _resolve_firm_payload(session: AsyncSession, payload: str):  # type: i
 
 
 def _link_success_html(firm) -> str:  # type: ignore[no-untyped-def]
-    name_part = bold(safe_text(firm.firm_name))
+    name_part = bold(firm.firm_name)
     salutation = (
-        "Welcome, " + bold(safe_text(firm.ca_name)) + "!\n\n"
+        "Welcome, " + bold(firm.ca_name) + "!\n\n"
         if firm.ca_name
         else bold("Welcome to Enma!") + " 🎉\n\n"
     )
@@ -217,7 +223,7 @@ def _link_success_html(firm) -> str:  # type: ignore[no-untyped-def]
 def _welcome_back_html(firm) -> str:  # type: ignore[no-untyped-def]
     return (
         bold("Welcome back!") + "\n"
-        "Your firm " + bold(safe_text(firm.firm_name))
+        "Your firm " + bold(firm.firm_name)
         + " is already linked.\n\n"
         + "Commands:\n"
         + "• " + code("/add_client") + " — Add a new client\n"
@@ -311,7 +317,7 @@ async def _handle_firm_name(
     )
 
     return (
-        "✅ " + bold(safe_text(name)) + " has been registered!\n\n"
+        "✅ " + bold(name) + " has been registered!\n\n"
         + italic("Optional:") + " Send me your firm's GSTIN for enhanced "
         + "verification, or skip this step.\n\n"
         + "You can also start right away:\n"

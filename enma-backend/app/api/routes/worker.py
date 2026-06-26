@@ -1840,7 +1840,7 @@ async def _send_user_error(chat_id: int, message: str) -> None:
     try:
         await telegram.send_message(
             chat_id=chat_id,
-            html_text=italic(safe_text(message)),
+            html_text=italic(message),
         )
     except telegram.TelegramAPIError as exc:
         _log.error("user_error_send_failed", error=str(exc), chat_id=chat_id)

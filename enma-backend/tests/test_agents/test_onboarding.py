@@ -10,13 +10,10 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
-
 from app.agents.onboarding import (
-    ONBOARDING_TTL,
     OnboardingStage,
     OnboardingState,
     clear_onboarding_state,
@@ -26,7 +23,6 @@ from app.agents.onboarding import (
     is_in_onboarding,
     set_onboarding_state,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -137,7 +133,7 @@ class TestStateMachine:
 class TestHandleStart:
     @pytest.mark.asyncio
     async def test_new_user_gets_welcome(self) -> None:
-        """A fresh user typing /start sees the welcome + firm name prompt."""
+        """A fresh user typing bare /start is sent to web onboarding (web-first)."""
         session = _mock_session()
 
         with patch(
@@ -148,11 +144,9 @@ class TestHandleStart:
             html = await handle_start(session, CHAT_ID)
 
         assert "Welcome to Enma" in html
-        assert "firm&#x27;s name" in html
-        # State should be set
-        state = get_onboarding_state(CHAT_ID)
-        assert state is not None
-        assert state.stage == OnboardingStage.AWAITING_FIRM_NAME
+        assert "complete signup on the web" in html
+        # Web-first: bare /start does not start a Telegram onboarding flow.
+        assert get_onboarding_state(CHAT_ID) is None
 
     @pytest.mark.asyncio
     async def test_existing_user_gets_welcome_back(self) -> None:
@@ -173,8 +167,8 @@ class TestHandleStart:
         assert get_onboarding_state(CHAT_ID) is None
 
     @pytest.mark.asyncio
-    async def test_start_resets_existing_onboarding(self) -> None:
-        """Typing /start while mid-onboarding restarts the flow."""
+    async def test_start_clears_stale_onboarding_state(self) -> None:
+        """Typing /start clears any stale legacy Telegram-onboarding state."""
         # Pre-set a stale state
         set_onboarding_state(
             OnboardingState(
@@ -193,9 +187,8 @@ class TestHandleStart:
             html = await handle_start(session, CHAT_ID)
 
         assert "Welcome to Enma" in html
-        state = get_onboarding_state(CHAT_ID)
-        assert state is not None
-        assert state.stage == OnboardingStage.AWAITING_FIRM_NAME
+        # /start is a fresh entry — the stale state is cleared, not advanced.
+        assert get_onboarding_state(CHAT_ID) is None
 
 
 # ---------------------------------------------------------------------------

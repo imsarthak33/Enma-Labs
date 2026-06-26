@@ -238,7 +238,7 @@ async def _recon_report_for_firm(firm: CaFirm) -> None:
                 continue  # no recon activity for this client — skip it
             firm_recovered += recovered
             firm_reversal += reversal
-            block = bold(safe_text(client.trade_name))
+            block = bold(client.trade_name)
             block += "\n  Recovered ITC: " + code(f"₹{recovered}")
             if reversal > ZERO:
                 block += " · Reversal risk: " + code(f"₹{reversal}")

@@ -132,7 +132,7 @@ def _header(result: PipelineResult) -> str:
     )
     return (
         f"{bold('Document processed')}\n"
-        f"Type: {bold(safe_text(result.document_type))}\n"
+        f"Type: {bold(result.document_type)}\n"
         f"Ref: {doc_id_str}"
     )
 
@@ -165,20 +165,20 @@ def _extraction_block(extraction: dict[str, Any]) -> str:
     if isinstance(vendor, dict):
         lines.append(
             f"Vendor: {safe_text(vendor.get('name') or '—')} "
-            f"({code(safe_text(vendor.get('gstin') or '—'))})"
+            f"({code(vendor.get('gstin') or '—')})"
         )
     if isinstance(buyer, dict):
         lines.append(
             f"Buyer: {safe_text(buyer.get('name') or '—')} "
-            f"({code(safe_text(buyer.get('gstin') or '—'))})"
+            f"({code(buyer.get('gstin') or '—')})"
         )
     if extraction.get("invoice_number"):
-        lines.append(f"Invoice #: {code(safe_text(extraction['invoice_number']))}")
+        lines.append(f"Invoice #: {code(extraction['invoice_number'])}")
     if extraction.get("invoice_date"):
         lines.append(f"Date: {safe_text(extraction['invoice_date'])}")
     if isinstance(totals, dict) and totals.get("grand_total") is not None:
         lines.append(
-            f"Grand total: {code(safe_text(totals.get('grand_total')))} "
+            f"Grand total: {code(totals.get('grand_total'))} "
             f"(taxable {safe_text(totals.get('taxable_value') or '—')})"
         )
         # O — surface the CGST/SGST/IGST breakdown (canonical, never LLM math).
@@ -189,7 +189,7 @@ def _extraction_block(extraction: dict[str, Any]) -> str:
         ):
             amount = totals.get(key)
             if amount not in (None, "", "0", "0.00"):
-                lines.append(f"{tax_label}: {code(safe_text(amount))}")
+                lines.append(f"{tax_label}: {code(amount)}")
     lines.append(f"Line items: {bold(len(line_items) if isinstance(line_items, list) else 0)}")
     # O — surface reconciler discrepancies so the CA sees what disagreed
     # between the printed invoice and the canonical math.
@@ -201,7 +201,7 @@ def _extraction_block(extraction: dict[str, Any]) -> str:
             lines.append(bold("Reconciliation flags"))
             for d in discrepancies[:5]:
                 if isinstance(d, dict) and d.get("message"):
-                    lines.append(f"• {italic(safe_text(d['message']))}")
+                    lines.append(f"• {italic(d['message'])}")
     return "\n".join(lines)
 
 
@@ -245,9 +245,9 @@ def _severity_sort_key(issue: VerificationIssue) -> int:
 
 
 def _format_issue(issue: VerificationIssue) -> str:
-    sev_label = bold(safe_text(issue.severity.value))
-    code_label = code(safe_text(issue.code))
-    field_label = f" @ {code(safe_text(issue.field.path))}" if issue.field else ""
+    sev_label = bold(issue.severity.value)
+    code_label = code(issue.code)
+    field_label = f" @ {code(issue.field.path)}" if issue.field else ""
     return f"• {sev_label} {code_label}{field_label}: {safe_text(issue.message)}"
 
 

@@ -327,10 +327,25 @@ class TestWhatsAppClient:
             await client.send_message(recipient="+1", body=Text("x"))
 
     @pytest.mark.asyncio
-    async def test_send_message_rejects_int_recipient(self) -> None:
+    async def test_send_message_coerces_int_recipient(self) -> None:
+        # W4-P3 — the worker passes the gateway-synthesized chat_id (the WA
+        # phone with the '+' stripped) as an int; the client reverses it to
+        # +E.164 so both channels share the recipient=chat_id path.
+        captured: dict[str, str] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured["body"] = request.content.decode()
+            return httpx.Response(201, json={"sid": "SMxxxx"})
+
+        client = _wa_client_with_mock(handler)
+        await client.send_message(recipient=918178803301, body=Text("x"))
+        assert "To=whatsapp%3A%2B918178803301" in captured["body"]
+
+    @pytest.mark.asyncio
+    async def test_send_message_rejects_non_positive_int_recipient(self) -> None:
         client = _wa_client_with_mock(lambda r: httpx.Response(201, json={}))
-        with pytest.raises(MessagingError, match="must be an E.164 phone string"):
-            await client.send_message(recipient=12345, body=Text("x"))
+        with pytest.raises(MessagingError, match="must be > 0"):
+            await client.send_message(recipient=0, body=Text("x"))
 
     @pytest.mark.asyncio
     async def test_send_message_empty_body_raises(self) -> None:

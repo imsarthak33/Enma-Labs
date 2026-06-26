@@ -51,8 +51,13 @@ class TestModelRegistration:
         ), f"Missing tables: {self.EXPECTED_TABLES - registered}"
 
     def test_table_count(self) -> None:
-        """13 tables after W3 adds ``tally_export_runs``."""
-        assert len(Base.metadata.tables) == 13
+        """Registered-table count. Bump this when a migration adds a table.
+
+        Grew from 13 (W3) as Layer A (brain_events), the P0 substrate
+        (outcome_units, agentic_trajectories, …) and TA-2 (reconciliation_runs)
+        landed. The count guards against an accidentally-undropped model.
+        """
+        assert len(Base.metadata.tables) == 19
 
 
 class TestCaFirmModel:
