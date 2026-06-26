@@ -46,6 +46,7 @@ from app.formatting.telegram_html import bold, code, italic, safe_text
 from app.logging_setup import get_logger
 from app.services import auto_ingest, scraper, telegram
 from app.services.providers.email_ingest import get_email_ingest_client
+from app.services.providers.gsp import get_gsp_client
 from app.utils.background import get_registry
 from app.utils.date_utils import FilingPeriod, now_ist
 from app.utils.decimal_utils import ZERO
@@ -270,6 +271,71 @@ async def _recon_report_for_firm(firm: CaFirm) -> None:
         _log.warning("recon_report_send_failed", firm_id=str(firm.id), error=str(exc))
 
 
+def _previous_return_period() -> str:
+    """GST return period (``MMYYYY``) of the just-closed month.
+
+    The pull cron runs after GSTN generates GSTR-2B (14th of each month) for
+    the prior period, so the target is the previous calendar month.
+    """
+    today = now_ist().date()
+    if today.month == 1:
+        month, year = 12, today.year - 1
+    else:
+        month, year = today.month - 1, today.year
+    return f"{month:02d}{year}"
+
+
+async def _gstr2b_pull_for_firm(firm: CaFirm) -> None:
+    """Pull each consented client's GSTR-2B via the GSP and auto-reconcile (P7b.2).
+
+    Dormant when no GSP is configured. Iterates only clients with a GSTIN and
+    an unexpired OTP-consent token; one client's failure never blocks the rest.
+    """
+    gsp = get_gsp_client(settings)
+    if not gsp.is_configured:
+        return
+    rtnprd = _previous_return_period()
+    factory = get_sessionmaker()
+    async with factory() as session:
+        clients_q = ClientQuery(session=session, ca_firm_id=firm.id)
+        consented = list(await clients_q.list_with_gsp_consent())
+        for client in consented:
+            if not client.gstin or not client.gsp_auth_token:
+                continue
+            try:
+                raw = await gsp.fetch_gstr2b(
+                    gstin=client.gstin,
+                    return_period=rtnprd,
+                    auth_token=client.gsp_auth_token,
+                )
+            except Exception as exc:  # — a GSP error on one client mustn't block others
+                _log.error(
+                    "gstr2b_pull_fetch_failed", client_id=str(client.id), error=str(exc)
+                )
+                continue
+            if not raw:
+                _log.info(
+                    "gstr2b_pull_empty", client_id=str(client.id), period=rtnprd
+                )
+                continue
+            try:
+                result = await auto_ingest.ingest_gstr2b_bytes(
+                    session=session, firm=firm, client=client, file_bytes=raw
+                )
+                _log.info(
+                    "gstr2b_pull_processed",
+                    client_id=str(client.id),
+                    period=rtnprd,
+                    ingested=result.ingested,
+                )
+            except Exception as exc:  # — ingest failure on one client only
+                _log.error(
+                    "gstr2b_pull_ingest_failed",
+                    client_id=str(client.id),
+                    error=str(exc),
+                )
+
+
 # ---------------------------------------------------------------------------
 # Fan-out drivers
 # ---------------------------------------------------------------------------
@@ -315,6 +381,10 @@ async def _run_chase(_envelope: DecodedEnvelope) -> None:
 
 async def _run_recon_report(_envelope: DecodedEnvelope) -> None:
     await _fanout(_recon_report_for_firm, label="monthly_recon")
+
+
+async def _run_gstr2b_pull(_envelope: DecodedEnvelope) -> None:
+    await _fanout(_gstr2b_pull_for_firm, label="gstr2b_pull")
 
 
 async def _run_email_ingest(_envelope: DecodedEnvelope) -> None:
@@ -481,6 +551,15 @@ async def cron_email_ingest(
 ) -> Response:
     _assert_kind(envelope, "cron_email_ingest")
     return await _process_cron(envelope, verdict, _run_email_ingest, "email_ingest")
+
+
+@router.post("/gstr2b-pull", summary="Cron — monthly GSTR-2B pull via GSP")
+async def cron_gstr2b_pull(
+    envelope: VerifiedCronEnvelopeDep,
+    verdict: IdempotencyCronDep,
+) -> Response:
+    _assert_kind(envelope, "cron_gstr2b_pull")
+    return await _process_cron(envelope, verdict, _run_gstr2b_pull, "gstr2b_pull")
 
 
 __all__ = [

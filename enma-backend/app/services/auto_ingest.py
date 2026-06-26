@@ -16,13 +16,24 @@ Deterministic; no LLM. Re-ingesting the same statement is a no-op at the
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 from app.db.queries.brain_events import BrainEventQuery
 from app.logging_setup import get_logger
-from app.services import bank_import, bank_pdf_import, bank_recon_runner
+from app.services import (
+    bank_import,
+    bank_pdf_import,
+    bank_recon_runner,
+    gstr2b_import,
+    recon_runner,
+)
 
-__all__ = ["AutoIngestResult", "ingest_bank_statement_bytes"]
+__all__ = [
+    "AutoIngestResult",
+    "ingest_bank_statement_bytes",
+    "ingest_gstr2b_bytes",
+]
 
 _log = get_logger(__name__)
 
@@ -95,6 +106,84 @@ async def ingest_bank_statement_bytes(
         firm=firm,
         client=client,
         transactions=list(statement.transactions),
+        chat_id=firm.admin_chat_id,
+    )
+    return AutoIngestResult(ingested=True, summary=delivery.summary)
+
+
+async def ingest_gstr2b_bytes(
+    *,
+    session: Any,
+    firm: Any,
+    client: Any,
+    file_bytes: bytes,
+) -> AutoIngestResult:
+    """Auto-ingest a GSTR-2B JSON for an already-resolved client (GSP pull).
+
+    Parses, **verifies the recipient GSTIN matches the client** (never ingest
+    one client's 2B into another), lands the entries in
+    ``brain_events(source='gstn_portal')``, and runs the period's
+    reconciliation, delivering the result to the firm admin.
+    """
+    if firm.admin_chat_id is None:
+        _log.info("auto_ingest_gstr2b_skipped_no_admin_chat", client_id=str(client.id))
+        return AutoIngestResult(ingested=False)
+
+    try:
+        parsed = gstr2b_import.parse_gstr2b(file_bytes)
+    except gstr2b_import.Gstr2bParseError as exc:
+        _log.warning("auto_ingest_gstr2b_parse_failed", error=str(exc))
+        return AutoIngestResult(ingested=False)
+
+    period = recon_runner.period_from_rtnprd(parsed.return_period)
+    if period is None:
+        _log.warning("auto_ingest_gstr2b_bad_period", rtnprd=parsed.return_period)
+        return AutoIngestResult(ingested=False)
+    month, year = period
+
+    client_gstin = (client.gstin or "").strip().upper()
+    recipient = (parsed.recipient_gstin or "").strip().upper()
+    if client_gstin and recipient and client_gstin != recipient:
+        _log.warning(
+            "auto_ingest_gstr2b_recipient_mismatch",
+            client_gstin=client_gstin,
+            recipient=recipient,
+        )
+        return AutoIngestResult(ingested=False)
+
+    rows = [
+        {
+            "source": "gstn_portal",
+            "event_type": "gstr2b_entry",
+            "dedup_key": e.dedup_key,
+            "occurred_at": datetime(
+                e.invoice_date.year, e.invoice_date.month, e.invoice_date.day, tzinfo=UTC
+            ),
+            "payload": {**e.to_payload(), "return_period": parsed.return_period},
+            "client_id": client.id,
+        }
+        for e in parsed.entries
+    ]
+    brain_q = BrainEventQuery(session=session, ca_firm_id=firm.id)
+    inserted, skipped = await brain_q.record_dedup_bulk(rows=rows)
+    await session.commit()
+    _log.info(
+        "auto_ingest_gstr2b_landed",
+        ca_firm_id=str(firm.id),
+        client_id=str(client.id),
+        period=parsed.return_period,
+        entries=len(parsed.entries),
+        inserted=inserted,
+        skipped=skipped,
+    )
+
+    delivery = await recon_runner.reconcile_and_deliver(
+        session=session,
+        firm=firm,
+        client=client,
+        month=month,
+        year=year,
+        entries=list(parsed.entries),
         chat_id=firm.admin_chat_id,
     )
     return AutoIngestResult(ingested=True, summary=delivery.summary)

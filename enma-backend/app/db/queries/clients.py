@@ -23,6 +23,24 @@ class ClientQuery(BaseQuery):
         stmt = self._scoped_select(Client).where(Client.is_active.is_(True))
         return await self._fetch_all(stmt)
 
+    async def list_with_gsp_consent(self) -> Sequence[Client]:
+        """Active clients with a GSTIN and an unexpired GSP consent token.
+
+        The GSTR-2B monthly-pull cron iterates these — a client without a
+        stored, unexpired token (or without a GSTIN) is simply skipped, so
+        the pull stays dormant until consent is captured.
+        """
+        from datetime import UTC, datetime
+
+        stmt = (
+            self._scoped_select(Client)
+            .where(Client.is_active.is_(True))
+            .where(Client.gstin.is_not(None))
+            .where(Client.gsp_auth_token.is_not(None))
+            .where(Client.gsp_auth_token_expires_at > datetime.now(UTC))
+        )
+        return await self._fetch_all(stmt)
+
     async def first_active(self) -> Client | None:
         """Return the oldest active client for this firm.
 

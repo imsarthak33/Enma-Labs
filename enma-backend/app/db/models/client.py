@@ -59,6 +59,14 @@ class Client(Base):
     contact_email: Mapped[str | None] = mapped_column(Text, nullable=True)
     contact_phone: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("TRUE"))
+    # Phase 7b.2 — per-client GSP OTP-consent token + expiry for the GSTR-2B
+    # monthly pull. Populated by the (GSP-specific) consent-acquisition flow;
+    # the pull cron skips clients without an unexpired token. Should be stored
+    # encrypted once the consent flow lands (mirror whatsapp_auth_token_encrypted).
+    gsp_auth_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    gsp_auth_token_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     gst_tds_deductor: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,

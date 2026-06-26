@@ -71,6 +71,15 @@ export const CRON_JOBS = Object.freeze([
     schedule: "*/30 * * * *",
     description: "Poll the bank-statement mailbox (every 30 min).",
   },
+  {
+    // Track-A automation Phase 7b.2 — monthly GSTR-2B pull via the GSP. Fires
+    // on the 15th at 08:30 IST, after GSTN generates GSTR-2B (14th) and before
+    // the 09:00 reconciliation digest so it reflects the fresh pull. A no-op
+    // until the GSP is configured + clients have consent tokens.
+    kind: "cron_gstr2b_pull",
+    schedule: "0 3 15 * *",
+    description: "Monthly GSTR-2B pull via GSP, 15th 08:30 IST.",
+  },
 ]);
 
 /**

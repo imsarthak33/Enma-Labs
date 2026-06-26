@@ -102,3 +102,42 @@ async def test_unrouted_attachment_skipped(monkeypatch: Any) -> None:
 
     find.assert_not_awaited()  # no client_id → never resolved
     ingest.assert_not_awaited()
+
+
+# ── GSTR-2B monthly pull (Phase 7b.2) ──────────────────────────────────────
+
+
+async def test_gstr2b_pull_routes_consented_clients(monkeypatch: Any) -> None:
+    firm = SimpleNamespace(id=uuid.uuid4(), admin_chat_id=1)
+    client = SimpleNamespace(
+        id=uuid.uuid4(), gstin="27AABCC1234D1Z5", gsp_auth_token="otp-token"
+    )
+    gsp = MagicMock()
+    gsp.is_configured = True
+    gsp.fetch_gstr2b = AsyncMock(return_value=b'{"data": {"docdata": {}}}')
+    clients_q = MagicMock()
+    clients_q.list_with_gsp_consent = AsyncMock(return_value=[client])
+    ingest = AsyncMock(return_value=SimpleNamespace(ingested=True))
+
+    monkeypatch.setattr(cron_module, "get_gsp_client", lambda _s: gsp)
+    monkeypatch.setattr(cron_module, "ClientQuery", lambda **_kw: clients_q)
+    monkeypatch.setattr(cron_module.auto_ingest, "ingest_gstr2b_bytes", ingest)
+    monkeypatch.setattr(cron_module, "get_sessionmaker", _fake_sessionmaker)
+
+    await cron_module._gstr2b_pull_for_firm(firm)
+
+    gsp.fetch_gstr2b.assert_awaited_once()
+    assert gsp.fetch_gstr2b.await_args.kwargs["gstin"] == "27AABCC1234D1Z5"
+    assert gsp.fetch_gstr2b.await_args.kwargs["auth_token"] == "otp-token"
+    ingest.assert_awaited_once()
+
+
+async def test_gstr2b_pull_dormant_when_unconfigured(monkeypatch: Any) -> None:
+    gsp = MagicMock()
+    gsp.is_configured = False
+    gsp.fetch_gstr2b = AsyncMock()
+    monkeypatch.setattr(cron_module, "get_gsp_client", lambda _s: gsp)
+
+    await cron_module._gstr2b_pull_for_firm(SimpleNamespace(id=uuid.uuid4()))
+
+    gsp.fetch_gstr2b.assert_not_awaited()  # never pulls when no GSP configured
