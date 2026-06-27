@@ -135,27 +135,6 @@ Every external integration — IMAP, GSP, Twilio — ships in the codebase **ful
     └── deploy_gateway.py       # Gateway: same pattern
 ```
 
----
-
-## What's Live in Production
-
-| Phase | Feature | Status |
-|---|---|---|
-| 0 | Substrate: brain_events, outcome_units, alarms | ✅ live |
-| 1 | Company Brain (Layer A): Tally ingest, query_brain, tax-KB | ✅ live |
-| 2 | Tri-Way ITC Reconciliation + PDF e-statement parser | ✅ live |
-| 3 | Outcome Meter: recovered ITC + reversal risk ledger | ✅ live |
-| 4 | Robustness: pending-resume, deploy scripts, escaping fixes | ✅ live |
-| 5 | Proactive Reporting: monthly digest cron (15th, 09:00 IST) | ✅ live |
-| 6 | Provider-Adapter Foundation: drop-in-key architecture | ✅ live |
-| 7a | Bank-via-email: IMAP ingest → auto recon | ✅ built · dormant until creds |
-| 7b | GSTR-2B via GSP: monthly pull cron | ✅ built · dormant until GSP key |
-| 8a | Per-client 1:1 deep-link binding (ADR-017) | ✅ live |
-| 8b | Completeness ledger (what's arrived vs. required) | 🔨 next |
-| 8c | Filing-period-aware chase cron | 🔨 next |
-| 9 | GSTR-1/3B filing (TA-3) | ⬜ planned |
-| 10 | Track B: Enma as its own operating CA firm | ⬜ planned |
-
 **Production:** AWS ECS Fargate, ap-south-1 · Backend rev 47 · Gateway rev 17 · Alembic `020`
 
 ---
