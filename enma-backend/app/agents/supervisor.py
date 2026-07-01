@@ -61,6 +61,7 @@ from app.prompts.master_prompt import build_supervisor_prompt
 from app.services import bank_recon_runner, recon_runner
 from app.services import telegram as telegram_service
 from app.services.client_channels import client_deep_link, client_ingest_email
+from app.services.completeness import LEG_LABELS, assess_completeness
 from app.services.export import generate_client_ledger_csv
 from app.services.llm import (
     ChatMessage,
@@ -345,6 +346,49 @@ async def _tool_get_client_status(
             "gst_tds_deductor": client.gst_tds_deductor,
         },
         "open_task_count": len(open_tasks),
+    }
+
+
+async def _tool_get_completeness(
+    ctx: SupervisorContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Phase 8b — has a client provided everything for a filing period?
+
+    Reports the three Tri-Way data legs (books / GSTR-2B / bank) as
+    present-or-missing so the CA can answer "does CLIENT have everything
+    for March?" without opening the recon. Period defaults to the current
+    month when the CA doesn't name one.
+    """
+    client = await _resolve_client_from_args(ctx, args)
+    now = datetime.now(UTC)
+    month = _coerce_int_or_none(args.get("filing_period_month")) or now.month
+    year = _coerce_int_or_none(args.get("filing_period_year")) or now.year
+    if not 1 <= month <= 12:  # — calendar month bound
+        raise ToolError("filing_period_month must be 1-12")
+
+    report = await assess_completeness(
+        session=ctx.session,
+        ca_firm_id=ctx.ca_firm_id,
+        client_id=client.id,
+        trade_name=client.trade_name,
+        month=month,
+        year=year,
+    )
+    return {
+        "client": client.trade_name,
+        "filing_period_month": month,
+        "filing_period_year": year,
+        "complete": report.is_complete,
+        "legs": [
+            {
+                "leg": leg.leg,
+                "label": LEG_LABELS.get(leg.leg, leg.leg),
+                "present": leg.present,
+                "count": leg.count,
+            }
+            for leg in report.legs
+        ],
+        "missing": [LEG_LABELS.get(name, name) for name in report.missing],
     }
 
 
@@ -2334,6 +2378,30 @@ TOOLS: Final[dict[str, ToolSpec]] = {
             "additionalProperties": False,
         },
         runner=_tool_get_client_ingest_setup,
+    ),
+    "get_completeness": ToolSpec(
+        name="get_completeness",
+        description=(
+            "Check whether a client has provided everything needed to file a "
+            "period — the three Tri-Way legs: purchase invoices/books, GSTR-2B, "
+            "and a bank statement. Use when the CA asks 'does CLIENT have "
+            "everything for March', 'is CLIENT ready to file', 'what's missing "
+            "for CLIENT', 'what documents are we still waiting on for CLIENT'. "
+            "Pass client_id OR client_name; filing_period_month/year are "
+            "optional and default to the current month. Returns complete=true/"
+            "false, each leg's presence, and a 'missing' list of what to chase."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "client_id": {"type": "string"},
+                "client_name": {"type": "string"},
+                "filing_period_month": {"type": "integer", "minimum": 1, "maximum": 12},
+                "filing_period_year": {"type": "integer", "minimum": 2020, "maximum": 2100},
+            },
+            "additionalProperties": False,
+        },
+        runner=_tool_get_completeness,
     ),
     "query_brain": ToolSpec(
         name="query_brain",
