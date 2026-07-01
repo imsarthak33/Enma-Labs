@@ -59,6 +59,16 @@ export const CRON_JOBS = Object.freeze([
     description: "Client completeness chase, 5th 09:00 IST.",
   },
   {
+    // Phase 8d — filing-ready report auto-assembly. Fires on the 16th at
+    // 09:00 IST, after GSTR-2B (14th) and the monthly digest (15th), so a
+    // client whose three legs are all in gets their complete-legs ITC
+    // reconciliation delivered to the CA before the GSTR-3B (20th) deadline
+    // — no ask. Idempotent per (client, period); skips incomplete clients.
+    kind: "cron_period_report",
+    schedule: "30 3 16 * *",
+    description: "Filing-ready report assembly, 16th 09:00 IST.",
+  },
+  {
     // Spec §2.4 — daily prune of idempotency_log entries older than 72 h.
     // Runs at 02:00 IST (20:30 UTC the previous day) when traffic is lowest.
     kind: "cron_idempotency_cleanup",

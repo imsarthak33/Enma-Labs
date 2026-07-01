@@ -46,9 +46,14 @@ from app.db.session import get_sessionmaker
 from app.formatting.telegram_html import bold, code, italic, safe_text
 from app.logging_setup import get_logger
 from app.services import auto_ingest, scraper, telegram
-from app.services.completeness import LEG_LABELS, assess_firm_completeness
+from app.services.completeness import (
+    LEG_LABELS,
+    assess_completeness,
+    assess_firm_completeness,
+)
 from app.services.providers.email_ingest import get_email_ingest_client
 from app.services.providers.gsp import get_gsp_client
+from app.services.recon_runner import entries_from_brain, reconcile_and_deliver
 from app.utils.background import get_registry
 from app.utils.date_utils import FilingPeriod, now_ist
 from app.utils.decimal_utils import ZERO
@@ -59,6 +64,11 @@ _log = get_logger(__name__)
 
 # Hard cap so a runaway loop can't blast Telegram. ADR-007 §Decision 4.
 CLIENT_CHASE_BATCH_CAP: int = 20
+
+# Phase 8d — audit-run kind stamped on the period-close report assembly.
+# Distinct from the billing recon's ``invoice_vs_2b`` so the assembler can
+# gate on "already delivered this period" without touching the billing runs.
+PERIOD_REPORT_KIND: str = "period_close_report"
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +301,76 @@ async def _completeness_chase_for_firm(
         await session.commit()
 
 
+async def _period_report_for_firm(firm: CaFirm) -> None:
+    """Phase 8d — assemble + deliver the filing-ready report once a client is complete.
+
+    At period close (after GSTR-2B is available), for every client whose three
+    legs are all in (Phase 8b), assemble the ITC reconciliation report and send
+    it to the CA automatically — no ask. Gated two ways so it fires exactly
+    once per (client, period) with the *complete* data:
+
+    * completeness — skip clients still missing a leg (they get chased by 8c);
+    * idempotency — skip clients already delivered a ``period_close_report``
+      run for the period.
+
+    Billing is NOT re-recorded (``record_outcomes=False``): the interim
+    on-arrival recon already billed the period, so this re-assembly delivers
+    the authoritative complete-legs CSV without double-counting outcome units.
+    """
+    if firm.admin_chat_id is None:
+        return  # no CA channel to deliver to
+    factory = get_sessionmaker()
+    period = _prev_period(FilingPeriod.from_date(now_ist().date()))
+    async with factory() as session:
+        clients_q = ClientQuery(session=session, ca_firm_id=firm.id)
+        runs_q = ReconRunQuery(session=session, ca_firm_id=firm.id)
+        for client in await clients_q.list_active():
+            report = await assess_completeness(
+                session=session,
+                ca_firm_id=firm.id,
+                client_id=client.id,
+                trade_name=client.trade_name,
+                month=period.month,
+                year=period.year,
+            )
+            if not report.is_complete:
+                continue
+            if await runs_q.exists_for_period(
+                client_id=client.id,
+                filing_period_month=period.month,
+                filing_period_year=period.year,
+                kind=PERIOD_REPORT_KIND,
+            ):
+                continue
+            entries = await entries_from_brain(
+                session=session,
+                ca_firm_id=firm.id,
+                client_id=client.id,
+                month=period.month,
+                year=period.year,
+            )
+            try:
+                await reconcile_and_deliver(
+                    session=session,
+                    firm=firm,
+                    client=client,
+                    month=period.month,
+                    year=period.year,
+                    entries=entries,
+                    chat_id=firm.admin_chat_id,
+                    record_outcomes=False,
+                    run_kind=PERIOD_REPORT_KIND,
+                )
+            except Exception as exc:  # — one client's failure must not sink the rest
+                _log.error(
+                    "period_report_failed",
+                    firm_id=str(firm.id),
+                    client_id=str(client.id),
+                    error=str(exc),
+                )
+                continue
+
+
 async def _recon_report_for_firm(firm: CaFirm) -> None:
     """Push a proactive monthly reconciliation digest to the firm admin.
 
@@ -467,6 +547,10 @@ async def _run_completeness_chase(_envelope: DecodedEnvelope) -> None:
     await _fanout(_completeness_chase_for_firm, label="completeness_chase")
 
 
+async def _run_period_report(_envelope: DecodedEnvelope) -> None:
+    await _fanout(_period_report_for_firm, label="period_report")
+
+
 async def _run_recon_report(_envelope: DecodedEnvelope) -> None:
     await _fanout(_recon_report_for_firm, label="monthly_recon")
 
@@ -632,6 +716,15 @@ async def cron_completeness_chase(
     return await _process_cron(
         envelope, verdict, _run_completeness_chase, "completeness_chase"
     )
+
+
+@router.post("/period-report", summary="Cron — 16th-of-month filing-ready report assembly")
+async def cron_period_report(
+    envelope: VerifiedCronEnvelopeDep,
+    verdict: IdempotencyCronDep,
+) -> Response:
+    _assert_kind(envelope, "cron_period_report")
+    return await _process_cron(envelope, verdict, _run_period_report, "period_report")
 
 
 @router.post("/monthly-recon", summary="Cron — monthly reconciliation digest")

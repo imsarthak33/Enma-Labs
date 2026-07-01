@@ -47,6 +47,31 @@ class ReconRunQuery(BaseQuery):
         )
         return cast(ReconciliationRun, await self._insert(row))
 
+    async def exists_for_period(
+        self,
+        *,
+        client_id: uuid.UUID,
+        filing_period_month: int,
+        filing_period_year: int,
+        kind: str | None = None,
+    ) -> bool:
+        """True iff a recon run already exists for this client + period.
+
+        The Phase 8d period-close assembler uses this (with
+        ``kind='period_close_report'``) to deliver the complete-legs report
+        at most once per period, no matter how often the cron re-fires.
+        """
+        stmt = (
+            self._scoped_select(ReconciliationRun)
+            .where(ReconciliationRun.client_id == client_id)
+            .where(ReconciliationRun.filing_period_month == filing_period_month)
+            .where(ReconciliationRun.filing_period_year == filing_period_year)
+        )
+        if kind is not None:
+            stmt = stmt.where(ReconciliationRun.kind == kind)
+        stmt = stmt.limit(1)
+        return await self._fetch_one(stmt) is not None
+
     async def list_recent(
         self, *, limit: int = 25, client_id: uuid.UUID | None = None
     ) -> Sequence[ReconciliationRun]:

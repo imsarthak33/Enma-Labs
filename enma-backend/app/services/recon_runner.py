@@ -160,12 +160,21 @@ async def reconcile_and_deliver(
     entries: list[Gstr2bEntry],
     chat_id: int,
     reply_to_message_id: int | None = None,
+    record_outcomes: bool = True,
+    run_kind: str = "invoice_vs_2b",
 ) -> ReconDelivery:
     """Run the 2-way recon, deliver the CSV, record audit + outcome units.
 
     ``entries`` is supplied by the caller — freshly parsed (auto-recon on
     upload) or rebuilt from brain_events (on-demand tool). The books leg
     is always loaded from ``documents`` for the period.
+
+    ``record_outcomes`` gates the Track-A billing hook: the Phase 8d
+    period-close assembly re-delivers the authoritative complete-legs report
+    but passes ``False`` because the interim on-arrival recon already billed
+    the period — re-recording ``outcome_units`` would double-bill. ``run_kind``
+    stamps the audit row so those re-runs are distinguishable (and idempotent)
+    from the billing recon.
     """
     invoices = await _invoice_records(
         session=session,
@@ -208,30 +217,34 @@ async def reconcile_and_deliver(
         at_risk_itc=result.at_risk_itc,
         report_sha256=report_sha,
         run_by_chat_id=chat_id,
+        kind=run_kind,
     )
 
     # Outcome units — the Track-A pricing hook. Both pending CA approval.
-    outcomes_q = OutcomeUnitQuery(session=session, ca_firm_id=firm.id)
-    await outcomes_q.record(
-        kind="reconciled_period",
-        quantity=Decimal("1"),
-        client_id=client.id,
-        confidence=Decimal("1.0"),
-        metadata={"month": month, "year": year, "run_id": str(run.id)},
-    )
-    if result.recoverable_itc > ZERO:
+    # Skipped for period-close re-assembly (record_outcomes=False) so the
+    # period is billed exactly once, at the interim on-arrival recon.
+    if record_outcomes:
+        outcomes_q = OutcomeUnitQuery(session=session, ca_firm_id=firm.id)
         await outcomes_q.record(
-            kind="itc_recovered_inr",
-            quantity=result.recoverable_itc,
+            kind="reconciled_period",
+            quantity=Decimal("1"),
             client_id=client.id,
             confidence=Decimal("1.0"),
-            metadata={
-                "month": month,
-                "year": year,
-                "run_id": str(run.id),
-                "basis": "in_2b_not_in_books",
-            },
+            metadata={"month": month, "year": year, "run_id": str(run.id)},
         )
+        if result.recoverable_itc > ZERO:
+            await outcomes_q.record(
+                kind="itc_recovered_inr",
+                quantity=result.recoverable_itc,
+                client_id=client.id,
+                confidence=Decimal("1.0"),
+                metadata={
+                    "month": month,
+                    "year": year,
+                    "run_id": str(run.id),
+                    "basis": "in_2b_not_in_books",
+                },
+            )
 
     await session.commit()
 
