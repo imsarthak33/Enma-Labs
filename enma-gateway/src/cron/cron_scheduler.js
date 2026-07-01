@@ -49,6 +49,16 @@ export const CRON_JOBS = Object.freeze([
     description: "Chase clients with missing docs on the 28th, 09:00 IST.",
   },
   {
+    // Phase 8c — client-facing completeness chase. Fires on the 5th at
+    // 09:00 IST, giving clients time before the GSTR-1 (11th) / GSTR-3B
+    // (20th) deadlines to send whatever leg is still missing for the
+    // period being filed this month. Nudges the client on their bound 1:1
+    // chat; a no-op for clients who haven't linked one.
+    kind: "cron_completeness_chase",
+    schedule: "30 3 5 * *",
+    description: "Client completeness chase, 5th 09:00 IST.",
+  },
+  {
     // Spec §2.4 — daily prune of idempotency_log entries older than 72 h.
     // Runs at 02:00 IST (20:30 UTC the previous day) when traffic is lowest.
     kind: "cron_idempotency_cleanup",

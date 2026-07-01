@@ -36,6 +36,7 @@ from app.db.queries.idempotency import (
 )
 from app.db.queries.notifications import (
     CHASE_COOLDOWN_DAYS,
+    NOTIFICATION_COMPLETENESS_CHASE,
     NotificationQuery,
 )
 from app.db.queries.outcome_units import OutcomeUnitQuery
@@ -45,6 +46,7 @@ from app.db.session import get_sessionmaker
 from app.formatting.telegram_html import bold, code, italic, safe_text
 from app.logging_setup import get_logger
 from app.services import auto_ingest, scraper, telegram
+from app.services.completeness import LEG_LABELS, assess_firm_completeness
 from app.services.providers.email_ingest import get_email_ingest_client
 from app.services.providers.gsp import get_gsp_client
 from app.utils.background import get_registry
@@ -81,6 +83,17 @@ def _next_period(period: FilingPeriod) -> FilingPeriod:
     if period.month == 12:
         return FilingPeriod(year=period.year + 1, month=1)
     return FilingPeriod(year=period.year, month=period.month + 1)
+
+
+def _prev_period(period: FilingPeriod) -> FilingPeriod:
+    """Return the calendar month before ``period``.
+
+    The GST return filed *in* a given month covers the *previous* month's
+    transactions — so this is the period the 8c chase collects docs for.
+    """
+    if period.month == 1:
+        return FilingPeriod(year=period.year - 1, month=12)
+    return FilingPeriod(year=period.year, month=period.month - 1)
 
 
 def _spawn(coro: Any, name: str) -> None:
@@ -203,6 +216,77 @@ async def _chase_for_firm(firm: CaFirm, *, batch_cap: int = CLIENT_CHASE_BATCH_C
                 )
                 continue
             await notifications_q.record_notification(client_id=client.id)
+            sent += 1
+        await session.commit()
+
+
+def _completeness_chase_html(trade_name: str, missing: list[str], period: FilingPeriod) -> str:
+    """Client-facing nudge listing the exact legs still missing for a period."""
+    items = "\n".join("• " + safe_text(LEG_LABELS.get(leg, leg)) for leg in missing)
+    return (
+        bold("A quick nudge from your accountant") + " 📄\n\n"
+        + "To file your GST return for "
+        + code(f"{period.month:02d}/{period.year}")
+        + ", we still need:\n"
+        + items
+        + "\n\n"
+        + italic("Just forward it to this chat and I'll pass it straight on.")
+    )
+
+
+async def _completeness_chase_for_firm(
+    firm: CaFirm, *, batch_cap: int = CLIENT_CHASE_BATCH_CAP
+) -> None:
+    """Phase 8c — nudge each bound client for the docs still missing to file.
+
+    Runs the three-leg completeness (Phase 8b) across the firm for the period
+    now being filed (the previous calendar month), then messages each
+    *incomplete* client on their bound 1:1 chat with the exact missing legs.
+
+    Only clients who tapped their deep link (``telegram_chat_id`` set) can be
+    reached directly; unbound clients are the CA's own chase to make. The
+    per-client 7-day cooldown uses a dedicated ``completeness_chase`` type so
+    it never collides with the CA-facing document chase. Capped at
+    ``batch_cap`` sends per firm so a runaway can't blast Telegram.
+    """
+    factory = get_sessionmaker()
+    period = _prev_period(FilingPeriod.from_date(now_ist().date()))
+    async with factory() as session:
+        clients_q = ClientQuery(session=session, ca_firm_id=firm.id)
+        notifications_q = NotificationQuery(session=session, ca_firm_id=firm.id)
+        by_id = {c.id: c for c in await clients_q.list_active()}
+        reports = await assess_firm_completeness(
+            session=session, ca_firm_id=firm.id, month=period.month, year=period.year
+        )
+        sent = 0
+        for report in reports:
+            if sent >= batch_cap:
+                break
+            if report.is_complete:
+                continue
+            client = by_id.get(report.client_id)
+            if client is None or client.telegram_chat_id is None:
+                continue  # unbound — can't reach the client directly (CA chase covers them)
+            if await notifications_q.was_recently_notified(
+                client_id=report.client_id,
+                notification_type=NOTIFICATION_COMPLETENESS_CHASE,
+            ):
+                continue
+            html = _completeness_chase_html(report.trade_name, report.missing, period)
+            try:
+                await telegram.send_message(chat_id=client.telegram_chat_id, html_text=html)
+            except telegram.TelegramAPIError as exc:
+                _log.warning(
+                    "completeness_chase_send_failed",
+                    firm_id=str(firm.id),
+                    client_id=str(report.client_id),
+                    error=str(exc),
+                )
+                continue
+            await notifications_q.record_notification(
+                client_id=report.client_id,
+                notification_type=NOTIFICATION_COMPLETENESS_CHASE,
+            )
             sent += 1
         await session.commit()
 
@@ -379,6 +463,10 @@ async def _run_chase(_envelope: DecodedEnvelope) -> None:
     await _fanout(_chase_for_firm, label="client_chase")
 
 
+async def _run_completeness_chase(_envelope: DecodedEnvelope) -> None:
+    await _fanout(_completeness_chase_for_firm, label="completeness_chase")
+
+
 async def _run_recon_report(_envelope: DecodedEnvelope) -> None:
     await _fanout(_recon_report_for_firm, label="monthly_recon")
 
@@ -533,6 +621,17 @@ async def cron_idempotency_cleanup(
 ) -> Response:
     _assert_kind(envelope, "cron_idempotency_cleanup")
     return await _process_cron(envelope, verdict, _run_idempotency_cleanup, "idempotency_cleanup")
+
+
+@router.post("/completeness-chase", summary="Cron — 5th-of-month client completeness chase")
+async def cron_completeness_chase(
+    envelope: VerifiedCronEnvelopeDep,
+    verdict: IdempotencyCronDep,
+) -> Response:
+    _assert_kind(envelope, "cron_completeness_chase")
+    return await _process_cron(
+        envelope, verdict, _run_completeness_chase, "completeness_chase"
+    )
 
 
 @router.post("/monthly-recon", summary="Cron — monthly reconciliation digest")

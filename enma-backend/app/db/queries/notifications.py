@@ -18,11 +18,17 @@ from app.db.queries.base import BaseQuery
 
 __all__ = [
     "CHASE_COOLDOWN_DAYS",
+    "NOTIFICATION_COMPLETENESS_CHASE",
     "NOTIFICATION_DOCUMENT_CHASE",
     "NotificationQuery",
 ]
 
+# CA-facing chase (Phase 7): "these clients have no docs yet" → the CA.
 NOTIFICATION_DOCUMENT_CHASE: Final[str] = "document_chase"
+# Client-facing chase (Phase 8c): "we still need X from you" → the client on
+# their bound channel. Separate type so its cooldown is independent — a client
+# nudge must not suppress the CA's own overview chase, and vice versa.
+NOTIFICATION_COMPLETENESS_CHASE: Final[str] = "completeness_chase"
 CHASE_COOLDOWN_DAYS: Final[int] = 7
 
 
