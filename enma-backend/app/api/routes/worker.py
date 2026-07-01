@@ -68,7 +68,7 @@ from app.api.middleware.idempotency import IdempotencyDep, IdempotencyVerdict
 from app.db.models.client import Client
 from app.db.models.firm import CaFirm
 from app.db.queries.brain_events import BrainEventQuery
-from app.db.queries.clients import ClientQuery
+from app.db.queries.clients import ClientQuery, find_client_by_telegram_chat_id
 from app.db.queries.conversations import RECENT_WINDOW_TURNS, ConversationQuery
 from app.db.queries.documents import DocumentQuery
 from app.db.queries.firms import find_firm_by_admin_chat_id
@@ -139,7 +139,24 @@ async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PL
 
     factory = get_sessionmaker()
     async with factory() as session:
+        # Resolve the chat's owner. A CA's admin chat resolves a firm; a
+        # client's bound 1:1 chat (ADR-017, Phase 8a) resolves both the firm
+        # AND the client, so their documents route to them with no "which
+        # client?" ambiguity — the deep-link binding already decided identity.
+        bound_client: Client | None = None
         firm = await find_firm_by_admin_chat_id(session, envelope.chat_id)
+        if firm is None:
+            binding = await find_client_by_telegram_chat_id(
+                session, envelope.chat_id
+            )
+            if binding is not None:
+                bound_client, firm = binding
+                _log.info(
+                    "document_pipeline_bound_client",
+                    client_id=str(bound_client.id),
+                    firm_id=str(firm.id),
+                    chat_id=envelope.chat_id,
+                )
         if firm is None:
             await _send_user_error(
                 envelope.chat_id,
@@ -174,6 +191,7 @@ async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PL
                 file_bytes=file_bytes,
                 caption=caption,
                 file_id=file_id,
+                bound_client=bound_client,
             )
             return
 
@@ -222,6 +240,7 @@ async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PL
                 statement=statement,
                 caption=caption,
                 file_id=file_id,
+                bound_client=bound_client,
             )
             return
 
@@ -247,6 +266,7 @@ async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PL
                 statement=statement,
                 caption=caption,
                 file_id=file_id,
+                bound_client=bound_client,
             )
             return
 
@@ -309,6 +329,23 @@ async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PL
 
         # ---- Step 4: route on extracted buyer fields --------------------
         extraction_data = extraction_outcome.extraction
+
+        # Phase 8a.2 — a bound client's chat already tells us the client.
+        # Skip identity resolution (and the "which client?" prompt a client
+        # can't answer) and finalise straight to them.
+        if bound_client is not None:
+            await _finalize_and_summarise(
+                session=session,
+                firm=firm,
+                client=bound_client,
+                outcome=extraction_outcome,
+                file_ids=[file_id],
+                chat_id=envelope.chat_id,
+                reply_to_message_id=envelope.message_id,
+                source_file_hash=source_file_hash,
+            )
+            return
+
         extracted_vendor_gstin = _safe_str(extraction_data, "vendor", "gstin")
         outcome = await resolve_identity(
             session=session,
@@ -477,6 +514,7 @@ async def _run_tally_ingestion(
     file_bytes: bytes,
     caption: str | None,
     file_id: str | None = None,
+    bound_client: Client | None = None,
 ) -> None:
     """Parse an uploaded Tally export and land its vouchers as brain_events.
 
@@ -486,6 +524,10 @@ async def _run_tally_ingestion(
     vouchers are added. When the export can't be routed to a client it is
     **held** on a pending row (like bank/invoice uploads) so a free-form
     name reply resumes ingestion instead of dropping the file.
+
+    ``bound_client`` (Phase 8a.2): set when the upload arrives on a client's
+    bound 1:1 chat — identity is already known, so we skip company/caption
+    resolution and the pending-hold entirely.
     """
     try:
         export = tally_import.parse_tally_export(file_bytes)
@@ -498,7 +540,7 @@ async def _run_tally_ingestion(
         )
         return
 
-    client = await _resolve_tally_client(
+    client = bound_client or await _resolve_tally_client(
         session=session,
         firm=firm,
         company_name=export.company_name,
@@ -754,6 +796,7 @@ async def _run_bank_ingestion(
     statement: bank_import.ParsedBankStatement,
     caption: str | None,
     file_id: str | None = None,
+    bound_client: Client | None = None,
 ) -> None:
     """Ingest a parsed bank statement's debits and run the 180-day recon.
 
@@ -765,12 +808,16 @@ async def _run_bank_ingestion(
     for. A free-form name reply then resumes ingestion via
     :func:`_resume_pipeline_for_pending_assignment` — same UX as invoices,
     so the file is never dropped (ADR-016).
+
+    ``bound_client`` (Phase 8a.2): set when the statement arrives on a
+    client's bound 1:1 chat — the client's own most common upload — so we
+    route straight to them with no caption match or pending hold.
     """
-    clients_q = ClientQuery(session=session, ca_firm_id=firm.id)
-    client = await _resolve_tally_client(
+    client = bound_client or await _resolve_tally_client(
         session=session, firm=firm, company_name="", caption=caption
     )
     if client is None:
+        clients_q = ClientQuery(session=session, ca_firm_id=firm.id)
         active = list(await clients_q.list_active())
         if len(active) == 1:
             client = active[0]

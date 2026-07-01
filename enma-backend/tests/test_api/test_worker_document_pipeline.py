@@ -103,6 +103,7 @@ def _patch_common(
     *,
     firm: Any = _SENTINEL,
     client: Any = _SENTINEL,
+    binding: Any = None,
     download_bytes: bytes = b"\x89PNG\r\n\x1a\nfake",
     pipeline_result: PipelineResult | None = None,
     pipeline_raise: Exception | None = None,
@@ -113,12 +114,23 @@ def _patch_common(
         "downloads": [],
         "sends": [],
         "pipeline_calls": [],
+        "resolve_calls": [],
     }
 
     async def fake_find_firm(_session: Any, _chat_id: int) -> Any:
         return firm
 
     monkeypatch.setattr(worker_module, "find_firm_by_admin_chat_id", fake_find_firm)
+
+    # Phase 8a.2 — the bound-client fallback only runs when find_firm is None.
+    # Default None preserves the "unknown firm" path; tests pass a
+    # (client, firm) tuple to exercise bound-client document routing.
+    async def fake_find_binding(_session: Any, _chat_id: int) -> Any:
+        return binding
+
+    monkeypatch.setattr(
+        worker_module, "find_client_by_telegram_chat_id", fake_find_binding
+    )
 
     from app.identity.resolver import (
         ResolutionConfidence,
@@ -131,6 +143,7 @@ def _patch_common(
     synthetic_client_id = getattr(client, "id", None) or uuid.uuid4()
 
     async def fake_resolve_identity(**_kw: Any) -> ResolutionOutcome:
+        captures["resolve_calls"].append(_kw)
         if pending_assignment:
             return ResolutionOutcome(
                 stage=ResolutionStage.EXPLICIT_ASK,
@@ -270,6 +283,55 @@ async def test_no_firm_sends_error_message(monkeypatch: pytest.MonkeyPatch) -> N
     assert captures["pipeline_calls"] == []
     # An HTML error was sent.
     assert len(captures["sends"]) == 1
+    assert "No firm is registered" in captures["sends"][0]["html_text"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 8a.2 — bound client 1:1 chat routing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bound_client_chat_routes_without_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A document from a bound client's chat finalises straight to them.
+
+    No CA firm owns the chat (find_firm → None), but
+    find_client_by_telegram_chat_id resolves it to (client, firm). Identity
+    resolution must be skipped — we already know whose document this is — so
+    no "which client?" prompt can arise.
+    """
+    bound_client = _FakeClient()
+    captures = _patch_common(
+        monkeypatch,
+        firm=None,  # not a CA admin chat
+        client=bound_client,
+        binding=(bound_client, _FakeFirm()),
+    )
+
+    await worker_module._run_document_pipeline(_envelope())
+
+    assert captures["downloads"] == ["tg-file-1"]
+    assert len(captures["pipeline_calls"]) == 1
+    assert captures["pipeline_calls"][0]["client_id"] == bound_client.id
+    assert len(captures["sends"]) == 1
+    assert "Document processed" in captures["sends"][0]["html_text"]
+    # The whole point: identity resolution was bypassed.
+    assert captures["resolve_calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_unbound_unknown_chat_still_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No firm AND no client binding → the unchanged 'unknown firm' error."""
+    captures = _patch_common(
+        monkeypatch, firm=None, client=_FakeClient(), binding=None
+    )
+    await worker_module._run_document_pipeline(_envelope())
+    assert captures["downloads"] == []
+    assert captures["pipeline_calls"] == []
     assert "No firm is registered" in captures["sends"][0]["html_text"]
 
 
