@@ -7,6 +7,9 @@
 # Docker
 docker-compose.override.yml
 
+# Build / deploy artifacts (never commit — rebuilt from source on deploy)
+*-deploy.zip
+
 # OS
 .DS_Store
 Thumbs.db
