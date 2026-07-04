@@ -43,6 +43,7 @@ from app.agents.commands import (
     is_slash_command,
     parse_command,
 )
+from app.agents.consent import handle_consent_reply
 from app.agents.filing_approval import (
     APPROVAL_REGEX,
     FilingPeriodAlreadyLocked,
@@ -1512,6 +1513,21 @@ async def _run_command_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PLR
                 "No firm is registered for this Telegram account. "
                 "Please complete signup at https://enmalabs.in/onboarding "
                 "and then tap the link from your dashboard.",
+            )
+            return
+
+        # ---- 0b'. GSP OTP-consent reply (Phase 7b) -----------------------
+        # If this chat is mid-consent and the message is OTP-shaped, verify it
+        # and store the per-client token — BEFORE the pending-assignment /
+        # supervisor paths, which would otherwise mis-handle a bare numeric code.
+        consent_html = await handle_consent_reply(
+            session, chat_id=envelope.chat_id, text=text
+        )
+        if consent_html is not None:
+            await telegram.send_message(
+                chat_id=envelope.chat_id,
+                html_text=consent_html,
+                reply_to_message_id=envelope.message_id,
             )
             return
 

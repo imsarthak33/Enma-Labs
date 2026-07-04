@@ -30,6 +30,7 @@ from typing import Final
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agents.consent import start_consent
 from app.db.queries.bug_reports import BugReportQuery
 from app.db.queries.clients import ClientQuery
 from app.db.queries.pending_assignments import PendingAssignmentQuery
@@ -268,6 +269,27 @@ async def _cmd_assign(ctx: _ExecCtx, cmd: ParsedCommand) -> CommandResult:
 
 
 # ---------------------------------------------------------------------------
+# /consent — start the per-client GSP OTP-consent flow (Phase 7b)
+# ---------------------------------------------------------------------------
+
+
+async def _cmd_consent(ctx: _ExecCtx, cmd: ParsedCommand) -> CommandResult:
+    if not cmd.args:
+        return _fail("Usage: " + code('/consent "Client Name"'))
+    name = " ".join(arg.strip() for arg in cmd.args if arg.strip()).strip()
+    if not name:
+        return _fail("Client name cannot be empty.")
+    html = await start_consent(
+        ctx.session,
+        ca_firm_id=ctx.ca_firm_id,
+        chat_id=ctx.chat_id,
+        client_name=name,
+    )
+    # start_consent owns the success/failure copy; treat as a delivered reply.
+    return CommandResult(html=html, success=True)
+
+
+# ---------------------------------------------------------------------------
 # /bug
 # ---------------------------------------------------------------------------
 
@@ -307,6 +329,7 @@ _HANDLERS: Final[dict[str, _Handler]] = {
     "add_client": _cmd_add_client,
     "assign": _cmd_assign,
     "bug": _cmd_bug,
+    "consent": _cmd_consent,
     "list_clients": _cmd_list_clients,
     "status": _cmd_status,
 }

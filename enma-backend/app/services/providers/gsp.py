@@ -23,6 +23,8 @@ POINT below:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Final, Protocol, runtime_checkable
 
 import httpx
@@ -31,20 +33,41 @@ from app.config import Settings
 from app.logging_setup import get_logger
 
 __all__ = [
+    "GspAuthToken",
     "GspProvider",
     "HttpGspClient",
     "NullGspClient",
+    "OtpChallenge",
     "get_gsp_client",
 ]
 
 _log = get_logger(__name__)
 
 _REQUEST_TIMEOUT_S: Final[float] = 30.0
+# GSTN OTP-consent tokens are short-lived and refreshable. Absent a real
+# expiry from the GSP response, assume this conservative window so the pull
+# cron re-consents rather than calling with a stale token.
+_DEFAULT_TOKEN_TTL: Final[timedelta] = timedelta(hours=6)
+
+
+@dataclass(frozen=True)
+class OtpChallenge:
+    """Opaque handle correlating an OTP request to its later verification."""
+
+    txn_id: str
+
+
+@dataclass(frozen=True)
+class GspAuthToken:
+    """A per-client GSP auth token (from OTP consent) plus its expiry."""
+
+    token: str
+    expires_at: datetime
 
 
 @runtime_checkable
 class GspProvider(Protocol):
-    """Pulls a client's GSTR-2B JSON for a return period from a GSP."""
+    """Pulls a client's GSTR-2B JSON + drives the per-client OTP consent."""
 
     @property
     def is_configured(self) -> bool: ...
@@ -53,6 +76,20 @@ class GspProvider(Protocol):
         self, *, gstin: str, return_period: str, auth_token: str
     ) -> bytes | None:
         """Return the GSTR-2B JSON bytes, or ``None`` when unavailable."""
+        ...
+
+    async def request_consent_otp(self, *, gstin: str) -> OtpChallenge | None:
+        """Ask the GSP to send a consent OTP to the taxpayer's registered mobile.
+
+        Returns a challenge whose ``txn_id`` is presented back at verification,
+        or ``None`` when the GSP is unconfigured / the request fails.
+        """
+        ...
+
+    async def verify_consent_otp(
+        self, *, gstin: str, txn_id: str, otp: str
+    ) -> GspAuthToken | None:
+        """Exchange the OTP for a per-client auth token, or ``None`` on failure."""
         ...
 
 
@@ -66,6 +103,14 @@ class NullGspClient:
     async def fetch_gstr2b(
         self, *, gstin: str, return_period: str, auth_token: str
     ) -> bytes | None:
+        return None
+
+    async def request_consent_otp(self, *, gstin: str) -> OtpChallenge | None:
+        return None
+
+    async def verify_consent_otp(
+        self, *, gstin: str, txn_id: str, otp: str
+    ) -> GspAuthToken | None:
         return None
 
 
@@ -112,6 +157,70 @@ class HttpGspClient:
             )
             return None
         return resp.content
+
+    async def request_consent_otp(self, *, gstin: str) -> OtpChallenge | None:
+        """Trigger the GSTN OTP to the taxpayer's registered mobile.
+
+        INTEGRATION POINT — path + payload + the field holding the correlation
+        id are GSP-specific. The generic shape below (POST a gstin, read a
+        ``txn`` back) matches the common GSP surface; adjust on subscription.
+        """
+        url = f"{self._base_url}/consent/otp/request"
+        headers = {"x-api-key": self._api_key, "accept": "application/json"}
+        try:
+            async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_S) as client:
+                resp = await client.post(url, json={"gstin": gstin}, headers=headers)
+        except httpx.HTTPError as exc:
+            _log.error("gsp_otp_request_failed", gstin=gstin, error=str(exc))
+            return None
+        if resp.status_code != httpx.codes.OK:
+            _log.warning("gsp_otp_request_non_200", gstin=gstin, status=resp.status_code)
+            return None
+        txn = str((resp.json() or {}).get("txn") or "").strip()
+        if not txn:
+            _log.warning("gsp_otp_request_no_txn", gstin=gstin)
+            return None
+        return OtpChallenge(txn_id=txn)
+
+    async def verify_consent_otp(
+        self, *, gstin: str, txn_id: str, otp: str
+    ) -> GspAuthToken | None:
+        """Exchange (txn, otp) for a per-client auth token.
+
+        INTEGRATION POINT — response field names (``auth_token`` / ``expiry``)
+        vary by GSP. When the response carries no explicit expiry we fall back
+        to :data:`_DEFAULT_TOKEN_TTL` so the pull cron re-consents conservatively.
+        """
+        url = f"{self._base_url}/consent/otp/verify"
+        headers = {"x-api-key": self._api_key, "accept": "application/json"}
+        payload = {"gstin": gstin, "txn": txn_id, "otp": otp}
+        try:
+            async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_S) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+        except httpx.HTTPError as exc:
+            _log.error("gsp_otp_verify_failed", gstin=gstin, error=str(exc))
+            return None
+        if resp.status_code != httpx.codes.OK:
+            _log.warning("gsp_otp_verify_non_200", gstin=gstin, status=resp.status_code)
+            return None
+        body = resp.json() or {}
+        token = str(body.get("auth_token") or "").strip()
+        if not token:
+            _log.warning("gsp_otp_verify_no_token", gstin=gstin)
+            return None
+        expires_at = _parse_expiry(body.get("expiry"))
+        return GspAuthToken(token=token, expires_at=expires_at)
+
+
+def _parse_expiry(raw: object) -> datetime:
+    """Parse a GSP expiry into a tz-aware datetime, or default the TTL."""
+    if isinstance(raw, str) and raw.strip():
+        try:
+            dt = datetime.fromisoformat(raw.strip())
+            return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+        except ValueError:
+            pass
+    return datetime.now(UTC) + _DEFAULT_TOKEN_TTL
 
 
 def get_gsp_client(settings: Settings) -> GspProvider:
