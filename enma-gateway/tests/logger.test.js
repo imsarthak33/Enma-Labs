@@ -8,6 +8,10 @@ let errSpy;
 beforeEach(async () => {
   process.env.NODE_ENV = "test";
   process.env.LOG_LEVEL = "debug";
+  // These tests assert the structured JSON renderer. In "auto" (the default)
+  // a non-production NODE_ENV resolves to the human-readable console format,
+  // so force json explicitly — otherwise JSON.parse chokes on the text line.
+  process.env.LOG_FORMAT = "json";
   vi.resetModules();
   const mod = await import("../src/utils/logger.js");
   logger = mod.logger;
