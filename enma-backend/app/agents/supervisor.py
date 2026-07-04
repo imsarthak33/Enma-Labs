@@ -63,6 +63,7 @@ from app.services import telegram as telegram_service
 from app.services.client_channels import client_deep_link, client_ingest_email
 from app.services.completeness import LEG_LABELS, assess_completeness
 from app.services.export import generate_client_ledger_csv
+from app.services.filing.gstr3b import build_gstr3b_draft
 from app.services.llm import (
     ChatMessage,
     ChatResponse,
@@ -390,6 +391,34 @@ async def _tool_get_completeness(
         ],
         "missing": [LEG_LABELS.get(name, name) for name in report.missing],
     }
+
+
+async def _tool_prepare_gstr3b(
+    ctx: SupervisorContext, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Phase 9 — assemble a DRAFT GSTR-3B summary for a client + period.
+
+    Gathers outward tax (from Tally sales vouchers) and ITC (from the period's
+    reconciliation) into the GSTR-3B shape. This is a draft for the CA to
+    review + lock via ENMA APPROVE FILING; it does NOT file the return.
+    """
+    client = await _resolve_client_from_args(ctx, args)
+    now = datetime.now(UTC)
+    month = _coerce_int_or_none(args.get("filing_period_month")) or now.month
+    year = _coerce_int_or_none(args.get("filing_period_year")) or now.year
+    if not 1 <= month <= 12:  # — calendar month bound
+        raise ToolError("filing_period_month must be 1-12")
+
+    draft = await build_gstr3b_draft(
+        session=ctx.session,
+        ca_firm_id=ctx.ca_firm_id,
+        client_id=client.id,
+        month=month,
+        year=year,
+    )
+    result = draft.to_payload()
+    result["client"] = client.trade_name
+    return result
 
 
 async def _tool_list_tasks(
@@ -2402,6 +2431,30 @@ TOOLS: Final[dict[str, ToolSpec]] = {
             "additionalProperties": False,
         },
         runner=_tool_get_completeness,
+    ),
+    "prepare_gstr3b": ToolSpec(
+        name="prepare_gstr3b",
+        description=(
+            "Assemble a DRAFT GSTR-3B summary for a client + period — outward "
+            "tax liability (from Tally sales vouchers) and ITC (from the "
+            "reconciliation), with net tax payable. Use when the CA asks "
+            "'prepare the 3B for CLIENT', 'draft CLIENT's GSTR-3B', 'what's "
+            "CLIENT's tax payable for March'. Pass client_id OR client_name; "
+            "filing_period_month/year default to the current month. Returns a "
+            "DRAFT with notes — the CA reviews and locks it via ENMA APPROVE "
+            "FILING; this does not file the return."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "client_id": {"type": "string"},
+                "client_name": {"type": "string"},
+                "filing_period_month": {"type": "integer", "minimum": 1, "maximum": 12},
+                "filing_period_year": {"type": "integer", "minimum": 2020, "maximum": 2100},
+            },
+            "additionalProperties": False,
+        },
+        runner=_tool_prepare_gstr3b,
     ),
     "query_brain": ToolSpec(
         name="query_brain",

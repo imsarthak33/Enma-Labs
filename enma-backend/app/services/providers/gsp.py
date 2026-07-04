@@ -33,6 +33,7 @@ from app.config import Settings
 from app.logging_setup import get_logger
 
 __all__ = [
+    "FilingReceipt",
     "GspAuthToken",
     "GspProvider",
     "HttpGspClient",
@@ -65,6 +66,14 @@ class GspAuthToken:
     expires_at: datetime
 
 
+@dataclass(frozen=True)
+class FilingReceipt:
+    """The GSTN acknowledgement of a filed return (Phase 9 submission)."""
+
+    reference_id: str  # ARN / acknowledgement number
+    status: str
+
+
 @runtime_checkable
 class GspProvider(Protocol):
     """Pulls a client's GSTR-2B JSON + drives the per-client OTP consent."""
@@ -92,6 +101,22 @@ class GspProvider(Protocol):
         """Exchange the OTP for a per-client auth token, or ``None`` on failure."""
         ...
 
+    async def file_return(
+        self,
+        *,
+        gstin: str,
+        return_type: str,
+        return_period: str,
+        auth_token: str,
+        payload: dict[str, object],
+    ) -> FilingReceipt | None:
+        """Submit an APPROVED return (GSTR-1/3B) to GSTN via the GSP (Phase 9).
+
+        Returns the GSTN acknowledgement, or ``None`` when unconfigured / the
+        submission fails. Only ever called on a CA-approved filing snapshot.
+        """
+        ...
+
 
 class NullGspClient:
     """No-op adapter used when no GSP is configured (the default)."""
@@ -111,6 +136,17 @@ class NullGspClient:
     async def verify_consent_otp(
         self, *, gstin: str, txn_id: str, otp: str
     ) -> GspAuthToken | None:
+        return None
+
+    async def file_return(
+        self,
+        *,
+        gstin: str,
+        return_type: str,
+        return_period: str,
+        auth_token: str,
+        payload: dict[str, object],
+    ) -> FilingReceipt | None:
         return None
 
 
@@ -210,6 +246,55 @@ class HttpGspClient:
             return None
         expires_at = _parse_expiry(body.get("expiry"))
         return GspAuthToken(token=token, expires_at=expires_at)
+
+    async def file_return(
+        self,
+        *,
+        gstin: str,
+        return_type: str,
+        return_period: str,
+        auth_token: str,
+        payload: dict[str, object],
+    ) -> FilingReceipt | None:
+        """Submit an approved return to GSTN via the GSP.
+
+        INTEGRATION POINT — the save/submit/file sequence (GSTN often splits
+        save-then-file), the endpoint, and the ack field names are GSP-specific.
+        The generic shape below POSTs the return payload and reads an ``arn``
+        back. Wire to the chosen GSP's return-filing API on subscription.
+        """
+        url = f"{self._base_url}/returns/{return_type.lower()}"
+        headers = {
+            "x-api-key": self._api_key,
+            "x-auth-token": auth_token,
+            "accept": "application/json",
+        }
+        body = {"gstin": gstin, "rtnprd": return_period, "return": payload}
+        try:
+            async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_S) as client:
+                resp = await client.post(url, json=body, headers=headers)
+        except httpx.HTTPError as exc:
+            _log.error(
+                "gsp_file_return_failed",
+                gstin=gstin,
+                return_type=return_type,
+                error=str(exc),
+            )
+            return None
+        if resp.status_code != httpx.codes.OK:
+            _log.warning(
+                "gsp_file_return_non_200",
+                gstin=gstin,
+                return_type=return_type,
+                status=resp.status_code,
+            )
+            return None
+        data = resp.json() or {}
+        arn = str(data.get("arn") or data.get("reference_id") or "").strip()
+        if not arn:
+            _log.warning("gsp_file_return_no_arn", gstin=gstin)
+            return None
+        return FilingReceipt(reference_id=arn, status=str(data.get("status") or "filed"))
 
 
 def _parse_expiry(raw: object) -> datetime:
