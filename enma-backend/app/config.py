@@ -340,6 +340,30 @@ class Settings(BaseSettings):
         description="GST Suvidha Provider API key / client secret.",
     )
 
+    # Phase 7c — Account Aggregator (RBI/Sahamati) zero-touch bank pull.
+    # Dormant until the AA base URL + API key are set (per-client consent
+    # handles are stored separately, per consented client). See ADR-018.
+    aa_base_url: str | None = Field(
+        default=None,
+        description="Account Aggregator / FIU gateway API base URL (Sahamati ecosystem).",
+    )
+    aa_api_key: SecretStr | None = Field(
+        default=None,
+        description="Account Aggregator FIU API key / client secret.",
+    )
+
+    # Phase 7c — Tally HTTP connector for zero-upload books sync. Dormant
+    # until the connector base URL is set (a local Tally Gateway Server the
+    # firm exposes, or a hosted bridge). See ADR-019.
+    tally_connector_url: str | None = Field(
+        default=None,
+        description="Tally HTTP connector base URL (Tally Gateway Server / bridge).",
+    )
+    tally_connector_api_key: SecretStr | None = Field(
+        default=None,
+        description="Optional shared secret for the Tally connector bridge.",
+    )
+
     # -- CORS -----------------------------------------------------------------
     cors_origins: list[str] = Field(
         default_factory=lambda: ["http://localhost:3000"],
@@ -374,6 +398,14 @@ class Settings(BaseSettings):
     def is_gsp_configured(self) -> bool:
         """True when the GST Suvidha Provider base URL + API key are set."""
         return bool(self.gsp_base_url and self.gsp_api_key)
+
+    def is_account_aggregator_configured(self) -> bool:
+        """True when the Account Aggregator FIU gateway is configured (7c)."""
+        return bool(self.aa_base_url and self.aa_api_key)
+
+    def is_tally_connector_configured(self) -> bool:
+        """True when the Tally HTTP connector base URL is set (7c)."""
+        return bool(self.tally_connector_url)
 
     def is_production(self) -> bool:
         return self.env == Environment.PRODUCTION
