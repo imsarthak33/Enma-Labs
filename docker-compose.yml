@@ -46,6 +46,14 @@ services:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-changeme}
       BACKEND_API_KEY: ${BACKEND_API_KEY:-dev_backend_api_key_change_me}
       GATEWAY_HMAC_SECRET: ${GATEWAY_HMAC_SECRET:-dev_hmac_secret_change_me}
+      # LLM access — without this the backend boots but every model call 401s,
+      # surfacing as "I could not reach the language model" in chat. Model
+      # endpoints/names have working defaults in app/config.py; to point at a
+      # different provider (e.g. a LiteLLM proxy in front of Bedrock) set the
+      # matching *_MODEL_ENDPOINT / *_MODEL_NAME vars in your shell or root .env
+      # and add them here — do NOT wire them with empty defaults, which would
+      # blank out the config defaults and break every call.
+      LLM_API_KEY: ${LLM_API_KEY:-}
       SENTRY_DSN: ${SENTRY_DSN:-}
       SENTRY_TRACES_SAMPLE_RATE: ${SENTRY_TRACES_SAMPLE_RATE:-0.1}
     ports:

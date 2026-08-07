@@ -158,12 +158,20 @@ class Settings(BaseSettings):
     extraction_model_endpoint: str = Field(
         default="https://integrate.api.nvidia.com/v1/chat/completions"
     )
-    extraction_model_name: str = Field(default="nvidia/nemotron-ocr-v1")
+    # nvidia/nemotron-ocr-v1 was retired from the NIM catalog (404). nano-VL is
+    # the OCR/extraction fit: fast (sub-second) and returns clean JSON. The
+    # extractor no longer forces response_format=json_object (which 500s this
+    # model) and parses tolerantly, so nano-VL's fenced JSON works. If nano-VL is
+    # ever unavailable, meta/llama-3.2-90b-vision-instruct is a slower fallback.
+    extraction_model_name: str = Field(default="nvidia/llama-3.1-nemotron-nano-vl-8b-v1")
 
     reasoning_model_endpoint: str = Field(
         default="https://integrate.api.nvidia.com/v1/chat/completions"
     )
-    reasoning_model_name: str = Field(default="meta/llama-3.3-70b-instruct")
+    # meta/llama-3.3-70b-instruct is listed but no longer served on integrate.api
+    # (requests hang to timeout). Nemotron Super 49B v1.5 is served, fast, and
+    # supports OpenAI tool-calling — what the supervisor agent needs.
+    reasoning_model_name: str = Field(default="nvidia/llama-3.3-nemotron-super-49b-v1.5")
 
     # Voice transcription (NVIDIA NIM audio endpoint, Whisper-compatible).
     whisper_endpoint: str | None = Field(
@@ -177,9 +185,7 @@ class Settings(BaseSettings):
     # ca_firm_rules.rule_embedding VECTOR(1024) column.
     # ⚠  Use nvidia/nv-embedqa-e5-v5 — produces exactly 1024 dims.
     #    Do NOT use nv-embedcode-7b-v1 (code embeddings, wrong domain).
-    embedding_endpoint: str | None = Field(
-        default="https://integrate.api.nvidia.com/v1/embeddings"
-    )
+    embedding_endpoint: str | None = Field(default="https://integrate.api.nvidia.com/v1/embeddings")
     embedding_model_name: str = Field(default="nvidia/nv-embedqa-e5-v5")
     embedding_dimensions: int = Field(default=1024, ge=64, le=4096)
     # Force-override the embedder's "send dimensions?" auto-detection.

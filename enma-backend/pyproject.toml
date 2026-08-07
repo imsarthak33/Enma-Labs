@@ -35,6 +35,10 @@ dependencies = [
     "cryptography>=42.0.0,<44.0.0",
     # P1 Brain Ingestion — XXE-safe parsing of user-supplied Tally XML
     "defusedxml>=0.7.1,<0.8.0",
+    # IANA tz database — the app pins IST (Asia/Kolkata) everywhere. Windows and
+    # slim container images ship no system tz db, so zoneinfo raises
+    # ZoneInfoNotFoundError without this. Bundling it makes the app portable.
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]
