@@ -1,0 +1,58 @@
+name: Deploy backend to ECS
+
+# Auto-deploy on every push to main that touches the backend. Reuses the
+# existing scripts/deploy.py pipeline (git archive -> S3 -> CodeBuild ->
+# ECR digest -> pinned task def -> ECS update-service), so this workflow only
+# adds AWS auth + orchestration; the build/push logic stays in CodeBuild.
+#
+# SETUP REQUIRED (one-time, in AWS + GitHub) — see docs/CI_DEPLOY_SETUP.md:
+#   1. Create a GitHub OIDC IAM role in account 603013471251 that this repo
+#      (imsarthak33/Enma-Labs) may assume, with deploy permissions.
+#   2. Add its ARN as an Actions *variable* named AWS_DEPLOY_ROLE_ARN
+#      (repo -> Settings -> Secrets and variables -> Actions -> Variables).
+# Until that is done, the "Configure AWS credentials" step will fail.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "enma-backend/**"
+      - "scripts/deploy.py"
+      - ".github/workflows/deploy-backend.yml"
+  workflow_dispatch: {} # allow manual "Run workflow" from the Actions tab
+
+# Never run two deploys at once; let an in-flight deploy finish rather than
+# cancelling it half-way.
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+permissions:
+  id-token: write # required for OIDC role assumption
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Optional manual gate: configure required reviewers on this environment
+    # (repo -> Settings -> Environments -> production) to make each deploy
+    # wait for a one-click approval. With no protection rules it deploys
+    # automatically. Remove this line for unconditional auto-deploy.
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ap-south-1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Deploy to ECS (build via CodeBuild, pin digest, update service)
+        run: python scripts/deploy.py
