@@ -83,7 +83,7 @@ from app.identity.resolver import (
 )
 from app.logging_setup import get_logger
 from app.services import tally_import, telegram
-from app.services.llm import LLMError
+from app.services.llm import LLMError, NoEndpointConfigured
 from app.services.messaging import factory as messaging_factory
 from app.services.messaging.base import RawHtml
 from app.utils.background import get_registry
@@ -173,9 +173,7 @@ async def _run_document_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PL
         # uploaded the same file before; render a dedup banner and stop.
         source_file_hash = hashlib.sha256(file_bytes).hexdigest()
         docs_q = DocumentQuery(session=session, ca_firm_id=firm.id)
-        existing_dup = await docs_q.find_by_source_file_hash(
-            source_file_hash=source_file_hash
-        )
+        existing_dup = await docs_q.find_by_source_file_hash(source_file_hash=source_file_hash)
         if existing_dup is not None:
             _log.info(
                 "document_early_dedup_hit",
@@ -694,13 +692,10 @@ async def _try_resolve_pending_from_text(
     top_client, top_sim = ranked[0]
 
     # Single-candidate HIGH: deterministic resolve + cached-extraction finalise.
-    if (
-        top_sim >= BUYER_NAME_TRGM_HIGH_THRESHOLD
-        and (len(ranked) == 1 or (ranked[1][1] < top_sim - 0.05))
+    if top_sim >= BUYER_NAME_TRGM_HIGH_THRESHOLD and (
+        len(ranked) == 1 or (ranked[1][1] < top_sim - 0.05)
     ):
-        resolved = await pending_q.resolve(
-            pending_id=most_recent.id, client_id=top_client.id
-        )
+        resolved = await pending_q.resolve(pending_id=most_recent.id, client_id=top_client.id)
         if resolved is None:
             # Race / TTL: nothing to do, let supervisor handle it.
             return False
@@ -724,9 +719,7 @@ async def _try_resolve_pending_from_text(
 
     # MEDIUM or multiple HIGH candidates → ask informally, no syntax demanded.
     candidates_html = "\n".join(
-        "• "
-        + safe_text(c.trade_name)
-        + italic(f" ({int(sim * 100)}% match)")
+        "• " + safe_text(c.trade_name) + italic(f" ({int(sim * 100)}% match)")
         for c, sim in ranked[:3]
     )
     body = (
@@ -928,9 +921,7 @@ async def _phase3_stub_pipeline(envelope: DecodedEnvelope) -> None:
 
 
 # Pattern for the confirmation message: "ENMA CONFIRM FILING <8-hex>".
-_CONFIRM_REGEX: re.Pattern[str] = re.compile(
-    r"^ENMA CONFIRM FILING ([0-9a-f]{8})$"
-)
+_CONFIRM_REGEX: re.Pattern[str] = re.compile(r"^ENMA CONFIRM FILING ([0-9a-f]{8})$")
 
 
 async def _run_command_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PLR0911, PLR0912
@@ -955,7 +946,6 @@ async def _run_command_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PLR
 
     factory = get_sessionmaker()
     async with factory() as session:
-
         # ---- 0. /start (onboarding) — BEFORE firm lookup -----------------
         if text.lower().startswith("/start"):
             payload = text[6:].strip() if len(text) > 6 else None
@@ -969,9 +959,7 @@ async def _run_command_pipeline(envelope: DecodedEnvelope) -> None:  # noqa: PLR
 
         # ---- 0b. Mid-onboarding reply — BEFORE firm lookup ---------------
         if is_in_onboarding(envelope.chat_id):
-            html = await handle_onboarding_reply(
-                session, envelope.chat_id, text
-            )
+            html = await handle_onboarding_reply(session, envelope.chat_id, text)
             if html is not None:
                 await telegram.send_message(
                     chat_id=envelope.chat_id,
@@ -1106,9 +1094,7 @@ async def _handle_approval_parse(
 ) -> None:
     """Parse ENMA APPROVE FILING and reply with the confirm prompt."""
     try:
-        intent = await parse_approval_intent(
-            session=session, ca_firm_id=ca_firm_id, text=text
-        )
+        intent = await parse_approval_intent(session=session, ca_firm_id=ca_firm_id, text=text)
     except InvalidApprovalString:
         await _send_user_error(chat_id, "Could not parse the approval string.")
         return
@@ -1125,9 +1111,15 @@ async def _handle_approval_parse(
         + "\n"
         + f"Period: {intent.month:02d}/{intent.year}\n"
         + f"Documents: {intent.document_count}\n"
-        + "Taxable value: " + code(str(intent.total_taxable_value)) + "\n"
-        + "Total tax: " + code(str(intent.total_tax)) + "\n\n"
-        + "Reply with " + code(f"ENMA CONFIRM FILING {hash8}") + " to finalise."
+        + "Taxable value: "
+        + code(str(intent.total_taxable_value))
+        + "\n"
+        + "Total tax: "
+        + code(str(intent.total_tax))
+        + "\n\n"
+        + "Reply with "
+        + code(f"ENMA CONFIRM FILING {hash8}")
+        + " to finalise."
     )
     await telegram.send_message(
         chat_id=chat_id,
@@ -1218,9 +1210,7 @@ async def _handle_supervisor(
     convs = ConversationQuery(session=session, ca_firm_id=ca_firm_id)
     active_client_id = await convs.get_last_client_id(chat_id=chat_id)
 
-    recent = await convs.list_recent_live(
-        chat_id=chat_id, limit=RECENT_WINDOW_TURNS
-    )
+    recent = await convs.list_recent_live(chat_id=chat_id, limit=RECENT_WINDOW_TURNS)
     history = [
         {"role": t.role, "content": t.content}
         for t in recent
@@ -1248,9 +1238,24 @@ async def _handle_supervisor(
     )
     try:
         reply = await run_supervisor(ctx=ctx, user_text=text, history=history)
+    except NoEndpointConfigured as exc:
+        # Distinct from a transient outage: the model endpoint isn't configured,
+        # so retrying won't help. Log loudly and tell the operator it's config.
+        _log.error("supervisor_llm_misconfigured", error=str(exc))
+        await _send_user_error(
+            chat_id,
+            "The language model isn't configured yet. "
+            "Please set the LLM credentials and try again.",
+        )
+        return
     except LLMError as exc:
+        # Transient (timeout / rate-limit / upstream error). The real reason is
+        # in the log line; the user just gets a retry hint.
         _log.error("supervisor_failed", error=str(exc))
-        await _send_user_error(chat_id, "I could not reach the language model.")
+        await _send_user_error(
+            chat_id,
+            "I couldn't reach the language model just now. Please try again in a moment.",
+        )
         return
 
     await convs.append_turn(
@@ -1416,9 +1421,7 @@ async def _run_voice_pipeline(envelope: DecodedEnvelope) -> None:
         ogg = await telegram.download_file(file_id)
     except telegram.TelegramAPIError as exc:
         _log.error("voice_download_failed", error=str(exc))
-        await _send_user_error(
-            envelope.chat_id, "Could not download the voice note from Telegram."
-        )
+        await _send_user_error(envelope.chat_id, "Could not download the voice note from Telegram.")
         return
 
     try:

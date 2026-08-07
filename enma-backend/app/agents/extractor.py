@@ -80,6 +80,41 @@ class ExtractionResult(BaseModel):
     output_tokens: int
 
 
+def _parse_json_object(content: str) -> dict[str, Any]:
+    """Parse a JSON object from an extractor response, tolerantly.
+
+    NIM vision models vary in how they emit JSON: some honour
+    ``response_format=json_object``, others wrap the object in a ```json
+    markdown fence or add a sentence around it. We try the raw content first,
+    then fall back to the outermost ``{...}`` span (which transparently handles
+    both fences and surrounding prose). Raises ``ExtractorError`` if no object
+    can be recovered.
+    """
+    text = (content or "").strip()
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        obj = None
+    else:
+        # Content was valid JSON. A dict is the happy path; any other top-level
+        # type (e.g. a list) is a real shape error — surface it, don't dig in.
+        if isinstance(obj, dict):
+            return obj
+        raise ExtractorError(f"extractor returned non-object payload: {type(obj).__name__}")
+
+    # Not clean JSON — a vision model likely wrapped the object in a ```json
+    # fence or surrounding prose. Recover the outermost {...} span.
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            span = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            span = None
+        if isinstance(span, dict):
+            return span
+    raise ExtractorError(f"extractor returned non-JSON content: {text[:200]!r}")
+
+
 async def extract_document(
     document_bytes: bytes,
     *,
@@ -115,21 +150,21 @@ async def extract_document(
         },
     ]
 
+    # NB: no response_format=json_object here. NIM vision models handle JSON
+    # mode inconsistently — nano-vl 500s on it, llama-3.2-11b ignores it. We ask
+    # for JSON in the prompt and parse tolerantly (see _parse_json_object), which
+    # works across the vision models and lets us pick on capability/latency.
     response = await llm.call_chat(
         LLMRole.EXTRACTION,
         messages=messages,
-        response_format={"type": "json_object"},
         max_tokens=_MAX_TOKENS,
     )
 
     try:
-        payload = json.loads(response.content)
-    except json.JSONDecodeError as exc:
-        _log.warning("extractor_non_json", body=response.content[:400])
-        raise ExtractorError(f"extractor returned non-JSON content: {exc}") from exc
-
-    if not isinstance(payload, dict):
-        raise ExtractorError(f"extractor returned non-object payload: {type(payload).__name__}")
+        payload = _parse_json_object(response.content)
+    except ExtractorError:
+        _log.warning("extractor_non_json", body=(response.content or "")[:400])
+        raise
 
     missing = _REQUIRED_TOP_LEVEL_KEYS - set(payload.keys())
     if missing:
